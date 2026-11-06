@@ -475,10 +475,19 @@ impl Browser {
                 self.reveal_context_file(target.absolute_path, cx)
             }
             (ContextMenuAction::CopyPath, ContextMenuTarget::Sample(target)) => {
-                cx.write_to_clipboard(ClipboardItem::new_string(format_copy_path(
-                    &target.absolute_path,
-                )));
-                self.set_playback_status(String::from("Copied path"));
+                let linux = cfg!(target_os = "linux");
+                let status = match format_copy_path(&target.absolute_path, linux) {
+                    Some(text) => {
+                        cx.write_to_clipboard(ClipboardItem::new_string(text));
+                        if linux {
+                            "Path copy requested"
+                        } else {
+                            "Copied path"
+                        }
+                    }
+                    None => "This path cannot be copied as UTF-8 text",
+                };
+                self.set_playback_status(String::from(status));
                 cx.notify();
             }
             (ContextMenuAction::Unlock, ContextMenuTarget::Sample(target)) => {
@@ -803,12 +812,15 @@ fn directory_open_label() -> &'static str {
     }
 }
 
-fn format_copy_path(path: &Path) -> String {
+fn format_copy_path(path: &Path, literal_linux_path: bool) -> Option<String> {
+    if literal_linux_path {
+        return path.to_str().map(str::to_owned);
+    }
     let mut rendered = path.to_string_lossy().replace('\\', "/");
     if rendered.contains(' ') {
         rendered = format!("\"{rendered}\"");
     }
-    rendered
+    Some(rendered)
 }
 
 #[cfg(test)]
@@ -854,13 +866,29 @@ mod tests {
     #[test]
     fn copy_path_normalizes_separators_and_quotes_spaces() {
         assert_eq!(
-            format_copy_path(Path::new(r"C:\Samples\kick one.wav")),
-            "\"C:/Samples/kick one.wav\""
+            format_copy_path(Path::new(r"C:\Samples\kick one.wav"), false).as_deref(),
+            Some("\"C:/Samples/kick one.wav\"")
         );
         assert_eq!(
-            format_copy_path(Path::new("/tmp/kick.wav")),
-            "/tmp/kick.wav"
+            format_copy_path(Path::new("/tmp/kick.wav"), false).as_deref(),
+            Some("/tmp/kick.wav")
         );
+    }
+
+    #[test]
+    fn linux_copy_path_preserves_literal_utf8_text() {
+        let raw = r#"/tmp/drum\kit/é kick "$take".wav"#;
+        assert_eq!(format_copy_path(Path::new(raw), true).as_deref(), Some(raw));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn linux_copy_path_refuses_invalid_utf8() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let path = Path::new(OsStr::from_bytes(b"/tmp/kick\xff.wav"));
+        assert_eq!(format_copy_path(path, true), None);
     }
 
     #[test]
