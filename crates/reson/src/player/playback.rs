@@ -130,6 +130,24 @@ impl AudioPlayer {
         )
     }
 
+    pub(super) fn play_prepared_tempo_span(
+        &mut self,
+        plan: PlaybackSpanPlan,
+        replace_policy: PlaybackRuntimeReplacePolicy,
+    ) -> Result<(), String> {
+        let duration = plan.end_seconds();
+        self.start_with_span_plan(
+            0.0,
+            duration,
+            duration,
+            plan.looped(),
+            replace_policy,
+            None,
+            Some(plan),
+            plan.seek_offset_frames() != 0,
+        )
+    }
+
     /// Retarget the active loop span without rebuilding the sink when the
     /// current source supports live loop bounds.
     pub fn retarget_looped_range_with_metronome(
@@ -429,13 +447,16 @@ impl AudioPlayer {
         }
 
         let plan_started_at = playback_stage_started();
-        let plan = planned.unwrap_or(self.playback_span_plan(
-            start_seconds,
-            end_seconds,
-            duration,
-            looped,
-            PlaybackSeekBehavior::SpanStart,
-        )?);
+        let plan = match planned {
+            Some(plan) => plan,
+            None => self.playback_span_plan(
+                start_seconds,
+                end_seconds,
+                duration,
+                looped,
+                PlaybackSeekBehavior::SpanStart,
+            )?,
+        };
         log_playback_stage("span_plan", plan_started_at, source_kind, looped);
         let sample_rate = plan.layout().sample_rate();
         let channels = plan.layout().channels();
@@ -454,7 +475,7 @@ impl AudioPlayer {
                     samples,
                     playback_span.clone(),
                     SpanSamplesMode::Looped,
-                    plan.start_sample(),
+                    plan.seek_sample(),
                 )
                 .with_edge_fade(self.anti_clip_fade())
                 .with_live_loop_mode(mode.clone());
@@ -485,7 +506,7 @@ impl AudioPlayer {
                 self.edit_fade_handle.clone(),
                 plan.start_seconds(),
                 plan.frame_count(),
-                0,
+                plan.seek_offset_frames(),
             );
             Box::new(editable)
         } else {
@@ -569,7 +590,8 @@ impl AudioPlayer {
         );
         let (handle, format) = self.build_sink_with_fade(final_source, replace_policy)?;
         let finish_started_at = playback_stage_started();
-        let initial_offset = (!looped).then_some(plan.seek_offset_frames());
+        let offset = plan.seek_offset_frames();
+        let initial_offset = (!looped || offset != 0).then_some(offset);
         self.finish_span_playback(&plan, initial_offset);
         self.active_playback_span = active_playback_span;
         self.active_loop_mode = Some(mode);

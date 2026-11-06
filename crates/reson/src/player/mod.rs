@@ -29,7 +29,7 @@ pub use runtime::{
     PlaybackRuntimeGainNormalization, PlaybackRuntimeHandle, PlaybackRuntimeMode,
     PlaybackRuntimeProgress, PlaybackRuntimeReplacePolicy, PlaybackRuntimeRequest,
     PlaybackRuntimeSource, PlaybackRuntimeSpanUpdate, PlaybackRuntimeStarted,
-    PlaybackRuntimeStreamPolicy, PlaybackRuntimeSubmitError,
+    PlaybackRuntimeStreamPolicy, PlaybackRuntimeSubmitError, PlaybackRuntimeTempoSpan,
 };
 
 #[derive(Clone)]
