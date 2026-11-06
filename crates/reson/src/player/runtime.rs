@@ -115,6 +115,8 @@ pub enum PlaybackRuntimeSource {
     /// Hosts can submit this variant from latency-sensitive UI paths without
     /// opening the file or decoding audio before the command is enqueued.
     WavFile { path: PathBuf },
+    /// Uncompressed AIFF file with timing metadata probed on the runtime thread.
+    AiffFile { path: PathBuf },
     /// Original encoded bytes plus pre-decoded interleaved f32 playback samples.
     DecodedSamples {
         audio_bytes: Arc<[u8]>,
@@ -134,6 +136,15 @@ pub enum PlaybackRuntimeSource {
 }
 
 impl PlaybackRuntimeSource {
+    /// Select the background-probed WAV or AIFF file path without opening the source.
+    pub fn probe_file(path: PathBuf) -> Self {
+        if yield_aiff::is_aiff_path(&path) {
+            Self::AiffFile { path }
+        } else {
+            Self::WavFile { path }
+        }
+    }
+
     fn apply_to_player(self, player: &mut AudioPlayer) -> Result<(), String> {
         match self {
             Self::AudioBytes {
@@ -155,6 +166,7 @@ impl PlaybackRuntimeSource {
                 Ok(())
             }
             Self::WavFile { path } => player.set_wav_file(path),
+            Self::AiffFile { path } => player.set_aiff_file(path),
             Self::DecodedSamples {
                 audio_bytes,
                 samples,
@@ -1893,6 +1905,7 @@ fn normalized_gain_for_runtime_source(
         ),
         PlaybackRuntimeSource::AudioBytes { .. }
         | PlaybackRuntimeSource::AudioFile { .. }
+        | PlaybackRuntimeSource::AiffFile { .. }
         | PlaybackRuntimeSource::WavFile { .. } => None,
     }
 }

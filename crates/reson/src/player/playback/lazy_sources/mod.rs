@@ -1,3 +1,4 @@
+mod aiff_file;
 mod decoder_source;
 mod f32_cursor;
 mod f32_file;
@@ -11,6 +12,7 @@ use std::time::Duration;
 use super::super::PlaybackSpanPlan;
 use crate::timebase::duration_for_frames;
 
+pub(super) use aiff_file::AiffSpanSource;
 pub(super) use f32_file::{InterleavedF32FileRepeatingSpanSource, InterleavedF32FileSpanSource};
 pub(super) use pcm_wav_file::{PcmWavFileRepeatingSpanSource, PcmWavFileSpanSource};
 pub(super) use repeating_source::LazyRepeatingSpanSource;

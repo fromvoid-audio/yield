@@ -1,9 +1,10 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::Source;
 use crate::telemetry;
+use yield_aiff::AiffPcmReader;
 
 use super::super::DEFAULT_ANTI_CLIP_FADE;
 use super::super::output::{AudioOutputConfig, ResolvedOutput, open_output_stream};
@@ -13,6 +14,23 @@ use super::{
     AudioPlaybackSource, AudioPlayer, EditFadeHandle, EditFadeRange, PlaybackRuntimeReplacePolicy,
     PlaybackRuntimeStreamPolicy,
 };
+
+pub(super) fn open_aiff_file_for_playback(path: &Path) -> Result<AiffPcmReader, String> {
+    let reader = AiffPcmReader::open(path).map_err(|error| error.to_string())?;
+    let sample_rate = reader.sample_rate();
+    let channels = reader.channels();
+    // Bound decoder-ring sizing before constructing a playback source.
+    if sample_rate > 384_000
+        || channels > 32
+        || u64::from(sample_rate) * u64::from(channels) > 384_000 * 8
+    {
+        return Err(format!(
+            "{} AIFF layout exceeds playback limits ({sample_rate} Hz, {channels} channels)",
+            path.display()
+        ));
+    }
+    Ok(reader)
+}
 
 impl AudioPlayer {
     /// Create a new audio player using the default output device.
@@ -186,6 +204,25 @@ impl AudioPlayer {
         let path = path.into();
         let (duration, sample_rate, channels) = wav_file_metadata(&path)?;
         self.set_audio_file_with_metadata(path, duration, sample_rate, channels);
+        Ok(())
+    }
+
+    pub(super) fn set_aiff_file(&mut self, path: PathBuf) -> Result<(), String> {
+        if !yield_aiff::is_aiff_path(&path) {
+            return Err(format!(
+                "AIFF playback requires an .aiff or .aif path: {}",
+                path.display()
+            ));
+        }
+        let reader = open_aiff_file_for_playback(&path)?;
+        let duration = (reader.frames() as f64 / f64::from(reader.sample_rate())) as f32;
+        self.set_audio_file_with_metadata(
+            path,
+            duration,
+            reader.sample_rate(),
+            usize::from(reader.channels()),
+        );
+        self.track_total_frames = Some(reader.frames());
         Ok(())
     }
 

@@ -1323,9 +1323,7 @@ impl Browser {
         );
         let (anti_click_enabled, anti_click_fade_ms) = self.preferences.anti_click_settings();
         let request = PlaybackRuntimeRequest {
-            source: PlaybackRuntimeSource::WavFile {
-                path: intent.path.clone(),
-            },
+            source: PlaybackRuntimeSource::probe_file(intent.path.clone()),
             mode,
             stream_policy: PlaybackRuntimeStreamPolicy::transient_navigation(),
             volume: super::volume::quantize_volume(intent.volume),
