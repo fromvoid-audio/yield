@@ -123,8 +123,10 @@ impl Drop for OwnedChild {
 }
 fn process_case(producer: bool) {
     let base = tempfile::tempdir().unwrap();
-    let profile = base.path().join("profile");
-    let ready = base.path().join("ready.json");
+    // Native profile ownership refuses symlinked ancestors, including macOS's /var alias.
+    let base_path = fs::canonicalize(base.path()).expect("canonical disposable fixture root");
+    let profile = base_path.join("profile");
+    let ready = base_path.join("ready.json");
     let _root = AppRootGuard::set(profile.clone()).unwrap();
     let mut command = Command::new(std::env::current_exe().unwrap());
     command
