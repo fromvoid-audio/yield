@@ -187,6 +187,7 @@ struct CatalogTestGate {
     audit_state: Mutex<CatalogTestAuditState>,
     feature_terminal_state: Mutex<CatalogTestAuditState>,
     feature_terminal_wake: Condvar,
+    transient_compute: Mutex<Option<(mpsc::SyncSender<()>, mpsc::Receiver<()>)>>,
     watcher_signals: Mutex<HashMap<(SourceId, u64), WatcherSignal>>,
     watcher_install_counts: Mutex<HashMap<(SourceId, u64), usize>>,
     cancel_on_audit_progress: AtomicBool,
@@ -225,6 +226,7 @@ impl CatalogTestGate {
                 at_boundary: false,
             }),
             feature_terminal_wake: Condvar::new(),
+            transient_compute: Mutex::new(None),
             watcher_signals: Mutex::new(HashMap::new()),
             watcher_install_counts: Mutex::new(HashMap::new()),
             cancel_on_audit_progress: AtomicBool::new(false),
@@ -245,6 +247,14 @@ impl CatalogTestGate {
                 .unwrap_or_else(|p| p.into_inner());
         }
         state.at_boundary = false;
+    }
+
+    fn before_transient_compute(&self) {
+        let signal = self.transient_compute.lock().unwrap().take();
+        if let Some((entered, release)) = signal {
+            let _ = entered.send(());
+            let _ = release.recv_timeout(Duration::from_secs(5));
+        }
     }
     #[cfg(target_os = "linux")]
     fn arm_feature_terminal(&self) -> CatalogTestFeatureTerminalPause<'_> {
@@ -4168,6 +4178,7 @@ fn run_worker_with_sources(
         .take()
         .expect("single original source worker inbox");
     let mut preparations = source_wal_preparation::WorkerReservations::new(control);
+    let mut transients = transient_dispatch::Worker::default();
     let mut deferred = VecDeque::<QueuedCatalogCommand>::new();
     let mut pending_finalizations = HashMap::<SourceId, PendingSourceFinalization>::new();
     let mut idle = idle_maintenance::Pacing::new(Instant::now());
@@ -4178,6 +4189,9 @@ fn run_worker_with_sources(
         let closing = admission_state(&admission, |state| state.shutdown || state.closed);
         if closing {
             preparations.close(&mut sources);
+        }
+        if !preparations.has_slots() {
+            transients.poll(&admission, &sources, test_gate.as_ref());
         }
         // Do not enter journal-facing commands or teardown while its original settlement
         // still owns any native reservation. Keep accepted packets/credits in existing bounds.
@@ -4331,6 +4345,25 @@ fn run_worker_with_sources(
             reservation.finish();
             continue;
         }
+        let command = match command {
+            CatalogCommand::RequestTransientMarkers {
+                request,
+                cancellation,
+            } => {
+                transients.submit(
+                    transient_dispatch::Submission {
+                        request,
+                        cancellation,
+                        reservation,
+                    },
+                    &admission,
+                    &sources,
+                    test_gate.as_ref(),
+                );
+                continue;
+            }
+            command => command,
+        };
         if handle_command(
             command,
             &profile_guard,
@@ -4349,6 +4382,7 @@ fn run_worker_with_sources(
         reservation.finish();
         idle.activity(Instant::now());
     }
+    drop(transients);
     preparations.close(&mut sources);
     preparations.retire_failed(journal.as_ref(), &mut pending_finalizations);
     if let Some(journal) = journal.as_ref() {
@@ -4582,12 +4616,8 @@ fn handle_command(
             similarity_dispatch::dispatch(request, cancellation, reservation, admission, sources);
             false
         }
-        CatalogCommand::RequestTransientMarkers {
-            request,
-            cancellation,
-        } => {
-            transient_dispatch::dispatch(request, cancellation, reservation, admission, sources);
-            false
+        CatalogCommand::RequestTransientMarkers { .. } => {
+            unreachable!("transient requests are handled by the compute slot");
         }
         CatalogCommand::RequestFeatureAnalysis {
             source_id,

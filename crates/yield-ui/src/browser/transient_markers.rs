@@ -337,6 +337,7 @@ fn unavailable(error: TransientRequestFailure) -> (ResultState, String) {
         TransientRequestFailure::Input(error) => error.to_string(),
         TransientRequestFailure::Decode(reason) => reason.into(),
         TransientRequestFailure::Computation => "analysis failed".into(),
+        TransientRequestFailure::Busy => "transient analysis is busy".into(),
         TransientRequestFailure::Cancelled => "analysis cancelled".into(),
     };
     (

@@ -58,6 +58,68 @@ mod fixtures {
         .unwrap()
     }
 
+    #[test]
+    fn transient_worker_keeps_catalog_responsive_and_refunds_cancelled_and_busy_requests() {
+        let fixture = Fixture::new("transient-compute-slot");
+        write_attacks(
+            &fixture.root.path().join("attacks.wav"),
+            16_000,
+            [1237, 9673],
+        );
+        let source = SourceId::from_string("transient-compute-slot");
+        let (service, gate) = CatalogService::start_with_test_gate(&fixture.guard).unwrap();
+        let revision =
+            register_and_audit(&service, fixture.root.path(), &source).committed_revision;
+        let (entered_send, entered_recv) = mpsc::sync_channel(1);
+        let (release_send, release_recv) = mpsc::sync_channel(1);
+        *gate.transient_compute.lock().unwrap() = Some((entered_send, release_recv));
+        let cancellation = FeatureAnalysisCancellation::new();
+        service
+            .submit(CatalogCommand::RequestTransientMarkers {
+                request: request(&source, revision, 1),
+                cancellation: cancellation.clone(),
+            })
+            .unwrap();
+        entered_recv.recv_timeout(Duration::from_secs(2)).unwrap();
+
+        service
+            .submit(CatalogCommand::ReadSnapshot {
+                source_id: source.clone(),
+                expected_revision: Some(revision),
+            })
+            .unwrap();
+        receive_until(&service, |event| {
+            matches!(event, CatalogEvent::SnapshotReady { .. })
+        });
+
+        for id in [2, 3] {
+            service
+                .submit(CatalogCommand::RequestTransientMarkers {
+                    request: request(&source, revision, id),
+                    cancellation: FeatureAnalysisCancellation::new(),
+                })
+                .unwrap();
+        }
+        assert!(matches!(
+            delivery(&service, 3).into_event_if_live(),
+            Some(CatalogEvent::TransientMarkersCompleted {
+                result: Err(TransientRequestFailure::Busy),
+                ..
+            })
+        ));
+        cancellation.cancel();
+        release_send.send(()).unwrap();
+        let CatalogEvent::TransientMarkersCompleted { result, .. } =
+            delivery(&service, 2).into_event_if_live().unwrap()
+        else {
+            panic!("expected waiting request");
+        };
+        assert_eq!(result.unwrap().markers.frames(), [1237, 9673]);
+        wait_for_tag_read_payload(&service, 0);
+        wait_for_tag_page_input_release(&service);
+        service.shutdown();
+    }
+
     fn run_request(
         service: &CatalogService,
         source: &SourceId,
