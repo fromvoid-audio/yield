@@ -531,6 +531,31 @@ impl Browser {
         span: WaveformPlayRegion,
         cx: &mut Context<Self>,
     ) -> Option<Result<(), String>> {
+        let target = self.accepted_playmark_timing_target(path, span)?;
+        self.submit_live_playback_target(target, cx)
+    }
+
+    pub(super) fn retarget_committed_playmark_resize(
+        &mut self,
+        span: WaveformPlayRegion,
+        cx: &mut Context<Self>,
+    ) {
+        let path = self
+            .selected
+            .and_then(|index| self.entries.get(index))
+            .map(|entry| entry.path.clone());
+        if let Some(path) = path
+            && let Some(Err(error)) = self.submit_playmark_timing_span(&path, span, cx)
+        {
+            self.set_playback_status(format!("Playmark resize update unavailable: {error}"));
+        }
+    }
+
+    fn accepted_playmark_timing_target(
+        &self,
+        path: &Path,
+        span: WaveformPlayRegion,
+    ) -> Option<PlaybackRetargetTarget> {
         let selected_path = self
             .selected
             .and_then(|index| self.entries.get(index))
@@ -542,12 +567,11 @@ impl Browser {
         {
             return None;
         }
-        let target = PlaybackRetargetTarget {
+        Some(PlaybackRetargetTarget {
             span,
             desired: self.current_playback_desired_state(),
             seek_if_outside: true,
-        };
-        self.submit_live_playback_target(target, cx)
+        })
     }
 
     fn submit_live_playback_target(
@@ -2268,6 +2292,53 @@ mod tests {
             origin: PlaybackIntentOrigin::Explicit,
             resume_desired: None,
         }
+    }
+
+    #[gpui::test]
+    fn committed_playmark_timing_targets_only_accepted_playback_of_the_selected_file(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use gpui::AppContext;
+        cx.set_global(crate::theme::ActiveTheme::default());
+        let browser = cx.new(super::Browser::new);
+        let path = Path::new("/tmp/tempo-release.wav");
+        let span = WaveformPlayRegion::new(0.25, 0.75).unwrap();
+        browser.update(cx, |view, _| {
+            view.entries = vec![AudioFile {
+                path: path.to_path_buf(),
+                relative_path: PathBuf::from("tempo-release.wav"),
+                byte_len: 0,
+                duration_seconds: None,
+                sample_rate: None,
+                playback_type: None,
+                curation: None,
+            }];
+            view.selected = Some(0);
+            view.waveform = Some(yield_media::WaveformPreview {
+                peaks: Vec::new(),
+                bands: Vec::new(),
+                duration_seconds: 4.0,
+                sample_rate: 48_000,
+                total_frames: 192_000,
+                detail_context: None,
+            });
+            assert!(view.accepted_playmark_timing_target(path, span).is_none());
+            view.playing_path = Some(path.to_path_buf());
+            assert!(view.accepted_playmark_timing_target(path, span).is_none());
+            view.accepted_playback_intent = Some(sample_intent(path, true));
+            let target = view.accepted_playmark_timing_target(path, span).unwrap();
+            assert_eq!(target.span.frame_bounds(192_000), Some((48_000, 144_000)));
+            assert!(target.seek_if_outside);
+
+            view.accepted_playback_intent = Some(sample_intent(Path::new("other.wav"), true));
+            assert!(view.accepted_playmark_timing_target(path, span).is_none());
+            view.accepted_playback_intent = Some(sample_intent(path, true));
+            view.selected = None;
+            assert!(view.accepted_playmark_timing_target(path, span).is_none());
+            view.selected = Some(0);
+            view.waveform = None;
+            assert!(view.accepted_playmark_timing_target(path, span).is_none());
+        });
     }
 
     fn sample_pending_retarget(

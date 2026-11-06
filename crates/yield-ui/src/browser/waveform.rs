@@ -2705,9 +2705,16 @@ impl Browser {
         } else if drag.is_handle_drag() {
             if drag.moved {
                 if let Some(region) = drag.preview_region_with_bpm(bpm_snap) {
+                    let tempo_span_changed = drag.tempo_resize.is_some_and(|capture| {
+                        self.waveform_play_region
+                            .and_then(|previous| previous.frame_bounds(capture.total_frames))
+                            != region.frame_bounds(capture.total_frames)
+                    });
                     self.set_waveform_play_region(Some(region));
                     similar_sections::invalidate_if_stale(self);
-                    if drag.zero_crossing_applies(bpm_snap) {
+                    if tempo_span_changed {
+                        self.retarget_committed_playmark_resize(region, cx);
+                    } else if drag.zero_crossing_applies(bpm_snap) {
                         zero_crossing::commit_or_schedule(self, region, cx);
                     }
                 }
