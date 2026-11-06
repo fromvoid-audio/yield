@@ -54,7 +54,8 @@ pub use playback_loop_policy::PlaybackLoopPolicy;
 pub use playback_type_filter::{PLAYBACK_TYPE_FILTERS, PlaybackType, PlaybackTypeFilter};
 pub use played_range_history::PlayedRangeHistory;
 pub use playmark_timing::{
-    MAX_PLAYMARK_TIMING_CHARACTERS, parse_playmark_frame_range, playmark_selection_label,
+    MAX_PLAYMARK_TIMING_CHARACTERS, parse_playmark_frame_range, playmark_frame_tempo_label,
+    playmark_selection_label,
 };
 pub use random_audition::{RandomAuditionUnits, random_audition_span_for_units};
 pub use random_navigation::RandomNavigationState;
