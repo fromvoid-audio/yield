@@ -114,6 +114,7 @@ mod panel_focus;
 mod panel_resize;
 mod playback_age;
 mod played_ranges;
+mod playmark_resize;
 mod playmark_timing;
 mod preferences;
 mod random_audition;
@@ -418,6 +419,7 @@ pub(crate) struct Browser {
     pane_resize_environment_subscriptions: Vec<gpui::Subscription>,
     waveform_zoom_anchor_ratio: f64,
     waveform_play_region: Option<waveform::WaveformPlayRegion>,
+    playmark_resize_anchor: Option<playmark_resize::ResizeAnchor>,
     waveform_edit_region: Option<WaveformEditRegion>,
     waveform_edit_settings: WaveformEditSettings,
     waveform_fade_hover: Option<waveform_fades::WaveformEditFadeHit>,
@@ -779,6 +781,7 @@ impl Browser {
             pane_resize_environment_subscriptions: Vec::new(),
             waveform_zoom_anchor_ratio: 0.5,
             waveform_play_region: None,
+            playmark_resize_anchor: None,
             waveform_edit_region: None,
             waveform_edit_settings: waveform::default_edit_settings(),
             waveform_fade_hover: None,
@@ -3136,6 +3139,9 @@ impl Browser {
                     self.toggle_focused_selection(cx);
                 }
             }
+            return;
+        }
+        if self.handle_playmark_resize_key(event, window, cx) {
             return;
         }
         if self.waveform_focus_handle.is_focused(window)
