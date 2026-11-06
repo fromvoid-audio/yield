@@ -3,7 +3,7 @@ use std::sync::{
     atomic::{AtomicU64, Ordering},
 };
 
-use super::{PlaybackMetronomeConfig, PlaybackSpanPlan};
+use super::{PlaybackMetronomeConfig, PlaybackMetronomeMix, PlaybackSpanPlan};
 
 const NO_PENDING_SEEK: u64 = u64::MAX;
 
@@ -38,7 +38,7 @@ struct PlaybackControlSlot {
     end_frame: AtomicU64,
     pending_seek_frame: AtomicU64,
     metronome_enabled: AtomicU64,
-    metronome_beat_count: AtomicU64,
+    metronome_controls: AtomicU64,
     metronome_cycle_frames: AtomicU64,
     metronome_anchor_frame: AtomicU64,
     metronome_anchor_phase_frames: AtomicU64,
@@ -48,7 +48,7 @@ struct PlaybackControlSlot {
 struct AppliedMetronomeSlot {
     revision: AtomicU64,
     enabled: AtomicU64,
-    beat_count: AtomicU64,
+    controls: AtomicU64,
     cycle_frames: AtomicU64,
     phase_frames: AtomicU64,
 }
@@ -66,6 +66,7 @@ pub(crate) struct PlaybackSpanSnapshot {
 struct PlaybackMetronomeSnapshot {
     enabled: bool,
     beat_count: u16,
+    mix: PlaybackMetronomeMix,
     cycle_frames: u64,
     anchor_frame: u64,
     anchor_phase_frames: u64,
@@ -76,6 +77,7 @@ pub(crate) struct AppliedMetronomeSnapshot {
     revision: u64,
     enabled: bool,
     beat_count: u16,
+    mix: PlaybackMetronomeMix,
     cycle_frames: u64,
     phase_frames: u64,
 }
@@ -195,7 +197,7 @@ impl PlaybackControlSlot {
             end_frame: AtomicU64::new(snapshot.end_frame),
             pending_seek_frame: AtomicU64::new(encode_optional_frame(snapshot.pending_seek_frame)),
             metronome_enabled: AtomicU64::new(u64::from(snapshot.metronome.enabled)),
-            metronome_beat_count: AtomicU64::new(u64::from(snapshot.metronome.beat_count)),
+            metronome_controls: AtomicU64::new(snapshot.metronome.controls()),
             metronome_cycle_frames: AtomicU64::new(snapshot.metronome.cycle_frames),
             metronome_anchor_frame: AtomicU64::new(snapshot.metronome.anchor_frame),
             metronome_anchor_phase_frames: AtomicU64::new(snapshot.metronome.anchor_phase_frames),
@@ -212,8 +214,8 @@ impl PlaybackControlSlot {
         );
         self.metronome_enabled
             .store(u64::from(snapshot.metronome.enabled), Ordering::SeqCst);
-        self.metronome_beat_count
-            .store(u64::from(snapshot.metronome.beat_count), Ordering::SeqCst);
+        self.metronome_controls
+            .store(snapshot.metronome.controls(), Ordering::SeqCst);
         self.metronome_cycle_frames
             .store(snapshot.metronome.cycle_frames, Ordering::SeqCst);
         self.metronome_anchor_frame
@@ -223,6 +225,8 @@ impl PlaybackControlSlot {
     }
 
     fn snapshot(&self, generation: u64) -> PlaybackSpanSnapshot {
+        let (beat_count, mix) =
+            decode_metronome_controls(self.metronome_controls.load(Ordering::SeqCst));
         PlaybackSpanSnapshot {
             generation,
             start_frame: self.start_frame.load(Ordering::SeqCst),
@@ -232,7 +236,8 @@ impl PlaybackControlSlot {
             ),
             metronome: PlaybackMetronomeSnapshot {
                 enabled: self.metronome_enabled.load(Ordering::SeqCst) != 0,
-                beat_count: self.metronome_beat_count.load(Ordering::SeqCst) as u16,
+                beat_count,
+                mix,
                 cycle_frames: self.metronome_cycle_frames.load(Ordering::SeqCst),
                 anchor_frame: self.metronome_anchor_frame.load(Ordering::SeqCst),
                 anchor_phase_frames: self.metronome_anchor_phase_frames.load(Ordering::SeqCst),
@@ -246,7 +251,7 @@ impl AppliedMetronomeSlot {
         Self {
             revision: AtomicU64::new(2),
             enabled: AtomicU64::new(u64::from(snapshot.enabled)),
-            beat_count: AtomicU64::new(u64::from(snapshot.beat_count)),
+            controls: AtomicU64::new(snapshot.controls()),
             cycle_frames: AtomicU64::new(snapshot.cycle_frames),
             phase_frames: AtomicU64::new(snapshot.anchor_phase_frames),
         }
@@ -257,8 +262,7 @@ impl AppliedMetronomeSlot {
         self.revision.fetch_add(1, Ordering::SeqCst);
         self.enabled
             .store(u64::from(snapshot.enabled), Ordering::SeqCst);
-        self.beat_count
-            .store(u64::from(snapshot.beat_count), Ordering::SeqCst);
+        self.controls.store(snapshot.controls(), Ordering::SeqCst);
         self.cycle_frames
             .store(snapshot.cycle_frames, Ordering::SeqCst);
         self.phase_frames
@@ -280,7 +284,7 @@ impl AppliedMetronomeSlot {
             return None;
         }
         let enabled = self.enabled.load(Ordering::SeqCst) != 0;
-        let beat_count = self.beat_count.load(Ordering::SeqCst) as u16;
+        let (beat_count, mix) = decode_metronome_controls(self.controls.load(Ordering::SeqCst));
         let cycle_frames = self.cycle_frames.load(Ordering::SeqCst);
         let phase_frames = self.phase_frames.load(Ordering::SeqCst);
         let after = self.revision.load(Ordering::SeqCst);
@@ -288,6 +292,7 @@ impl AppliedMetronomeSlot {
             revision: after,
             enabled,
             beat_count,
+            mix,
             cycle_frames,
             phase_frames,
         })
@@ -306,7 +311,7 @@ impl PlaybackSpanSnapshot {
         let pending_seek_frame =
             seek_frame.map(|frame| clamp_frame_to_span(frame, start_frame, end_frame));
         let anchor_frame = plan_anchor_frame(plan);
-        let (enabled, beat_count, cycle_frames, anchor_phase_frames) = match metronome {
+        let (enabled, beat_count, mix, cycle_frames, anchor_phase_frames) = match metronome {
             Some(config) => {
                 let (cycle_frames, phase_frames) = config.cycle_at_anchor(
                     plan.frame_count(),
@@ -316,11 +321,18 @@ impl PlaybackSpanSnapshot {
                 (
                     true,
                     config.beat_count(),
+                    config.mix(),
                     cycle_frames.max(1),
                     phase_frames % cycle_frames.max(1),
                 )
             }
-            None => (false, 1, plan.frame_count().max(1), 0),
+            None => (
+                false,
+                1,
+                PlaybackMetronomeMix::default(),
+                plan.frame_count().max(1),
+                0,
+            ),
         };
         Self {
             generation,
@@ -330,6 +342,7 @@ impl PlaybackSpanSnapshot {
             metronome: PlaybackMetronomeSnapshot {
                 enabled,
                 beat_count,
+                mix,
                 cycle_frames,
                 anchor_frame,
                 anchor_phase_frames,
@@ -376,6 +389,10 @@ pub(crate) fn plan_anchor_frame(plan: &PlaybackSpanPlan) -> u64 {
 }
 
 impl PlaybackMetronomeSnapshot {
+    fn controls(self) -> u64 {
+        u64::from(self.beat_count) | (u64::from(self.mix.encode()) << u16::BITS)
+    }
+
     fn phase_at(self, frame: u64) -> u64 {
         let cycle_frames = self.cycle_frames.max(1);
         if frame >= self.anchor_frame {
@@ -406,6 +423,10 @@ impl AppliedMetronomeSnapshot {
         self.beat_count
     }
 
+    pub(crate) fn mix(self) -> PlaybackMetronomeMix {
+        self.mix
+    }
+
     pub(crate) fn cycle_frames(self) -> u64 {
         self.cycle_frames
     }
@@ -427,7 +448,14 @@ fn clamp_frame_to_span(frame: u64, start_frame: u64, end_frame: u64) -> u64 {
     frame.clamp(start_frame, end_frame.saturating_sub(1).max(start_frame))
 }
 
-fn add_modulo(value: u64, increment: u64, modulus: u64) -> u64 {
+fn decode_metronome_controls(word: u64) -> (u16, PlaybackMetronomeMix) {
+    (
+        word as u16,
+        PlaybackMetronomeMix::decode((word >> u16::BITS) as u16),
+    )
+}
+
+pub(super) fn add_modulo(value: u64, increment: u64, modulus: u64) -> u64 {
     let modulus = modulus.max(1);
     let value = value % modulus;
     let increment = increment % modulus;
@@ -468,6 +496,7 @@ mod tests {
         let left = PlaybackMetronomeSnapshot {
             enabled: true,
             beat_count: 3,
+            mix: PlaybackMetronomeMix::default(),
             cycle_frames: 3_000,
             anchor_frame: 0,
             anchor_phase_frames: 30,
@@ -475,6 +504,7 @@ mod tests {
         let right = PlaybackMetronomeSnapshot {
             enabled: false,
             beat_count: 7,
+            mix: PlaybackMetronomeMix::new(12, false, true, crate::MetronomeSound::Rimshot),
             cycle_frames: 7_000,
             anchor_frame: 0,
             anchor_phase_frames: 70,
@@ -492,11 +522,12 @@ mod tests {
 
         while !finished.load(Ordering::Acquire) {
             if let Some(snapshot) = slot.try_snapshot() {
-                let left_tuple = (true, 3, 3_000, 30);
-                let right_tuple = (false, 7, 7_000, 70);
+                let left_tuple = (true, 3, left.mix, 3_000, 30);
+                let right_tuple = (false, 7, right.mix, 7_000, 70);
                 let observed = (
                     snapshot.enabled(),
                     snapshot.beat_count(),
+                    snapshot.mix(),
                     snapshot.cycle_frames(),
                     snapshot.phase_frames(),
                 );
@@ -598,6 +629,7 @@ mod tests {
         let metronome = PlaybackMetronomeSnapshot {
             enabled: true,
             beat_count: 4,
+            mix: PlaybackMetronomeMix::default(),
             cycle_frames: u64::MAX,
             anchor_frame: 1,
             anchor_phase_frames: u64::MAX - 1,
