@@ -2,6 +2,7 @@
 
 use std::fmt::{Display, Formatter};
 use std::path::PathBuf;
+use yield_library::sample_sources::is_rejected_source_file_path;
 
 #[cfg(target_os = "macos")]
 mod macos;
@@ -40,7 +41,7 @@ impl PreparedFilePaths {
 pub(crate) enum FileClipboardError {
     /// No paths were supplied by the browser command.
     NoPathsProvided,
-    /// The supplied paths contained no existing regular absolute files.
+    /// The supplied paths contained no eligible existing regular absolute files.
     NoExistingFiles,
     /// The current platform has no native file clipboard implementation.
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
@@ -83,7 +84,7 @@ pub(crate) fn prepare_file_paths(
 
     let valid_paths = paths
         .iter()
-        .filter(|path| path.is_absolute() && path.is_file())
+        .filter(|path| path.is_absolute() && !is_rejected_source_file_path(path) && path.is_file())
         .cloned()
         .collect::<Vec<_>>();
     if valid_paths.is_empty() {
@@ -146,17 +147,20 @@ mod tests {
     }
 
     #[test]
-    fn prepare_filters_relative_missing_and_directory_paths() {
+    fn prepare_filters_ineligible_paths() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let existing = directory.path().join("existing sample.wav");
         std::fs::write(&existing, b"sample").expect("write sample");
         let nested_directory = directory.path().join("folder");
         std::fs::create_dir(&nested_directory).expect("create nested directory");
+        let metadata = directory.path().join(".wavecrate.db");
+        std::fs::write(&metadata, b"private fixture").expect("write source metadata");
 
         let paths = vec![
             PathBuf::from("relative.wav"),
             directory.path().join("missing.wav"),
             nested_directory,
+            metadata,
             existing.clone(),
         ];
 
