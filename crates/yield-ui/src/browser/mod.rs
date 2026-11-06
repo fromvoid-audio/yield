@@ -667,7 +667,7 @@ impl Browser {
         let beat_count_subscription = cx.subscribe(
             &beat_count_input,
             |view, _input, event: &BeatCountChanged, cx| {
-                if view.waveform.is_some() {
+                if view.waveform.is_some() && view.beat_guide_count != event.count {
                     view.playmark_tempo.preserve_local_edit();
                 }
                 view.beat_guide_count = event.count;
