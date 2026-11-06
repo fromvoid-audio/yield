@@ -28,7 +28,7 @@ mod zero_crossing;
 pub use detail::{
     MAX_WAVEFORM_DETAIL_COLUMNS, MAX_WAVEFORM_DETAIL_VISIBLE_FRAMES, WaveformDetailContext,
     WaveformDetailRange, WaveformDetailRequest, WaveformDetailResult, WaveformFileRevision,
-    WaveformSpec, load_waveform_detail, load_waveform_detail_with_cancel,
+    WaveformSpec, load_waveform_detail, load_waveform_detail_with_cancel, with_fenced_wav_read,
 };
 pub use edit_intent::{
     WaveformEditIntentAdapterError, waveform_edit_intent, waveform_edit_request,
