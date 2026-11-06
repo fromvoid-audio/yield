@@ -46,19 +46,20 @@ impl AudioPlayer {
         let track_frames = self.track_total_frames?;
         let (span_start, span_end) = self.play_span_frames?;
         let span_frames = span_end.saturating_sub(span_start).max(1);
-        if self.active_playback_span.is_none()
+        if self.rendered_source_position.is_none()
+            && self.active_playback_span.is_none()
             && let Some(mode) = self.active_loop_mode.as_ref()
         {
             let within_span = mode.progress_offset();
             return Some(span_start.saturating_add(within_span).min(track_frames));
         }
-        let elapsed_frames = duration_to_frames_floor(self.elapsed_since(started_at), sample_rate);
-        let base_offset = self.loop_offset_frames.unwrap_or(0).min(span_frames);
-        let within_span = if self.looping {
-            (base_offset % span_frames).saturating_add(elapsed_frames) % span_frames
-        } else {
-            base_offset.saturating_add(elapsed_frames).min(span_frames)
-        };
+        let elapsed_frames = self.elapsed_source_frames(started_at, sample_rate);
+        let within_span = position_in_span(
+            self.loop_offset_frames.unwrap_or(0).min(span_frames),
+            elapsed_frames,
+            span_frames,
+            self.looping,
+        );
         Some(span_start.saturating_add(within_span).min(track_frames))
     }
 
@@ -71,6 +72,13 @@ impl AudioPlayer {
     pub fn playback_elapsed(&self) -> Option<Duration> {
         self.started_at
             .map(|started_at| self.elapsed_since(started_at))
+    }
+
+    fn elapsed_source_frames(&self, started_at: std::time::Instant, sample_rate: u32) -> u64 {
+        self.rendered_source_position.as_ref().map_or_else(
+            || duration_to_frames_floor(self.elapsed_since(started_at), sample_rate),
+            |position| position.source_frame(),
+        )
     }
 
     /// True when the current sink is configured to loop.
@@ -131,10 +139,13 @@ impl AudioPlayer {
             (self.sample_rate, self.play_span_frames)
         {
             let span_frames = span_end.saturating_sub(span_start).max(1);
-            let elapsed_frames =
-                duration_to_frames_floor(self.elapsed_since(started_at), sample_rate);
-            let base_offset = self.loop_offset_frames.unwrap_or(0) % span_frames;
-            let elapsed_in_span = (base_offset.saturating_add(elapsed_frames)) % span_frames;
+            let elapsed_frames = self.elapsed_source_frames(started_at, sample_rate);
+            let elapsed_in_span = position_in_span(
+                self.loop_offset_frames.unwrap_or(0),
+                elapsed_frames,
+                span_frames,
+                true,
+            );
             let remaining_frames = span_frames.saturating_sub(elapsed_in_span);
             return Some(duration_for_frames(remaining_frames, sample_rate));
         }
@@ -157,12 +168,29 @@ impl AudioPlayer {
     }
 }
 
+fn position_in_span(offset: u64, elapsed: u64, span_frames: u64, looped: bool) -> u64 {
+    if looped {
+        (offset % span_frames).saturating_add(elapsed) % span_frames
+    } else {
+        offset.saturating_add(elapsed).min(span_frames)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::output::{AudioOutputConfig, open_output_stream};
     use crate::timebase::{duration_for_frames, duration_to_frames_floor};
     use std::time::Instant;
+
+    #[test]
+    fn rendered_source_frames_wrap_at_loop_boundary_and_clamp_at_one_shot_end() {
+        assert_eq!(super::position_in_span(10, 0, 147, false), 10);
+        assert_eq!(super::position_in_span(10, 136, 147, true), 146);
+        assert_eq!(super::position_in_span(10, 137, 147, true), 0);
+        assert_eq!(super::position_in_span(10, 138, 147, true), 1);
+        assert_eq!(super::position_in_span(10, 138, 147, false), 147);
+    }
 
     #[test]
     fn progress_uses_frame_timebase_when_available() {

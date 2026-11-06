@@ -16,7 +16,9 @@ use std::time::Duration;
 pub use self::buffered::Buffered;
 pub use self::fade::FadeIn;
 pub use self::limit::{TakeDuration, TakeSamples};
-pub(crate) use self::output_adapter::{BandLimitedOutputAdapter, OutputAdapter, StereoOutputPair};
+pub(crate) use self::output_adapter::{
+    BandLimitedOutputAdapter, OutputAdapter, RenderedSourcePosition, StereoOutputPair,
+};
 pub use self::repeat::RepeatInfinite;
 pub use self::samples_buffer::SamplesBuffer;
 
