@@ -129,6 +129,7 @@ mod shortcut_help;
 mod sidebar;
 mod similar_sections;
 mod similarity_list;
+mod source_digest;
 mod source_recovery;
 mod source_registry;
 mod status_log;
@@ -427,6 +428,7 @@ pub(crate) struct Browser {
     waveform_play_region: Option<waveform::WaveformPlayRegion>,
     waveform_play_grid: Option<yield_core::SnappedPlaymark>,
     playmark_tempo: playmark_tempo::PlaymarkTempoState,
+    source_digest_requests: source_digest::SourceDigestRequests,
     playmark_resize_anchor: Option<playmark_resize::ResizeAnchor>,
     held_playmark_slide: Option<waveform::WaveformRegionSlide>,
     playmark_slide_blur_subscription: Option<gpui::Subscription>,
@@ -802,6 +804,7 @@ impl Browser {
             waveform_play_region: None,
             waveform_play_grid: None,
             playmark_tempo: playmark_tempo::PlaymarkTempoState::default(),
+            source_digest_requests: source_digest::SourceDigestRequests::default(),
             playmark_resize_anchor: None,
             held_playmark_slide: None,
             playmark_slide_blur_subscription: None,

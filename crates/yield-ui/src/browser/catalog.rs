@@ -702,6 +702,11 @@ impl Browser {
         publication_fence: Option<SourcePublicationFence>,
         cx: &mut Context<Self>,
     ) -> bool {
+        if let CatalogEvent::SourceContentDigestFailed { request, error, .. } = &event {
+            super::playmark_tempo::fail_digest(self, request, *error, cx);
+            super::bpm_snap_persistence::fail_digest(self, request, *error, cx);
+            return true;
+        }
         if super::playmark_tempo::apply_catalog_event(self, &event, publication_fence.as_ref(), cx)
         {
             return true;
@@ -1028,10 +1033,12 @@ impl Browser {
         if let Some(context) = &previous {
             if context.revision == revision {
                 super::playmark_tempo::adopt_digest_revision(self, scope, revision, cx);
+                super::bpm_snap_persistence::adopt_digest_revision(self, scope, revision, cx);
                 return;
             }
             if context.revision > revision {
                 super::playmark_tempo::reject_digest_revision(self, scope, cx);
+                super::bpm_snap_persistence::reject_digest_revision(self, scope, cx);
                 return;
             }
         }
@@ -1080,6 +1087,7 @@ impl Browser {
             });
         let Some(previous) = exact.filter(|_| patched) else {
             super::playmark_tempo::reject_digest_revision(self, scope, cx);
+            super::bpm_snap_persistence::reject_digest_revision(self, scope, cx);
             self.catalog_pending_command
                 .get_or_insert(CatalogCommandIntent::ReadSnapshot {
                     source_id: key.source_id,
@@ -1131,6 +1139,7 @@ impl Browser {
             cx,
         );
         super::playmark_tempo::adopt_digest_revision(self, scope, revision, cx);
+        super::bpm_snap_persistence::adopt_digest_revision(self, scope, revision, cx);
         cx.notify();
     }
 

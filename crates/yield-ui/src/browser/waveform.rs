@@ -189,7 +189,7 @@ impl Render for BpmSnapTooltip {
             .text_size(px(theme.typography.small_size))
             .text_color(crate::theme::color(theme.colors.text_primary))
             .child(
-                "Paint new playmarks in whole beats at the authored tempo. Snap resized selections to whole BPM values.",
+                "Paint new playmarks in whole beats when a BPM is set. Snap resized selections to whole BPM values.",
             )
     }
 }
