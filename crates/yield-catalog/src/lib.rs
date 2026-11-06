@@ -173,6 +173,7 @@ pub use root::{VerifiedSourceRoot, resolve_source_root};
 
 use watcher::{
     AuditDisposition, AuditTrigger, WatcherMode, WatcherSchedule, run_watcher_idle_work,
+    start_local_watcher,
 };
 
 const COMMAND_CAPACITY: usize = 32;
@@ -3894,7 +3895,7 @@ impl CatalogService {
         }
         #[cfg(not(test))]
         {
-            Self::start_inner(profile_guard, None, None, WatcherMode::Native)
+            Self::start_inner(profile_guard, None, None, WatcherMode::runtime())
         }
     }
 
@@ -3911,7 +3912,7 @@ impl CatalogService {
         }
         #[cfg(not(test))]
         {
-            Self::start_inner(profile_guard, None, Some(journal), WatcherMode::Native)
+            Self::start_inner(profile_guard, None, Some(journal), WatcherMode::runtime())
         }
     }
 
@@ -3951,7 +3952,7 @@ impl CatalogService {
         #[cfg(test)]
         let mode = WatcherMode::Detached;
         #[cfg(not(test))]
-        let mode = WatcherMode::Native;
+        let mode = WatcherMode::runtime();
         Self::start_inner_with_harvest(profile_guard, None, journal, mode, Some(harvest))
     }
 
@@ -3961,6 +3962,24 @@ impl CatalogService {
         journal: Option<OperationJournalClient>,
         watcher_mode: WatcherMode,
         harvest: Option<HarvestFactsClient>,
+    ) -> Result<Self, CatalogStartError> {
+        Self::start_configured(
+            profile_guard,
+            test_gate,
+            journal,
+            watcher_mode,
+            harvest,
+            None,
+        )
+    }
+
+    fn start_configured(
+        profile_guard: &WritableProfileGuard,
+        test_gate: Option<Arc<CatalogTestGate>>,
+        journal: Option<OperationJournalClient>,
+        watcher_mode: WatcherMode,
+        harvest: Option<HarvestFactsClient>,
+        watcher_executable: Option<PathBuf>,
     ) -> Result<Self, CatalogStartError> {
         let worker_profile_guard = profile_guard.try_clone()?;
         let (commands, command_rx) = mpsc::sync_channel(COMMAND_CAPACITY);
@@ -3982,6 +4001,7 @@ impl CatalogService {
                     worker_journal,
                     watcher_mode,
                     harvest,
+                    watcher_executable,
                 )
             })
             .map_err(CatalogStartError::ThreadSpawn)?;
@@ -4287,6 +4307,7 @@ fn run_worker(
     journal: Option<OperationJournalClient>,
     watcher_mode: WatcherMode,
     harvest: Option<HarvestFactsClient>,
+    watcher_executable: Option<PathBuf>,
 ) {
     run_worker_with_sources(
         profile_guard,
@@ -4298,6 +4319,7 @@ fn run_worker(
         watcher_mode,
         harvest,
         HashMap::new(),
+        watcher_executable,
     );
 }
 
@@ -4311,6 +4333,7 @@ fn run_worker_with_sources(
     watcher_mode: WatcherMode,
     harvest: Option<HarvestFactsClient>,
     mut sources: HashMap<SourceId, RegisteredSource>,
+    watcher_executable: Option<PathBuf>,
 ) {
     let control = admission
         .lock()
@@ -4323,11 +4346,27 @@ fn run_worker_with_sources(
     let mut deferred = VecDeque::<QueuedCatalogCommand>::new();
     let mut pending_finalizations = HashMap::<SourceId, PendingSourceFinalization>::new();
     let mut idle = idle_maintenance::Pacing::new(Instant::now());
+    #[cfg(target_os = "macos")]
+    let mut watchers = watcher_mode
+        .uses_helper()
+        .then(|| watcher::supervised::Supervisor::new(watcher_executable));
+    #[cfg(not(target_os = "macos"))]
+    let _ = watcher_executable;
     loop {
         #[cfg(feature = "test-support")]
         test_support::original_worker_failure(&admission);
         preparations.poll(&admission, &mut sources);
         let closing = admission_state(&admission, |state| state.shutdown || state.closed);
+        #[cfg(target_os = "macos")]
+        if let Some(watchers) = watchers.as_mut() {
+            watchers.poll(
+                &admission,
+                &mut sources,
+                test_gate.as_ref(),
+                closing,
+                !preparations.has_slots(),
+            );
+        }
         if closing {
             preparations.close(&mut sources);
         }
@@ -4539,6 +4578,8 @@ fn run_worker_with_sources(
         reservation.finish();
         idle.activity(Instant::now());
     }
+    #[cfg(target_os = "macos")]
+    drop(watchers);
     drop(transients);
     preparations.close(&mut sources);
     preparations.retire_failed(journal.as_ref(), &mut pending_finalizations);
@@ -5907,27 +5948,13 @@ fn register_source(
     {
         source.snapshot = Some(snapshot);
     }
-    let watcher_spec = SourceWatchSpec::new(
-        source_id.clone(),
-        lifecycle_generation,
-        source.root.clone(),
-        source.known_root_identity.clone(),
+    start_local_watcher(
+        &source_id,
+        &mut source,
+        test_gate,
+        watcher_mode,
+        Instant::now(),
     );
-    let watcher = match watcher_mode {
-        WatcherMode::Native => SourceWatcher::start(watcher_spec),
-        WatcherMode::Detached => Ok(SourceWatcher::detached(watcher_spec)),
-    };
-    match watcher {
-        Ok(watcher) => {
-            let signal = watcher.signal();
-            source.watcher = Some(watcher);
-            source.watcher_schedule.watcher_started(Instant::now());
-            if let Some(test_gate) = test_gate {
-                test_gate.install_watcher_signal(source_id.clone(), lifecycle_generation, signal);
-            }
-        }
-        Err(_) => source.watcher_schedule.watcher_start_failed(Instant::now()),
-    }
     if let Err(error) = root::revalidate_registration_root(
         &source_id,
         &source.root,
@@ -7419,7 +7446,7 @@ fn audit_source(
         });
     }
     #[cfg(target_os = "macos")]
-    let bootstrap_capture = if matches!(watcher_mode, WatcherMode::Native)
+    let bootstrap_capture = if watcher_mode.uses_native_replay()
         && source
             .database
             .read_durable_replay_prior(
@@ -8234,6 +8261,9 @@ fn now_epoch_seconds() -> i64 {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "macos")]
+    mod supervised_watcher;
+
     use super::*;
     use std::sync::atomic::AtomicUsize;
     use std::sync::{MutexGuard, OnceLock};

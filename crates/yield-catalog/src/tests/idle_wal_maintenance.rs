@@ -82,6 +82,7 @@ fn start_source_idle(
             WatcherMode::Detached,
             None,
             sources,
+            None,
         );
     });
     let service = CatalogService {

@@ -24,7 +24,7 @@ pub(super) fn run(
     mode: WatcherMode,
     now: Instant,
 ) {
-    if !matches!(mode, WatcherMode::Native) || !cfg!(target_os = "macos") {
+    if !mode.uses_native_replay() {
         return;
     }
     // A retained envelope wins over a later hint. New hints stay coalesced for the next capture.
