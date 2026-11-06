@@ -36,6 +36,8 @@ pub enum WavEditOperation {
     Trim,
     /// Keep only selected existing frames; silence outside the source is not supported here.
     Crop,
+    /// Convert the whole stereo source to one channel with equal channel weights.
+    ConvertToMono,
     /// Rotate the whole file by signed frames, wrapping at the ends without changing length.
     Slide {
         /// Positive offsets move audio right; negative offsets move it left.
@@ -67,7 +69,7 @@ impl WavEditPreparationRequest {
     ///
     /// `Crop` preserves signed bounds and becomes `CropWithSilence`. Gain/fades, reverse,
     /// mute and trim use only the source intersection and reject wholly absent audio.
-    /// Frame-authored crops and whole-file slides use their dedicated constructors instead.
+    /// Frame-authored crops and whole-file operations use their dedicated constructors instead.
     pub fn from_edit_region(
         context: WaveformDetailContext,
         region: yield_core::WaveformEditRegion,
@@ -81,10 +83,12 @@ impl WavEditPreparationRequest {
         }
         if matches!(
             operation,
-            WavEditOperation::CropWithSilence { .. } | WavEditOperation::Slide { .. }
+            WavEditOperation::CropWithSilence { .. }
+                | WavEditOperation::Slide { .. }
+                | WavEditOperation::ConvertToMono
         ) {
             return Err(String::from(
-                "frame-authored crops and whole-file slides require their dedicated constructors",
+                "frame-authored crops and whole-file operations require their dedicated constructors",
             ));
         }
         let (start_frame, end_frame) = region
@@ -122,6 +126,16 @@ impl WavEditPreparationRequest {
             && (range.start_frame != 0 || range.end_frame != context.total_frames)
         {
             return Err(String::from("slide requires the whole source range"));
+        }
+        if operation == WavEditOperation::ConvertToMono {
+            if context.spec.channels != 2 {
+                return Err(String::from("mono conversion requires a stereo source"));
+            }
+            if range.start_frame != 0 || range.end_frame != context.total_frames {
+                return Err(String::from(
+                    "mono conversion requires the whole source range",
+                ));
+            }
         }
         if operation == WavEditOperation::Trim && range.len() == context.total_frames {
             return Err(String::from("trimming the entire WAV would leave no audio"));
@@ -181,13 +195,23 @@ impl WavEditPreparationRequest {
         };
         Self::with_operation(context, range, WavEditOperation::Slide { frame_offset })
     }
+
+    /// Prepare a whole-file stereo downmix. The resulting WAV remains unpublished.
+    pub fn with_mono_conversion(context: WaveformDetailContext) -> Result<Self, String> {
+        let range = WaveformDetailRange {
+            start_frame: 0,
+            end_frame: context.total_frames,
+        };
+        Self::with_operation(context, range, WavEditOperation::ConvertToMono)
+    }
 }
 
 /// Prepare the whole edited WAV in a fresh caller-owned sink, without publishing it.
 ///
 /// `decoded_byte_budget` bounds the decoded f32 buffer, additionally capped by
 /// [`MAX_WAV_EDIT_DECODED_BYTES`]. The caller must run this blocking work off the UI thread.
-/// Output retains channels and sample rate and uses native unclipped 32-bit float encoding.
+/// Output retains the sample rate and uses native unclipped 32-bit float encoding.
+/// Mono conversion emits one channel. Other operations retain the original channel count.
 /// Trim removes selected frames; crop retains only selected frames. Other operations retain
 /// the original frame count. `CropWithSilence` accepts signed bounds and pads absent frames.
 /// Other selection bounds must lie within existing audio. The budget bounds the larger of
@@ -240,13 +264,18 @@ pub fn prepare_wav_edit_with_cancel<W: Write + Seek>(
     };
     let capacity = sample_count.max(padded_crop.as_ref().map_or(0, |plan| plan.output_samples));
     check_sample_budget(capacity, decoded_byte_budget)?;
-    crate::edited_wav::checked_spec(
-        padded_crop
-            .as_ref()
-            .map_or(sample_count, |plan| plan.output_samples),
-        usize::from(context.spec.channels),
-        context.spec.sample_rate,
-    )?;
+    let convert_to_mono = request.operation == WavEditOperation::ConvertToMono;
+    let (output_channels, output_samples) = if convert_to_mono {
+        (1, context.total_frames)
+    } else {
+        (
+            usize::from(context.spec.channels),
+            padded_crop
+                .as_ref()
+                .map_or(sample_count, |plan| plan.output_samples),
+        )
+    };
+    crate::edited_wav::checked_spec(output_samples, output_channels, context.spec.sample_rate)?;
     let whole_source = WavSpanExportRequest::from_frames(context.clone(), 0, context.total_frames)?;
     let mut opened = detail::open_wav(&context.path, cancellation)?;
     if crate::WaveformSpec::from_hound(opened.spec) != context.spec
@@ -260,10 +289,31 @@ pub fn prepare_wav_edit_with_cancel<W: Write + Seek>(
     check_cancel(cancellation)?;
     let mut samples = Vec::new();
     samples
-        .try_reserve_exact(capacity)
+        .try_reserve_exact(if convert_to_mono {
+            output_samples
+        } else {
+            capacity
+        })
         .map_err(|error| format!("failed to reserve WAV edit buffer: {error}"))?;
-    match opened.spec.sample_format {
-        hound::SampleFormat::Float => {
+    match (convert_to_mono, opened.spec.sample_format) {
+        (true, hound::SampleFormat::Float) => decode_mono(
+            opened.reader.samples::<f32>(),
+            context.total_frames,
+            &mut samples,
+            f64::from,
+            cancellation,
+        )?,
+        (true, hound::SampleFormat::Int) => {
+            let scale = (1_i64 << (opened.spec.bits_per_sample - 1)) as f64;
+            decode_mono(
+                opened.reader.samples::<i32>(),
+                context.total_frames,
+                &mut samples,
+                |value| f64::from(value) / scale,
+                cancellation,
+            )?;
+        }
+        (false, hound::SampleFormat::Float) => {
             decode_samples(
                 opened.reader.samples::<f32>(),
                 sample_count,
@@ -272,7 +322,7 @@ pub fn prepare_wav_edit_with_cancel<W: Write + Seek>(
                 cancellation,
             )?;
         }
-        hound::SampleFormat::Int => {
+        (false, hound::SampleFormat::Int) => {
             let scale = (1_i64 << (opened.spec.bits_per_sample - 1)) as f32;
             decode_samples(
                 opened.reader.samples::<i32>(),
@@ -312,6 +362,7 @@ pub fn prepare_wav_edit_with_cancel<W: Write + Seek>(
                 || check_cancel(cancellation),
             )?;
         }
+        WavEditOperation::ConvertToMono => {} // Downmixed during decode.
         WavEditOperation::CropWithSilence { .. } => {
             padded_crop
                 .as_ref()
@@ -330,7 +381,7 @@ pub fn prepare_wav_edit_with_cancel<W: Write + Seek>(
     recheck(context, &opened, cancellation)?;
     crate::encode_edited_wav_with_cancel(
         &samples,
-        usize::from(context.spec.channels),
+        output_channels,
         context.spec.sample_rate,
         sink,
         cancellation,
@@ -591,17 +642,46 @@ fn decode_samples<T>(
         if index % 4_096 == 0 {
             check_cancel(cancellation)?;
         }
-        let value = source
-            .next()
-            .ok_or_else(|| String::from("incomplete WAV edit source"))?
-            .map_err(|error| format!("failed to decode WAV edit source: {error}"))?;
-        output.push(convert(value));
+        output.push(convert(read_sample(&mut source)?));
     }
     check_cancel(cancellation)?;
     if source.next().is_some() {
         return Err(String::from("WAV edit source has extra samples"));
     }
     Ok(())
+}
+
+fn decode_mono<T>(
+    mut source: impl Iterator<Item = Result<T, hound::Error>>,
+    frames: usize,
+    output: &mut Vec<f32>,
+    convert: impl Fn(T) -> f64,
+    cancellation: Option<&AtomicBool>,
+) -> Result<(), String> {
+    for frame in 0..frames {
+        if frame % 2_048 == 0 {
+            check_cancel(cancellation)?;
+        }
+        let left = convert(read_sample(&mut source)?);
+        let right = convert(read_sample(&mut source)?);
+        if !left.is_finite() || !right.is_finite() {
+            return Err(String::from("mono conversion rejects nonfinite samples"));
+        }
+        // Sum before narrowing to retain cancellation residuals from 32-bit PCM.
+        output.push(((left + right) * 0.5) as f32);
+    }
+    check_cancel(cancellation)?;
+    if source.next().is_some() {
+        return Err(String::from("WAV edit source has extra samples"));
+    }
+    Ok(())
+}
+
+fn read_sample<T>(source: &mut impl Iterator<Item = Result<T, hound::Error>>) -> Result<T, String> {
+    source
+        .next()
+        .ok_or_else(|| String::from("incomplete WAV edit source"))?
+        .map_err(|error| format!("failed to decode WAV edit source: {error}"))
 }
 
 #[cfg(test)]
@@ -655,6 +735,100 @@ mod tests {
         let mut encoded = Cursor::new(Vec::new());
         crate::encode_edited_wav(samples, channels, 48_000, &mut encoded).unwrap();
         fs::write(path, encoded.into_inner()).unwrap();
+    }
+
+    #[test]
+    fn mono_conversion_preserves_frames_rate_and_source_across_supported_pcm_depths() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("stereo.wav");
+        for bits in [8, 16, 24, 32] {
+            let half = 1 << (bits - 2);
+            let scale = 1_i64 << (bits - 1);
+            write_int(
+                &path,
+                &[
+                    half,
+                    half,
+                    half,
+                    -half,
+                    0,
+                    -half,
+                    (scale - 1) as i32,
+                    (-scale) as i32,
+                    0,
+                    0,
+                ],
+                2,
+                bits,
+            );
+            let original = fs::read(&path).unwrap();
+            let mono = WavEditPreparationRequest::with_mono_conversion(request(&path).context)
+                .expect("whole stereo input");
+            let mut output = Cursor::new(Vec::new());
+            prepare_wav_edit(&mono, 40, &mut output).expect("mono preparation");
+            let (spec, samples) = read_output(output);
+            assert_eq!(spec.channels, 1);
+            assert_eq!(spec.sample_rate, 1_000);
+            assert_eq!(spec.bits_per_sample, 32);
+            assert_eq!(spec.sample_format, hound::SampleFormat::Float);
+            assert_eq!(samples, [0.5, 0.0, -0.25, -0.5 / scale as f32, 0.0]);
+            assert_eq!(fs::read(&path).unwrap(), original);
+        }
+    }
+
+    #[test]
+    fn mono_conversion_keeps_finite_float_extremes_and_requires_exact_stereo() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("float.wav");
+        let subnormal = f32::from_bits(1);
+        write_float(&path, &[f32::MAX, f32::MAX, subnormal, subnormal], 2);
+        let mono = WavEditPreparationRequest::with_mono_conversion(request(&path).context)
+            .expect("stereo float");
+        let mut output = Cursor::new(Vec::new());
+        prepare_wav_edit(&mono, 16, &mut output).expect("mono preparation");
+        let (spec, samples) = read_output(output);
+        assert_eq!((spec.channels, spec.sample_rate), (1, 48_000));
+        assert_eq!(samples, [f32::MAX, subnormal]);
+
+        let mut partial = mono;
+        partial.range.end_frame = 1;
+        let mut output = Cursor::new(Vec::new());
+        assert!(prepare_wav_edit(&partial, 16, &mut output).is_err());
+        assert!(output.get_ref().is_empty());
+        for channels in [1, 3] {
+            write_float(&path, &[0.5; 3][..channels], channels);
+            assert!(
+                WavEditPreparationRequest::with_mono_conversion(request(&path).context).is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn mono_conversion_refuses_insufficient_budget_cancellation_and_nonfinite_audio() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("float.wav");
+        write_float(&path, &[0.5, f32::INFINITY], 2);
+        let original = fs::read(&path).unwrap();
+        let mono = WavEditPreparationRequest::with_mono_conversion(request(&path).context)
+            .expect("stereo input shape");
+        let mut output = Cursor::new(Vec::new());
+        assert!(
+            prepare_wav_edit(&mono, 7, &mut output)
+                .unwrap_err()
+                .contains("budget")
+        );
+        assert!(
+            prepare_wav_edit_with_cancel(&mono, 8, &mut output, Some(&AtomicBool::new(true)))
+                .unwrap_err()
+                .contains("canceled")
+        );
+        assert!(
+            prepare_wav_edit(&mono, 8, &mut output)
+                .unwrap_err()
+                .contains("nonfinite")
+        );
+        assert!(output.get_ref().is_empty());
+        assert_eq!(fs::read(&path).unwrap(), original);
     }
 
     #[test]

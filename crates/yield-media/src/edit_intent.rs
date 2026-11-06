@@ -213,6 +213,11 @@ fn operation_args(
         WavEditOperation::Mute => WaveformEditOperationArgs::Mute,
         WavEditOperation::Trim => WaveformEditOperationArgs::Trim,
         WavEditOperation::Crop => WaveformEditOperationArgs::Crop,
+        WavEditOperation::ConvertToMono => {
+            return Err(WaveformEditIntentAdapterError::InvalidRequest(
+                String::from("mono conversion does not yet have a durable edit command"),
+            ));
+        }
         WavEditOperation::Slide { frame_offset } => {
             WaveformEditOperationArgs::Slide { frame_offset }
         }
@@ -466,6 +471,17 @@ mod tests {
             assert_eq!(reconstructed.range, request.range);
             assert_eq!(reconstructed.operation, request.operation);
         }
+    }
+
+    #[test]
+    fn prepared_mono_conversion_cannot_admit_a_stereo_journal_edit() {
+        let (endpoint, participants, context) = fixture();
+        let mono = WavEditPreparationRequest::with_mono_conversion(context).expect("stereo");
+        assert!(matches!(
+            waveform_edit_intent(endpoint, &participants, &mono),
+            Err(WaveformEditIntentAdapterError::InvalidRequest(reason))
+                if reason.contains("durable edit command")
+        ));
     }
 
     #[test]
