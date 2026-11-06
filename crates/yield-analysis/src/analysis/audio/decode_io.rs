@@ -15,18 +15,23 @@ pub(crate) fn decode_for_analysis(path: &Path) -> Result<AnalysisAudio, String> 
 }
 
 /// Audio metadata probed without running the full analysis decode path.
+#[derive(Debug)]
 pub struct AudioProbe {
     /// Total decoded duration when the source reports one.
     pub duration_seconds: Option<f32>,
     /// Source sample rate when known.
     pub sample_rate: Option<u32>,
-    #[cfg(test)]
     /// Source channel count when known.
     pub channels: Option<u16>,
+    /// Source PCM bit depth when available.
+    pub bits_per_sample: Option<u32>,
 }
 
 /// Probe source metadata without running the full analysis decode path.
 pub fn probe_metadata(path: &Path) -> Result<AudioProbe, String> {
+    if crate::analysis::aiff::is_aiff_path(path) {
+        return crate::analysis::aiff::probe(path).map_err(|error| error.to_string());
+    }
     if path
         .extension()
         .and_then(|ext| ext.to_str())
@@ -41,8 +46,8 @@ pub fn probe_metadata(path: &Path) -> Result<AudioProbe, String> {
         return Ok(AudioProbe {
             duration_seconds: Some(duration_seconds),
             sample_rate: Some(sample_rate),
-            #[cfg(test)]
             channels: Some(spec.channels.max(1)),
+            bits_per_sample: Some(u32::from(spec.bits_per_sample)),
         });
     }
 
@@ -79,15 +84,11 @@ pub fn probe_metadata(path: &Path) -> Result<AudioProbe, String> {
     Ok(AudioProbe {
         duration_seconds,
         sample_rate: Some(sample_rate),
-        #[cfg(test)]
-        channels: Some(
-            track
-                .codec_params
-                .channels
-                .map(|channels| channels.count() as u16)
-                .unwrap_or(2)
-                .max(1),
-        ),
+        channels: track
+            .codec_params
+            .channels
+            .map(|channels| channels.count() as u16),
+        bits_per_sample: track.codec_params.bits_per_sample,
     })
 }
 

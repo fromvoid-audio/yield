@@ -12,6 +12,7 @@ warnings = "deny"
 missing_docs = "deny"
 
 [dependencies]
+aifc = "=0.7.0"
 blake3 = "1.6.1"
 directories = "6.0.0"
 hdbscan = "0.12.0"
