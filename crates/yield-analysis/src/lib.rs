@@ -6,6 +6,8 @@
 /// Background analysis helpers (decoding, normalization, feature extraction).
 pub mod analysis;
 mod app_dirs;
+/// Native-frame transient detection over bounded decoded PCM.
+pub mod transients;
 
 pub use analysis::LIGHT_DSP_VECTOR_LEN;
 pub use analysis::{
