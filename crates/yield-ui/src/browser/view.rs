@@ -134,6 +134,7 @@ const MAX_WAVEFORM_HEIGHT: f32 = 512.0;
 const MIN_MAIN_PANE_WIDTH: f32 = 240.0;
 const MIN_LIST_ROWS: f32 = 4.0;
 const PANE_RESIZE_RAIL: f32 = 6.0;
+const WIDE_TOOLBAR_WIDTH: f32 = 1_440.0;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum PaneAxis {
@@ -200,27 +201,42 @@ fn browser_toolbar_gap(window_width: f32, theme: &Theme) -> f32 {
     }
 }
 
+fn browser_toolbar_row_count(window_width: f32, enlarged: bool, has_waveform: bool) -> u8 {
+    if enlarged {
+        if has_waveform && window_width < crate::WINDOW_WIDTH {
+            3
+        } else {
+            2
+        }
+    } else if (has_waveform && window_width < WIDE_TOOLBAR_WIDTH)
+        || window_width < crate::WINDOW_WIDTH
+    {
+        2
+    } else {
+        1
+    }
+}
+
 fn browser_toolbar_height(
     window_width: f32,
     theme: &Theme,
     enlarged: bool,
     has_waveform: bool,
 ) -> f32 {
-    if !enlarged {
+    let rows = browser_toolbar_row_count(window_width, enlarged, has_waveform);
+    if rows == 1 {
         return theme.spacing.toolbar_height;
     }
-    let rows = if has_waveform && window_width < 1_120.0 {
-        3.0
+    let rows = f32::from(rows);
+    let edge_space = if enlarged {
+        theme.spacing.panel_padding * 2.0
     } else {
-        2.0
+        theme.spacing.border_width * 2.0
     };
-    theme.spacing.control_height * rows
+    (theme.spacing.control_height * rows
         + browser_toolbar_gap(window_width, theme) * (rows - 1.0)
-        + theme.spacing.panel_padding * 2.0
-}
-
-fn browser_status_bar_height(theme: &Theme, enlarged: bool) -> f32 {
-    theme.spacing.status_height * if enlarged { 2.0 } else { 1.0 }
+        + edge_space)
+        .max(theme.spacing.toolbar_height)
 }
 
 fn waveform_height(
@@ -614,11 +630,7 @@ impl Browser {
                             == yield_session::ENLARGED_TEXT_SCALE_PERCENT,
                         self.waveform.is_some(),
                     ),
-                    browser_status_bar_height(
-                        theme,
-                        self.general_settings.text_scale_percent
-                            == yield_session::ENLARGED_TEXT_SCALE_PERCENT,
-                    ),
+                    theme.spacing.status_height,
                 ),
                 self.preferred_waveform_height,
             ),
@@ -700,11 +712,7 @@ impl Browser {
                             == yield_session::ENLARGED_TEXT_SCALE_PERCENT,
                         self.waveform.is_some(),
                     ),
-                    browser_status_bar_height(
-                        theme,
-                        self.general_settings.text_scale_percent
-                            == yield_session::ENLARGED_TEXT_SCALE_PERCENT,
-                    ),
+                    theme.spacing.status_height,
                 ));
             }
         }
@@ -1518,7 +1526,7 @@ impl Render for Browser {
                 enlarged_text,
                 self.waveform.is_some(),
             ),
-            browser_status_bar_height(&theme, enlarged_text),
+            theme.spacing.status_height,
         );
         let motion_frame = self.motion_frame(theme.motion, window);
         let jobs = super::job_details::snapshot(self, cx);
@@ -1591,7 +1599,12 @@ impl Render for Browser {
             enlarged_text,
             self.waveform.is_some(),
         );
-        let status_bar_height = browser_status_bar_height(&theme, enlarged_text);
+        let wrap_toolbar = browser_toolbar_row_count(
+            f32::from(window.bounds().size.width),
+            enlarged_text,
+            self.waveform.is_some(),
+        ) > 1;
+        let status_bar_height = theme.spacing.status_height;
         let loop_enabled = self.loop_toolbar_enabled();
         let loop_label = self.loop_toolbar_label();
         let bpm_snap_enabled = self.bpm_snap_enabled;
@@ -2052,7 +2065,7 @@ impl Render for Browser {
                     .flex_none()
                     .items_center()
                     .h(px(toolbar_height))
-                    .when(enlarged_text, |element| {
+                    .when(wrap_toolbar, |element| {
                         element.flex_wrap().content_start()
                     })
                     .gap(px(toolbar_gap))
@@ -2067,7 +2080,7 @@ impl Render for Browser {
                                 - theme.spacing.panel_padding)
                                 .max(0.0)))
                             .h_full()
-                            .when(enlarged_text, |element| {
+                            .when(wrap_toolbar, |element| {
                                 element.h(px(theme.spacing.control_height))
                             })
                             .window_control_area(WindowControlArea::Drag)
@@ -3067,6 +3080,10 @@ impl Render for Browser {
             })
     }
 }
+
+#[cfg(test)]
+#[path = "density_layout_tests.rs"]
+mod density_layout_tests;
 
 #[cfg(test)]
 mod tests {
@@ -4618,9 +4635,15 @@ mod tests {
             status.bottom() <= px(560.0),
             "footer escaped the window: {status:?}"
         );
+        let status_details = cx
+            .debug_bounds("status-job-details")
+            .expect("status details action");
         assert!(
-            status.size.height > px(60.0),
-            "footer did not reserve wrapped text: {status:?}"
+            status_details.left() >= status.left()
+                && status_details.right() <= status.right()
+                && status_details.top() >= status.top()
+                && status_details.bottom() <= status.bottom(),
+            "status details {status_details:?} escaped {status:?}"
         );
 
         let viewport = cx
@@ -5379,7 +5402,7 @@ mod tests {
                 560.0,
                 &enlarged,
                 browser_toolbar_height(960.0, &enlarged, true, false),
-                browser_status_bar_height(&enlarged, true),
+                enlarged.spacing.status_height,
             ) >= minimum
         );
     }
