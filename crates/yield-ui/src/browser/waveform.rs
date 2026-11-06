@@ -2222,6 +2222,7 @@ impl Browser {
     }
 
     pub(super) fn clear_waveform_region(&mut self) {
+        self.playmark_resize_anchor = None;
         self.cancel_playmark_timing_edit();
         self.similar_sections.cancel();
         zero_crossing::cancel_for_interruption(self);
@@ -2236,6 +2237,7 @@ impl Browser {
 
     pub(super) fn set_waveform_play_region(&mut self, region: Option<WaveformPlayRegion>) {
         if self.waveform_play_region != region {
+            self.playmark_resize_anchor = None;
             self.cancel_playmark_timing_edit();
         }
         self.waveform_play_region = region;
