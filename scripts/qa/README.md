@@ -62,3 +62,17 @@ Keep the Git SHA, macOS build, SDK, filesystem, and individual run output with
 the report. The probe measures the native registration call. Event delivery,
 bounded behavior during a daemon stall, and production catalog ownership
 require separate evidence.
+
+Run the supervised process variant against the same compiled probe:
+
+```sh
+python3 scripts/internal/ci/managed_exec.py --timeout-seconds 8 \
+  python3 scripts/qa/macos_watcher_supervision_probe.py "$probe_dir/dual-path"
+```
+
+This variant stops an owned child before it enters registration to force a
+missed readiness deadline, then verifies retry serialization and reaping.
+Live starts exercise superseded generation and replaced root refusal,
+descendant delivery, sibling filtering, and root rename. The probe has no
+catalog publication or checkpoint authority. It uses a simulated stall,
+so it measures caller behavior without a hard guarantee for kernel cleanup.
