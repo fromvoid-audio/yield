@@ -84,6 +84,8 @@ impl ReplayUncertainty {
     pub const UNKNOWN_EVENT: Self = Self(1 << 8);
     /// The stream stopped before the native historical-replay completion marker.
     pub const HISTORY_INCOMPLETE: Self = Self(1 << 9);
+    /// The root directory's modification time changed during a silent bootstrap stream.
+    pub const SILENT_ROOT_CHANGE: Self = Self(1 << 10);
 
     /// Return whether no uncertainty was recorded.
     pub const fn is_empty(self) -> bool {
