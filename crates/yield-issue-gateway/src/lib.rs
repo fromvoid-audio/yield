@@ -312,6 +312,47 @@ mod tests {
     use std::net::TcpListener;
     use std::thread;
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_token_store_selects_secret_service() {
+        let entry = TokenStore::entry().expect("valid credential locator");
+        assert!(
+            entry
+                .get_credential()
+                .is::<keyring::secret_service::SsCredential>()
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires explicit Linux Secret Service qualification"]
+    fn linux_secret_service_probe() {
+        let step = std::env::var("YIELD_KEYRING_TEST_STEP").expect("explicit probe step");
+        if step == "unavailable" {
+            assert!(matches!(
+                TokenStore::load(),
+                Err(TokenStoreError::Unavailable)
+            ));
+            return;
+        }
+
+        let account = std::env::var("YIELD_KEYRING_TEST_ACCOUNT").expect("unique probe account");
+        assert!(
+            account
+                .strip_prefix("yield-qa-")
+                .is_some_and(|suffix| Uuid::parse_str(suffix).is_ok())
+        );
+        let entry = keyring::Entry::new(KEYRING_SERVICE, &account).expect("valid probe locator");
+        let token = "yield_linux_keyring_fixture_only_0000";
+        match step.as_str() {
+            "store" => assert!(entry.set_password(token).is_ok()),
+            "load" => assert!(entry.get_password().is_ok_and(|value| value == token)),
+            "delete" => assert!(entry.delete_credential().is_ok()),
+            "absent" => assert!(matches!(entry.get_password(), Err(keyring::Error::NoEntry))),
+            _ => panic!("unknown probe step"),
+        }
+    }
+
     fn serve_once(status: &str, body: &'static str) -> (String, thread::JoinHandle<String>) {
         let listener = TcpListener::bind("127.0.0.1:0").expect("local test listener");
         let address = format!("http://{}/", listener.local_addr().unwrap());
