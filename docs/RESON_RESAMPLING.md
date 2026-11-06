@@ -97,14 +97,17 @@ ratio for the isolated stereo dot-product workload was 7.193 ms per second
 of output. The production streaming adapter must verify these targets with
 its actual history, routing, and callback integration.
 
-## Kernel qualification
+## Streaming qualification
 
-The standalone probe uses the same kernel source intended for Reson. It runs
-the common-rate matrix and an interpolated 48,001 → 44,100 Hz pair. The kernel
-caps future support at 512 frames, uses up to 320 exact phase intervals or
+The standalone probe uses the kernel and streaming state intended for Reson.
+It runs the common-rate matrix and an interpolated 48,001 → 44,100 Hz pair.
+The kernel caps future support at 512 frames, uses up to 320 exact phase intervals or
 128 interpolated intervals, and stores one additional row for the phase-wrap
-endpoint. The render call only reads the prepared coefficients and source
-window.
+endpoint. The stream prepares fixed mirrored history off-thread, then reads
+on demand. It repeats the first and last source frames at finite edges and
+reports the next output frame's exact source coordinate independently of
+the read head. Decimation is limited to 64:1 so the render step has a fixed
+upper bound on source reads.
 
 ```sh
 scratch=$(mktemp -d)
