@@ -45,8 +45,11 @@ No automatic archival is performed during startup or checks.
 
 For the active GPUI fork, use `scripts/gpui-local-ci.sh` on macOS and
 `scripts/install-gpui-local-ci.sh` for its automatic commit hook; see
-[GPUI local CI](../docs/GPUI_LOCAL_CI.md). Windows and Linux native release qualification
-is deferred until the macOS release-ready gate OPT-1863 is complete.
+[GPUI local CI](../docs/GPUI_LOCAL_CI.md). Linux is an active product target:
+`bash scripts/gpui-linux-ci.sh [check|full]` checks the normal desktop graph and
+workspace locally without macOS state transactions. See
+[Linux support](../docs/LINUX_SUPPORT.md) for prerequisites and native boundaries.
+macOS and Windows qualification is tracked separately in platform-tagged issues.
 The older `scripts/ci.sh` lanes below still target the legacy Radiant app and
 are not GPUI acceptance gates.
 

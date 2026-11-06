@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-# Developer-validation helper only. Yield does not ship Linux app builds.
+# Developer-validation helper only; this is not Linux desktop/audio acceptance.
 # This configures a dummy ALSA backend for headless Linux CI/agent/perf runs so
 # logs are not flooded with "cannot find card" / "Unknown PCM default" noise.
 yield_setup_headless_audio() {

@@ -45,6 +45,9 @@ gpui = { workspace = true, features = ["test-support"] }
 yield-catalog = { path = "../yield-catalog", features = ["test-support"] }
 tempfile.workspace = true
 
+[target.'cfg(target_os = "linux")'.dependencies]
+gpui = { workspace = true, features = ["x11", "wayland"] }
+
 [target.'cfg(target_os = "macos")'.dependencies]
 naga = { version = "=25.0.1", features = ["wgsl-in"] }
 
