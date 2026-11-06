@@ -49,6 +49,28 @@ pub(super) struct PlaybackRetargetTarget {
     pub(super) span: WaveformPlayRegion,
     pub(super) desired: PlaybackDesiredState,
     pub(super) seek_if_outside: bool,
+    /// Explicit tempo edits carry the grid through deferred or coalesced requests.
+    pub(super) metronome_grid: MetronomeGridTarget,
+}
+
+/// Whether a retarget inherits the current grid or explicitly configures a new one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum MetronomeGridTarget {
+    /// Preserve the existing source-anchored grid.
+    Retain,
+    /// Use this grid, or the runtime's own span-derived grid when absent.
+    Set(Option<PlaybackMetronomeGrid>),
+    /// Restore the captured grid when a temporary preview ends.
+    Restore(Option<PlaybackMetronomeGrid>),
+}
+
+impl MetronomeGridTarget {
+    fn explicit_grid(self) -> Option<Option<PlaybackMetronomeGrid>> {
+        match self {
+            Self::Set(grid) | Self::Restore(grid) => Some(grid),
+            Self::Retain => None,
+        }
+    }
 }
 
 /// Playback identity captured when a live retarget is admitted by the browser.
@@ -73,13 +95,22 @@ pub(super) struct PlaybackRetargetRequest {
 pub(super) struct PlaymarkTempoAudition {
     anchor: PlaybackRetargetAnchor,
     original: WaveformPlayRegion,
-    latest: WaveformPlayRegion,
+    latest: Option<(WaveformPlayRegion, u8)>,
+    original_grid: Option<PlaybackMetronomeGrid>,
+    original_beats: Option<u16>,
 }
 
 impl PlaymarkTempoAudition {
-    fn changed_span(&self, span: Option<WaveformPlayRegion>) -> Option<WaveformPlayRegion> {
-        let span = span.unwrap_or(self.original);
-        (span != self.latest).then_some(span)
+    fn needs_retarget(&self, preview: Option<(WaveformPlayRegion, u8)>) -> bool {
+        self.latest != preview
+    }
+
+    fn restore_grid(&self, target: &mut PlaybackRetargetTarget) {
+        target.metronome_grid = MetronomeGridTarget::Restore(self.original_grid);
+        if target.desired.metronome_beat_count.is_some() {
+            target.desired.metronome_beat_count =
+                self.original_beats.or(target.desired.metronome_beat_count);
+        }
     }
 }
 
@@ -495,6 +526,9 @@ impl Browser {
         status_label: String,
         cx: &mut Context<Self>,
     ) {
+        if !desired.looped && self.playmark_tempo_audition.is_some() {
+            self.abandon_waveform_region_drag(cx);
+        }
         if self.playback_init_intent.is_some() {
             self.cancel_normalized_audition();
         }
@@ -580,67 +614,134 @@ impl Browser {
         {
             return None;
         }
-        let original = self.accepted_playback_retarget_target(desired)?.span;
+        let target = self.accepted_playback_retarget_target(desired)?;
+        let original = target.span;
+        let original_grid = self.resolve_retarget_metronome_grid(&anchor.path, target);
         Some(PlaymarkTempoAudition {
             anchor,
             original,
-            latest: original,
+            latest: None,
+            original_grid,
+            original_beats: desired.metronome_beat_count,
         })
     }
 
     pub(super) fn preview_playmark_tempo_span(
         &mut self,
         span: Option<WaveformPlayRegion>,
+        beats: u8,
         cx: &mut Context<Self>,
     ) {
         let Some(mut audition) = self.playmark_tempo_audition.take() else {
             return;
         };
+        let preview = span.map(|span| (span, beats));
         if self.current_playback_desired_state().looped
-            && let Some(span) = audition.changed_span(span)
+            && audition.needs_retarget(preview)
             && self
-                .retarget_playmark_tempo_audition(&audition.anchor, span, cx)
+                .retarget_playmark_tempo_audition(&audition, preview, cx)
                 .is_some_and(|result| result.is_ok())
         {
-            audition.latest = span;
+            audition.latest = preview;
         }
         self.playmark_tempo_audition = Some(audition);
     }
 
     pub(super) fn finish_playmark_tempo_audition(
         &mut self,
-        committed: Option<WaveformPlayRegion>,
+        committed: Option<(WaveformPlayRegion, u8)>,
         cx: &mut Context<Self>,
     ) {
         if let Some(audition) = self.playmark_tempo_audition.take() {
-            if let Some(span) = audition.changed_span(committed)
+            if audition.needs_retarget(committed)
                 && let Some(Err(error)) =
-                    self.retarget_playmark_tempo_audition(&audition.anchor, span, cx)
+                    self.retarget_playmark_tempo_audition(&audition, committed, cx)
                 && committed.is_none()
             {
                 // A preview may already be audible. Do not leave that temporary span running.
                 self.stop_playback();
                 self.set_playback_status(format!("Playmark loop restore failed: {error}"));
             }
-        } else if let Some(span) = committed {
-            self.retarget_committed_playmark_resize(span, cx);
+        } else if let Some((span, beats)) = committed {
+            self.retarget_authored_playmark_tempo(span, beats, cx);
         }
     }
 
     fn retarget_playmark_tempo_audition(
         &mut self,
-        anchor: &PlaybackRetargetAnchor,
-        span: WaveformPlayRegion,
+        audition: &PlaymarkTempoAudition,
+        preview: Option<(WaveformPlayRegion, u8)>,
         cx: &mut Context<Self>,
     ) -> Option<Result<(), String>> {
-        if !self.playback_retarget_anchor_is_current(anchor) {
+        if !self.playback_retarget_anchor_is_current(&audition.anchor) {
             return None;
         }
-        let result = self.submit_playmark_timing_span(&anchor.path, span, cx);
+        let span = preview.map_or(audition.original, |(span, _)| span);
+        let mut target = self.accepted_playmark_timing_target(&audition.anchor.path, span)?;
+        if let Some((_, beats)) = preview {
+            target = self.tempo_grid_target(target, beats);
+        } else {
+            audition.restore_grid(&mut target);
+        }
+        let result = self.submit_live_playback_target(target, cx);
         if let Some(Err(error)) = &result {
             self.set_playback_status(format!("Playmark loop update unavailable: {error}"));
         }
         result
+    }
+
+    pub(super) fn retarget_authored_playmark_tempo(
+        &mut self,
+        span: WaveformPlayRegion,
+        beats: u8,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(path) = self.selected_audio_path() else {
+            return;
+        };
+        if let Some(target) = self.accepted_playmark_timing_target(path, span) {
+            let target = self.tempo_grid_target(target, beats);
+            if let Some(Err(error)) = self.submit_live_playback_target(target, cx) {
+                self.set_playback_status(format!("Playmark tempo update unavailable: {error}"));
+            }
+        }
+    }
+
+    fn tempo_grid_target(
+        &self,
+        target: PlaybackRetargetTarget,
+        beats: u8,
+    ) -> PlaybackRetargetTarget {
+        let grid = self
+            .waveform
+            .as_ref()
+            .and_then(|waveform| target.span.frame_bounds(waveform.total_frames))
+            .map(|(start, end)| PlaybackMetronomeGrid {
+                frames: (end - start) as u64,
+                origin_frame: start as u64,
+            });
+        let mut target = target;
+        target.metronome_grid = MetronomeGridTarget::Set(grid);
+        target.desired.metronome_beat_count = target
+            .desired
+            .metronome_beat_count
+            .map(|_| u16::from(beats));
+        target
+    }
+
+    fn resolve_retarget_metronome_grid(
+        &self,
+        path: &Path,
+        target: PlaybackRetargetTarget,
+    ) -> Option<PlaybackMetronomeGrid> {
+        target.metronome_grid.explicit_grid().unwrap_or_else(|| {
+            captured_metronome_grid_or_source(
+                path,
+                self.playback_metronome_grid_path.as_deref(),
+                self.playback_metronome_grid,
+                || metronome::source_grid_for_span(self, path, target.span),
+            )
+        })
     }
 
     fn accepted_playmark_timing_target(
@@ -663,6 +764,7 @@ impl Browser {
             span,
             desired: self.current_playback_desired_state(),
             seek_if_outside: true,
+            metronome_grid: MetronomeGridTarget::Retain,
         })
     }
 
@@ -713,12 +815,7 @@ impl Browser {
         if !target.span.is_valid() {
             return Some(Err(String::from("playback retarget span is unavailable")));
         }
-        let metronome_grid = captured_metronome_grid_or_source(
-            &path,
-            self.playback_metronome_grid_path.as_deref(),
-            self.playback_metronome_grid,
-            || metronome::source_grid_for_span(self, &path, target.span),
-        );
+        let metronome_grid = self.resolve_retarget_metronome_grid(&path, target);
         let Some(handle) = self.playback.as_ref().map(|runtime| runtime.handle.clone()) else {
             return Some(Err(String::from("audio runtime is unavailable")));
         };
@@ -825,6 +922,7 @@ impl Browser {
                 span: request.target.span,
                 desired,
                 seek_if_outside: request.target.seek_if_outside,
+                metronome_grid: request.target.metronome_grid,
             });
         }
         if let Some(pending) = self
@@ -836,6 +934,7 @@ impl Browser {
                 span: pending.request.target.span,
                 desired,
                 seek_if_outside: pending.request.target.seek_if_outside,
+                metronome_grid: pending.request.target.metronome_grid,
             });
         }
         let accepted = self.accepted_playback_intent.as_ref()?;
@@ -844,6 +943,7 @@ impl Browser {
             span,
             desired,
             seek_if_outside: false,
+            metronome_grid: MetronomeGridTarget::Retain,
         })
     }
 
@@ -1352,6 +1452,9 @@ impl Browser {
                 PlaybackRuntimeEvent::Failed { id, error }
                     if self.pending_loop_retarget_event_is_current(id) =>
                 {
+                    if self.pending_tempo_grid_restore() {
+                        self.stop_playback();
+                    }
                     self.pending_loop_retarget = None;
                     self.set_playback_status(format!("Playback live update failed: {error}"));
                 }
@@ -1476,6 +1579,7 @@ impl Browser {
         response_id: u64,
         progress: PlaybackRuntimeProgress,
     ) {
+        let restoring_tempo_grid = self.pending_tempo_grid_restore();
         let accepted_path = self
             .accepted_playback_intent
             .as_ref()
@@ -1505,6 +1609,9 @@ impl Browser {
         match outcome {
             LoopRetargetProgressOutcome::Ignored => {}
             LoopRetargetProgressOutcome::Failed => {
+                if restoring_tempo_grid {
+                    self.stop_playback();
+                }
                 if let Some(error) = progress.error.as_deref() {
                     self.set_playback_status(format!("Playback live update failed: {error}"));
                 } else {
@@ -1605,6 +1712,15 @@ impl Browser {
         })
     }
 
+    fn pending_tempo_grid_restore(&self) -> bool {
+        self.pending_loop_retarget.as_ref().is_some_and(|pending| {
+            matches!(
+                pending.request.target.metronome_grid,
+                MetronomeGridTarget::Restore(_)
+            )
+        })
+    }
+
     fn capture_audio_output_resume_intent(&self) -> Option<PlaybackIntent> {
         if let Some(intent) = self.playback_init_intent.clone() {
             return Some(intent);
@@ -1653,6 +1769,16 @@ impl Browser {
     pub(super) fn reconfigure_audio_output(&mut self, cx: &mut Context<Self>) {
         self.abandon_waveform_region_drag(cx);
         let resume = self.capture_audio_output_resume_intent();
+        if let Some(request) = self.current_normalized_playback_target()
+            && let Some(grid) = request.target.metronome_grid.explicit_grid()
+            && resume.as_ref().is_some_and(|intent| {
+                intent.origin == PlaybackIntentOrigin::AudioOutputResume
+                    && intent.path == request.anchor.path
+            })
+        {
+            self.playback_metronome_grid = grid;
+            self.playback_metronome_grid_path = Some(request.anchor.path);
+        }
         self.stop_playback();
         if let Some(runtime) = self.playback.take() {
             self.retire_audio_output_runtime(runtime);
@@ -2425,6 +2551,24 @@ mod tests {
             let target = view.accepted_playmark_timing_target(path, span).unwrap();
             assert_eq!(target.span.frame_bounds(192_000), Some((48_000, 144_000)));
             assert!(target.seek_if_outside);
+            let grid = super::PlaybackMetronomeGrid {
+                frames: 160_000,
+                origin_frame: 0,
+            };
+            view.playback_metronome_grid = Some(grid);
+            view.playback_metronome_grid_path = Some(path.to_path_buf());
+            assert_eq!(
+                view.resolve_retarget_metronome_grid(path, target),
+                Some(grid)
+            );
+            let mut target = target;
+            target.desired.metronome_beat_count = Some(4);
+            let target = view.tempo_grid_target(target, 6);
+            let grid = view.resolve_retarget_metronome_grid(path, target);
+            assert_eq!(
+                super::metronome::config_for_count(target.desired.metronome_beat_count, grid),
+                Some(reson::PlaybackMetronomeConfig::new(6).with_source_cycle(96_000, 48_000))
+            );
 
             view.accepted_playback_intent = Some(sample_intent(Path::new("other.wav"), true));
             assert!(view.accepted_playmark_timing_target(path, span).is_none());
@@ -2442,19 +2586,37 @@ mod tests {
         let original = WaveformPlayRegion::new(0.25, 0.5).unwrap();
         let first = WaveformPlayRegion::new(0.25, 0.625).unwrap();
         let final_span = WaveformPlayRegion::new(0.25, 0.75).unwrap();
-        let mut audition = super::PlaymarkTempoAudition {
-            anchor: sample_pending_retarget(Path::new("loop.wav"), 1, true)
-                .request
-                .anchor,
-            original,
-            latest: original,
+        let mut request = sample_pending_retarget(Path::new("loop.wav"), 1, true).request;
+        let grid = super::PlaybackMetronomeGrid {
+            frames: 25,
+            origin_frame: 25,
         };
-        assert_eq!(audition.changed_span(None), None);
-        assert_eq!(audition.changed_span(Some(first)), Some(first));
-        audition.latest = first;
-        assert_eq!(audition.changed_span(Some(first)), None);
-        assert_eq!(audition.changed_span(Some(final_span)), Some(final_span));
-        assert_eq!(audition.changed_span(None), Some(original));
+        let mut audition = super::PlaymarkTempoAudition {
+            anchor: request.anchor,
+            original,
+            latest: None,
+            original_grid: Some(grid),
+            original_beats: Some(4),
+        };
+        assert!(!audition.needs_retarget(None));
+        assert!(audition.needs_retarget(Some((first, 6))));
+        audition.latest = Some((first, 6));
+        assert!(!audition.needs_retarget(Some((first, 6))));
+        assert!(audition.needs_retarget(Some((first, 4))));
+        assert!(audition.needs_retarget(Some((final_span, 6))));
+        assert!(audition.needs_retarget(None));
+        request.target.span = audition.original;
+        request.target.desired.metronome_beat_count = Some(6);
+        audition.restore_grid(&mut request.target);
+        assert_eq!(request.target.span, original);
+        assert_eq!(
+            request.target.metronome_grid,
+            super::MetronomeGridTarget::Restore(Some(grid))
+        );
+        assert_eq!(request.target.desired.metronome_beat_count, Some(4));
+        request.target.desired.metronome_beat_count = None;
+        audition.restore_grid(&mut request.target);
+        assert_eq!(request.target.desired.metronome_beat_count, None);
     }
 
     fn sample_pending_retarget(
@@ -2485,6 +2647,7 @@ mod tests {
                     span: WaveformPlayRegion::new(0.4, 1.0).expect("valid test span"),
                     desired,
                     seek_if_outside: false,
+                    metronome_grid: super::MetronomeGridTarget::Retain,
                 },
                 anchor: PlaybackRetargetAnchor {
                     playback_id: 42,
@@ -2602,6 +2765,7 @@ mod tests {
                     span: playback_span_for_intent(&accepted).expect("accepted span"),
                     desired,
                     seek_if_outside: false,
+                    metronome_grid: super::MetronomeGridTarget::Retain,
                 },
                 anchor: super::PlaybackRetargetAnchor {
                     playback_id: 42,
@@ -2672,6 +2836,7 @@ mod tests {
             span: WaveformPlayRegion::new(0.15, 0.65).expect("valid target span"),
             desired: latest,
             seek_if_outside: true,
+            metronome_grid: super::MetronomeGridTarget::Retain,
         };
         let latest_request = super::PlaybackRetargetRequest {
             generation: 45,

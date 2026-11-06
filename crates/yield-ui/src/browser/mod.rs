@@ -1136,14 +1136,20 @@ impl Browser {
         }
         self.set_waveform_play_region(Some(region));
         similar_sections::invalidate_if_stale(self);
-        match self.submit_playmark_timing_span(&editor.path, region, cx) {
-            Some(Ok(())) => {
-                self.set_playback_status("Playmark timing applying to playback".to_string());
+        if timing.authored_tempo {
+            self.retarget_authored_playmark_tempo(region, self.beat_guide_count, cx);
+        } else {
+            match self.submit_playmark_timing_span(&editor.path, region, cx) {
+                Some(Ok(())) => {
+                    self.set_playback_status("Playmark timing applying to playback".to_string());
+                }
+                Some(Err(error)) => {
+                    self.set_playback_status(format!(
+                        "Playmark timing update unavailable: {error}"
+                    ));
+                }
+                None => {}
             }
-            Some(Err(error)) => {
-                self.set_playback_status(format!("Playmark timing update unavailable: {error}"));
-            }
-            None => {}
         }
         if restore_focus {
             window.focus(&self.waveform_focus_handle);
