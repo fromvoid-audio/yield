@@ -2318,6 +2318,49 @@ fn valid_curation_commit_preserves_continuity_and_returns_bounded_rows() {
 }
 
 #[test]
+fn fourth_keep_checks_the_live_rating_and_rolls_back_conflicting_batches() {
+    let mut fixture = CurationFixture::new();
+    let accept = SourceCurationUpdate::AcceptKeep {
+        path: CurationFixture::path("one.wav"),
+    };
+    let seed = SourceCurationUpdate::SetRating {
+        path: CurationFixture::path("one.wav"),
+        rating: Rating::KEEP_3,
+    };
+    for updates in [vec![accept.clone()], vec![seed.clone(), accept.clone()]] {
+        assert!(matches!(
+            fixture.commit(&updates),
+            Err(SourceDbError::KeepAcceptanceConflict { .. })
+        ));
+        assert_eq!(fixture.database.get_revision().unwrap(), fixture.revision);
+    }
+
+    fixture.revision = fixture.commit(&[seed]).unwrap().source_revision();
+    let accepted = fixture
+        .commit(&[accept.clone()])
+        .expect("exact fourth keep");
+    assert_eq!(accepted.source_revision(), fixture.revision + 1);
+    assert_eq!(accepted.files()[0].rating, Rating::KEEP_3);
+    assert!(accepted.files()[0].locked);
+    assert!(accepted.files()[0].last_curated_at.is_some());
+    fixture.revision = accepted.source_revision();
+    let before = fixture.database.browser_metadata_snapshot().unwrap();
+    assert!(matches!(
+        fixture.commit(&[
+            SourceCurationUpdate::SetRating {
+                path: CurationFixture::path("two.wav"),
+                rating: Rating::KEEP_1,
+            },
+            accept,
+        ]),
+        Err(SourceDbError::KeepAcceptanceConflict { .. })
+    ));
+    let after = fixture.database.browser_metadata_snapshot().unwrap();
+    assert_eq!(after.revision, before.revision);
+    assert_eq!(after.files, before.files);
+}
+
+#[test]
 fn curation_receipt_matches_browser_playback_type_projection() {
     let fixture = CurationFixture::new();
     let path = Path::new("one.wav");
