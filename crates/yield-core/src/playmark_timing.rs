@@ -10,6 +10,18 @@ pub const MAX_PLAYMARK_TIMING_CHARACTERS: usize = 64;
 
 const PLAYMARK_LENGTH_USAGE: &str = "Use a value such as 1000ms, 1.5s, 1min, or 142bpm";
 
+/// Format the tempo implied by a positive beat count and exact sample-frame span.
+pub fn playmark_frame_tempo_label(frames: usize, sample_rate: u32, beats: u8) -> Option<String> {
+    if frames == 0 || sample_rate == 0 || beats == 0 {
+        return None;
+    }
+    let bpm = f64::from(beats) * 60.0 * f64::from(sample_rate) / frames as f64;
+    if bpm < 0.01 {
+        return Some(format!("{bpm} BPM"));
+    }
+    format_waveform_bpm_input(bpm).map(|bpm| format!("{bpm} BPM"))
+}
+
 /// Format a playmark's duration, or its beat-guide tempo when beat_count is enabled.
 ///
 /// The duration calculation intentionally uses f32 arithmetic to match the native waveform
@@ -28,7 +40,7 @@ pub fn playmark_selection_label(
 
     if let Some(beat_count) = beat_count.filter(|count| *count > 0) {
         let bpm = f32::from(beat_count) * 60.0 / duration_seconds;
-        return format_waveform_bpm_input(bpm).map(|bpm| format!("{bpm} BPM"));
+        return format_waveform_bpm_input(f64::from(bpm)).map(|bpm| format!("{bpm} BPM"));
     }
 
     Some(format_selection_duration(duration_seconds))
@@ -175,7 +187,7 @@ fn format_selection_duration(seconds: f32) -> String {
     format!("{minutes}m {remaining:05.2}s")
 }
 
-fn format_waveform_bpm_input(value: f32) -> Option<String> {
+fn format_waveform_bpm_input(value: f64) -> Option<String> {
     if !value.is_finite() || value <= 0.0 {
         return None;
     }
@@ -193,6 +205,25 @@ mod tests {
 
     fn region(start: f64, end: f64) -> WaveformRegion {
         WaveformRegion::new(start, end).expect("non-empty region")
+    }
+
+    #[test]
+    fn frame_tempo_formats_precisely_and_rejects_empty_inputs() {
+        assert_eq!(
+            playmark_frame_tempo_label(96_000, 48_000, 4).as_deref(),
+            Some("120 BPM")
+        );
+        assert_eq!(
+            playmark_frame_tempo_label(192_000, 48_000, 8).as_deref(),
+            Some("120 BPM")
+        );
+        assert_eq!(
+            playmark_frame_tempo_label(80_640, 48_000, 4).as_deref(),
+            Some("142.86 BPM")
+        );
+        assert_eq!(playmark_frame_tempo_label(0, 48_000, 4), None);
+        assert_eq!(playmark_frame_tempo_label(1, 0, 4), None);
+        assert_eq!(playmark_frame_tempo_label(1, 48_000, 0), None);
     }
 
     #[test]

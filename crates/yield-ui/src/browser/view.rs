@@ -1468,8 +1468,9 @@ impl Render for Browser {
         if self.playmark_slide_blur_subscription.is_none() {
             self.playmark_slide_blur_subscription =
                 Some(
-                    cx.on_blur(&self.waveform_focus_handle, window, |view, _, _| {
+                    cx.on_blur(&self.waveform_focus_handle, window, |view, window, cx| {
                         view.held_playmark_slide = None;
+                        view.cancel_playmark_tempo_resize(window, cx);
                     }),
                 );
         }

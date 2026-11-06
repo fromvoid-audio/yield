@@ -359,6 +359,13 @@ enum WaveformRegionDragMode {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
+struct PlaymarkTempoResize {
+    total_frames: usize,
+    sample_rate: u32,
+    beat_count: u8,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub(super) struct WaveformRegionDrag {
     anchor: f64,
     current: f64,
@@ -372,6 +379,7 @@ pub(super) struct WaveformRegionDrag {
     button: MouseButton,
     mode: WaveformRegionDragMode,
     edit_settings: Option<WaveformEditSettings>,
+    tempo_resize: Option<PlaymarkTempoResize>,
 }
 
 impl WaveformRegionDrag {
@@ -602,7 +610,44 @@ impl WaveformRegionDrag {
             button,
             mode,
             edit_settings,
+            tempo_resize: None,
         }
+    }
+
+    fn capture_tempo_resize(&mut self, total_frames: usize, sample_rate: u32, beat_count: u8) {
+        if total_frames > 0
+            && sample_rate > 0
+            && beat_count > 0
+            && matches!(
+                self.mode,
+                WaveformRegionDragMode::ResizePlayStart { .. }
+                    | WaveformRegionDragMode::ResizePlayEnd { .. }
+            )
+        {
+            self.tempo_resize = Some(PlaymarkTempoResize {
+                total_frames,
+                sample_rate,
+                beat_count,
+            });
+        }
+    }
+
+    fn tempo_resize_region(self, capture: PlaymarkTempoResize) -> Option<WaveformPlayRegion> {
+        let (baseline, leading) = match self.mode {
+            WaveformRegionDragMode::ResizePlayStart { baseline } => (baseline, true),
+            WaveformRegionDragMode::ResizePlayEnd { baseline } => (baseline, false),
+            _ => return None,
+        };
+        let baseline = WaveformPlayRegion::from_core(baseline);
+        let (start, end) = baseline.frame_bounds(capture.total_frames)?;
+        let total = capture.total_frames as f64;
+        let moving = (self.current.clamp(0.0, 1.0) * total).round() as usize;
+        let (start, end) = if leading {
+            (moving.min(end - 1), end)
+        } else {
+            (start, moving.max(start + 1).min(capture.total_frames))
+        };
+        WaveformPlayRegion::new(start as f64 / total, end as f64 / total)
     }
 
     fn update(&mut self, position: Point<Pixels>) {
@@ -630,6 +675,11 @@ impl WaveformRegionDrag {
         self,
         bpm_snap: BpmSnapSettings,
     ) -> Option<WaveformPlayRegion> {
+        if self.moved
+            && let Some(capture) = self.tempo_resize
+        {
+            return self.tempo_resize_region(capture);
+        }
         if !self.moved {
             match self.mode {
                 WaveformRegionDragMode::Create {
@@ -840,7 +890,10 @@ impl WaveformRegionDrag {
     }
 
     pub(super) fn zero_crossing_applies(self, bpm_snap: BpmSnapSettings) -> bool {
-        self.moved && !self.is_edit_effect_handle() && (!self.is_resize() || !bpm_snap.enabled)
+        self.moved
+            && self.tempo_resize.is_none()
+            && !self.is_edit_effect_handle()
+            && (!self.is_resize() || !bpm_snap.enabled)
     }
 
     fn is_resize(self) -> bool {
@@ -1837,8 +1890,12 @@ pub(super) fn render_waveform(
     );
     bars = bars.child(similar_sections::overlay(browser, theme.clone()));
     bars = bars.child(transient_markers::render_overlay(browser, &theme));
-    let beat_guides = browser.beat_guides_enabled.then_some((
-        browser.beat_guide_count,
+    let tempo_resize = browser
+        .waveform_region_drag
+        .and_then(|drag| drag.tempo_resize);
+    let beat_count = tempo_resize.map_or(browser.beat_guide_count, |capture| capture.beat_count);
+    let beat_guides = (browser.beat_guides_enabled || tempo_resize.is_some()).then_some((
+        beat_count,
         color(theme.colors.waveform_playhead).opacity(150.0 / 255.0),
     ));
     let active_selection_kind = browser
@@ -1857,6 +1914,14 @@ pub(super) fn render_waveform(
             ),
         ));
         if let Some(preview) = browser.waveform.as_ref() {
+            let tempo_label = tempo_resize.and_then(|capture| {
+                let (start, end) = region.frame_bounds(capture.total_frames)?;
+                yield_core::playmark_frame_tempo_label(
+                    end - start,
+                    capture.sample_rate,
+                    capture.beat_count,
+                )
+            });
             bars = bars.child(playmark_timing::render_overlay(
                 region,
                 browser.waveform_viewport,
@@ -1865,6 +1930,7 @@ pub(super) fn render_waveform(
                 browser
                     .beat_guides_enabled
                     .then_some(browser.beat_guide_count),
+                tempo_label,
                 color(theme.colors.waveform_playmark_label_background),
                 color(theme.colors.text_primary),
                 browser
@@ -2044,7 +2110,7 @@ pub(super) fn render_waveform(
                 view.clear_waveform_fade_hover();
                 view.waveform_zoom_anchor_ratio =
                     view.waveform_viewport.absolute_ratio_from_visible(ratio);
-                let drag = begin_primary_waveform_drag_with_settings(
+                let mut drag = begin_primary_waveform_drag_with_settings(
                     view.waveform_play_region,
                     view.waveform_edit_region,
                     view.waveform_edit_settings,
@@ -2054,6 +2120,24 @@ pub(super) fn render_waveform(
                     view.waveform_viewport,
                     view.waveform_generation,
                 );
+                let modifiers = event.modifiers;
+                let tempo_modifier = if cfg!(target_os = "macos") {
+                    modifiers.platform
+                } else {
+                    modifiers.control
+                };
+                if tempo_modifier
+                    && !modifiers.shift
+                    && !modifiers.alt
+                    && !modifiers.function
+                    && let Some(preview) = view.waveform.as_ref()
+                {
+                    drag.capture_tempo_resize(
+                        preview.total_frames,
+                        preview.sample_rate,
+                        view.beat_guide_count,
+                    );
+                }
                 if matches!(drag.mode, WaveformRegionDragMode::Create { .. })
                     && let Some(preview) = view.waveform.as_ref()
                     && let Some(region) = view.waveform_play_region
@@ -2284,6 +2368,21 @@ impl Browser {
             if had_region_drag || had_pan_drag || had_scrollbar_drag {
                 cx.stop_active_drag(window);
             }
+        }
+        canceled
+    }
+
+    pub(super) fn cancel_playmark_tempo_resize(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let canceled = self
+            .waveform_region_drag
+            .is_some_and(|drag| drag.tempo_resize.is_some())
+            && self.cancel_waveform_gestures(window, cx);
+        if canceled {
+            cx.notify();
         }
         canceled
     }
@@ -4628,6 +4727,135 @@ mod tests {
         let snapped_duration = (resized.end - resized.start) * 10.0;
         let bpm = 4.0 * 60.0 / snapped_duration;
         assert!((bpm - bpm.round()).abs() < 0.001);
+    }
+
+    #[test]
+    fn tempo_resize_keeps_the_opposite_frame_and_skips_old_grid_snapping() {
+        let bounds = test_bounds(1000.0, 100.0);
+        let baseline = WaveformPlayRegion::new(0.25, 0.65).unwrap();
+        let snap = BpmSnapSettings {
+            enabled: true,
+            beat_count: 12,
+            audio_duration_seconds: 4.0,
+            constrain_to_audio: true,
+        };
+        for (handle, origin, target, expected) in [
+            (
+                WaveformRegionHandle::ResizeStart,
+                0.25,
+                0.15,
+                (28_800, 124_800),
+            ),
+            (
+                WaveformRegionHandle::ResizeEnd,
+                0.65,
+                0.75,
+                (48_000, 144_000),
+            ),
+        ] {
+            let mut drag = WaveformRegionDrag::begin_handle(
+                point(px((origin * 1000.0) as f32), px(50.0)),
+                origin,
+                bounds,
+                WaveformViewport::full(),
+                baseline,
+                handle,
+                1,
+            )
+            .unwrap();
+            drag.capture_tempo_resize(192_000, 48_000, 4);
+            drag.update(point(px((target * 1000.0) as f32), px(50.0)));
+            assert_eq!(
+                drag.preview_region_with_bpm(snap)
+                    .unwrap()
+                    .frame_bounds(192_000),
+                Some(expected)
+            );
+            assert_eq!(drag.tempo_resize.unwrap().beat_count, 4);
+            assert!(!drag.zero_crossing_applies(snap));
+        }
+    }
+
+    #[gpui::test]
+    fn command_handle_previews_without_committing_until_release(cx: &mut gpui::TestAppContext) {
+        cx.set_global(crate::theme::ActiveTheme::default());
+        let (browser, cx) = cx.add_window_view(|_, cx| Browser::new(cx));
+        cx.update(|window, _| window.activate_window());
+        let baseline = WaveformPlayRegion::new(0.25, 0.5).unwrap();
+        browser.update(cx, |view, _| {
+            view.waveform = Some(yield_media::WaveformPreview {
+                peaks: vec![0.5; 8],
+                bands: Vec::new(),
+                duration_seconds: 4.0,
+                sample_rate: 48_000,
+                total_frames: 192_000,
+                detail_context: None,
+            });
+            view.waveform_play_region = Some(baseline);
+            view.beat_guide_count = 4;
+        });
+        cx.refresh().unwrap();
+        let bounds = cx.debug_bounds("waveform").unwrap();
+        let at = |fraction: f32| {
+            point(
+                bounds.left() + bounds.size.width * fraction,
+                bounds.top() + px(2.0),
+            )
+        };
+        let mut modifier = gpui::Modifiers::none();
+        if cfg!(target_os = "macos") {
+            modifier.platform = true;
+        } else {
+            modifier.control = true;
+        }
+        for abort in [Some("escape"), Some("blur"), None] {
+            cx.simulate_mouse_down(at(0.5), MouseButton::Left, modifier);
+            // Render the newly focused waveform before exercising the keyboard/focus routes.
+            cx.refresh().unwrap();
+            cx.simulate_mouse_move(at(0.6), MouseButton::Left, gpui::Modifiers::none());
+            cx.simulate_mouse_move(at(0.75), MouseButton::Left, gpui::Modifiers::none());
+            browser.read_with(cx, |view, _| {
+                let drag = view.waveform_region_drag.unwrap();
+                assert_eq!(drag.tempo_resize.unwrap().beat_count, 4);
+                assert_eq!(
+                    drag.preview_region_with_bpm(view.bpm_snap_settings())
+                        .unwrap()
+                        .frame_bounds(192_000),
+                    Some((48_000, 144_000))
+                );
+                assert_eq!(view.waveform_play_region, Some(baseline));
+            });
+            match abort {
+                Some("escape") => cx.simulate_keystrokes("escape"),
+                Some("blur") => {
+                    cx.update(|window, app| {
+                        window.focus(&browser.read(app).search_input.read(app).focus_handle());
+                    });
+                    cx.refresh().unwrap();
+                }
+                _ => {}
+            }
+            if let Some(reason) = abort {
+                browser.read_with(cx, |view, _| {
+                    assert!(
+                        view.waveform_region_drag.is_none(),
+                        "{reason} should cancel"
+                    );
+                });
+            }
+            cx.simulate_mouse_up(at(0.75), MouseButton::Left, gpui::Modifiers::none());
+            browser.read_with(cx, |view, _| {
+                assert!(view.waveform_region_drag.is_none());
+                assert_eq!(
+                    view.waveform_play_region.unwrap().frame_bounds(192_000),
+                    Some(if abort.is_some() {
+                        (48_000, 96_000)
+                    } else {
+                        (48_000, 144_000)
+                    })
+                );
+            });
+        }
     }
 
     #[test]

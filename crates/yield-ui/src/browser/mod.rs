@@ -3311,6 +3311,10 @@ impl Browser {
                 }
             }
             "escape" => {
+                if self.cancel_playmark_tempo_resize(window, cx) {
+                    cx.stop_propagation();
+                    return;
+                }
                 self.cancel_column_gesture(cx);
                 self.cancel_file_drag_with_window(window, cx);
                 self.cancel_waveform_region_drag(window, cx);
