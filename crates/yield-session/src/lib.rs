@@ -78,6 +78,10 @@ use maintenance::{
     MaintenanceAdmission, MaintenanceKind, MaintenanceReservation, MaintenanceService,
 };
 use vocabulary::VocabularySlot;
+pub use yield_catalog::{
+    SourceTransientRequest, TransientCacheUse, TransientMarkers, TransientPreset,
+    TransientRequestFailure,
+};
 
 pub use maintenance::{
     CacheClearOutcome, GlobalStorageUsage, MaintenanceError, MaintenanceRequest,

@@ -9,11 +9,11 @@ use gpui::{BorrowAppContext, Context};
 use yield_core::{AudioFile, AudioFileCuration, AudioFileId, FolderTree, PlaybackType};
 use yield_library::sample_sources::{
     BrowserFileMetadata, SourceId, SourcePlaybackType, SourcePublicationFence,
-    reconciliation::RootIdentity,
+    db::SourceManifestEntry, reconciliation::RootIdentity,
 };
 use yield_session::{
     CatalogCommand, CatalogDelivery, CatalogEvent, CatalogOperation, CatalogPublicationStatus,
-    CatalogStatus, CatalogSubmitError, VerifiedSourceRoot,
+    CatalogStatus, CatalogSubmitError, SourceTransientRequest, VerifiedSourceRoot,
 };
 
 use super::source_registry::SourceRegistryGlobal;
@@ -70,6 +70,10 @@ pub(super) enum CatalogCommandIntent {
         source_id: SourceId,
         lifecycle_generation: u64,
     },
+    ReadSnapshot {
+        source_id: SourceId,
+        lifecycle_generation: u64,
+    },
     Remove {
         source_id: SourceId,
         lifecycle_generation: u64,
@@ -82,6 +86,7 @@ impl CatalogCommandIntent {
             Self::Register { source_id, .. }
             | Self::RegisterVerified { source_id, .. }
             | Self::Audit { source_id, .. }
+            | Self::ReadSnapshot { source_id, .. }
             | Self::Remove { source_id, .. } => source_id,
         }
     }
@@ -97,6 +102,10 @@ impl CatalogCommandIntent {
                 ..
             }
             | Self::Audit {
+                lifecycle_generation,
+                ..
+            }
+            | Self::ReadSnapshot {
                 lifecycle_generation,
                 ..
             }
@@ -133,6 +142,10 @@ impl CatalogCommandIntent {
             } => CatalogCommand::RequestAudit {
                 source_id,
                 lifecycle_generation,
+            },
+            Self::ReadSnapshot { source_id, .. } => CatalogCommand::ReadSnapshot {
+                source_id,
+                expected_revision: None,
             },
             Self::Remove {
                 source_id,
@@ -572,7 +585,9 @@ impl Browser {
                     lifecycle_generation,
                     ..
                 } => Some((source_id.clone(), *lifecycle_generation)),
-                CatalogCommandIntent::Audit { .. } | CatalogCommandIntent::Remove { .. } => None,
+                CatalogCommandIntent::Audit { .. }
+                | CatalogCommandIntent::ReadSnapshot { .. }
+                | CatalogCommandIntent::Remove { .. } => None,
             };
             match submit_catalog(intent, cx) {
                 Ok(()) => {
@@ -683,6 +698,14 @@ impl Browser {
         publication_fence: Option<SourcePublicationFence>,
         cx: &mut Context<Self>,
     ) -> bool {
+        if super::transient_markers::apply_catalog_event(
+            self,
+            &mut event,
+            publication_fence.clone(),
+            cx,
+        ) {
+            return true;
+        }
         if super::similarity_list::apply_catalog_event(
             self,
             &mut event,
@@ -833,6 +856,19 @@ impl Browser {
                 self.start_catalog_projection(event, publication_fence, cx);
                 true
             }
+            CatalogEvent::SourceContentDigestCommitted {
+                request,
+                committed_revision,
+                entry,
+            } => {
+                if publication_fence
+                    .as_ref()
+                    .is_some_and(SourcePublicationFence::is_live)
+                {
+                    self.apply_digest_revision(request, *committed_revision, entry, cx);
+                }
+                true
+            }
             CatalogEvent::ReplayCommitted { .. } => {
                 super::unsupported_entries::cancel_for_source_change(self, cx);
                 self.job_action = None;
@@ -946,8 +982,114 @@ impl Browser {
             CatalogEvent::CollectionHistoryCompleted { .. }
             | CatalogEvent::CollectionHistoryGroupCompleted { .. }
             | CatalogEvent::SimilarityCompleted { .. }
+            | CatalogEvent::TransientMarkersCompleted { .. }
             | CatalogEvent::Closed => false,
         }
+    }
+
+    fn apply_digest_revision(
+        &mut self,
+        request: &SourceTransientRequest,
+        revision: u64,
+        entry: &SourceManifestEntry,
+        cx: &mut Context<Self>,
+    ) {
+        let previous = self.catalog_metadata.context();
+        if previous
+            .as_ref()
+            .is_some_and(|context| context.revision >= revision)
+        {
+            return;
+        }
+        let key = super::curation::CurationLifecycleKey {
+            source_id: request.source_id().clone(),
+            lifecycle_generation: request.lifecycle_generation(),
+        };
+        let exact = previous.filter(|context| {
+            context.source_id == key.source_id
+                && context.lifecycle_generation == key.lifecycle_generation
+                && context.revision == request.revision()
+                && context.revision.checked_add(1) == Some(revision)
+        });
+        let keep_tag_mask = super::tag_filter::capture_ready_mask(self).is_some();
+        let session = self
+            .active_source
+            .and_then(|index| self.source_sessions.get_mut(index));
+        let patched = exact
+            .as_ref()
+            .zip(session)
+            .is_some_and(|(context, session)| {
+                let Some(facts) = session.catalog_facts.get(&entry.relative_path) else {
+                    return false;
+                };
+                if session.root != context.root
+                    || session.source_id.as_ref() != Some(&key.source_id)
+                    || session.catalog_lifecycle_generation != Some(key.lifecycle_generation)
+                    || entry.relative_path != request.relative_path()
+                    || facts.file_size != entry.file_size
+                    || facts.modified_ns != entry.modified_ns
+                    || facts.file_identity != entry.file_identity
+                    || facts.content_hash.is_some()
+                    || entry.content_hash.is_none()
+                    || !self
+                        .curation_state
+                        .advance_digest_revision(&key, context, revision)
+                {
+                    return false;
+                }
+                if let Some(facts) =
+                    Arc::make_mut(&mut session.catalog_facts).get_mut(&entry.relative_path)
+                {
+                    facts.content_hash = entry.content_hash.clone();
+                }
+                true
+            });
+        let Some(previous) = exact.filter(|_| patched) else {
+            self.catalog_pending_command
+                .get_or_insert(CatalogCommandIntent::ReadSnapshot {
+                    source_id: key.source_id,
+                    lifecycle_generation: key.lifecycle_generation,
+                });
+            return;
+        };
+        self.catalog_metadata.advance_projection_revision(revision);
+        let pending = self.curation_state.has_pending_for_lifecycle(&key);
+        if pending {
+            self.catalog_metadata.pause_for_curation();
+        }
+        let display_context = self
+            .catalog_metadata
+            .context()
+            .map(super::display_labels::display_context_from_metadata);
+        if !display_context.clone().is_some_and(|context| {
+            self.display_labels.rebase_after_curation(
+                context,
+                previous.revision,
+                revision,
+                &previous.root_identity,
+                previous.directory_generation,
+                pending,
+            )
+        }) {
+            self.display_labels
+                .invalidate_after_curation(display_context, pending);
+        }
+        if !keep_tag_mask
+            || !super::tag_filter::rebase_ready_context(
+                self,
+                revision,
+                &previous.root_identity,
+                previous.directory_generation,
+            )
+        {
+            super::tag_filter::invalidate_after_curation(
+                self,
+                super::tag_filter::FilterOrigin::PassiveMetadata,
+                cx,
+            );
+        }
+        super::transient_markers::accept_digest_revision(self, request, revision, cx);
+        cx.notify();
     }
 
     fn start_catalog_projection(
@@ -1237,6 +1379,7 @@ impl Browser {
             },
         );
         self.restore_projection_focus(restore_id, restore_position, cx);
+        super::transient_markers::schedule(self, cx);
         if audit_ready {
             let _ = self.maybe_start_rating_decay(cx);
         }
@@ -1257,6 +1400,7 @@ impl Browser {
             return;
         }
         self.similarity_list.cancel();
+        self.transient_markers.invalidate();
         super::source_recovery::cancel_for_source_change(self);
         super::rating_decay::invalidate_for_source_publication(self, status);
         super::unsupported_entries::cancel_for_source_change(self, cx);
@@ -1316,6 +1460,10 @@ fn catalog_event_identity(event: &CatalogEvent) -> Option<(SourceId, u64)> {
             Some((request.source_id().clone(), request.lifecycle_generation()))
         }
         CatalogEvent::SimilarityCompleted { request, .. } => {
+            Some((request.source_id().clone(), request.lifecycle_generation()))
+        }
+        CatalogEvent::TransientMarkersCompleted { request, .. }
+        | CatalogEvent::SourceContentDigestCommitted { request, .. } => {
             Some((request.source_id().clone(), request.lifecycle_generation()))
         }
         CatalogEvent::Registered {

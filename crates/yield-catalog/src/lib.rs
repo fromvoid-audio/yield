@@ -101,6 +101,8 @@ pub use history_selection::{
 };
 mod similarity_dispatch;
 mod similarity_query;
+mod transient_dispatch;
+mod transient_job;
 pub use feature_job::{
     ComputedFeatureJob, FeatureJobFailure, FeatureJobOutcome, PreparedFeatureJob,
     prepare_feature_job,
@@ -116,7 +118,13 @@ pub use similarity_query::{
     SimilarityCandidateOutcome, SimilarityQueryError, SourceSimilarityQuery,
     SourceSimilarityResult, SourceSimilarityRow, query_source_similarity,
 };
+pub use transient_dispatch::{SourceTransientRequest, TransientRequestFailure};
+pub use transient_job::{
+    ComputedTransientJob, PreparedTransientJob, TransientCacheUse, TransientJobError,
+    TransientJobOutcome, prepare_transient_job,
+};
 pub use yield_analysis::aspects::SimilarityAspect;
+pub use yield_analysis::transients::{TransientMarkers, TransientPreset};
 mod index_pages;
 mod index_reveal;
 mod index_reveal_contract;
@@ -179,6 +187,7 @@ struct CatalogTestGate {
     audit_state: Mutex<CatalogTestAuditState>,
     feature_terminal_state: Mutex<CatalogTestAuditState>,
     feature_terminal_wake: Condvar,
+    transient_compute: Mutex<Option<(mpsc::SyncSender<()>, mpsc::Receiver<()>)>>,
     watcher_signals: Mutex<HashMap<(SourceId, u64), WatcherSignal>>,
     watcher_install_counts: Mutex<HashMap<(SourceId, u64), usize>>,
     cancel_on_audit_progress: AtomicBool,
@@ -217,6 +226,7 @@ impl CatalogTestGate {
                 at_boundary: false,
             }),
             feature_terminal_wake: Condvar::new(),
+            transient_compute: Mutex::new(None),
             watcher_signals: Mutex::new(HashMap::new()),
             watcher_install_counts: Mutex::new(HashMap::new()),
             cancel_on_audit_progress: AtomicBool::new(false),
@@ -237,6 +247,14 @@ impl CatalogTestGate {
                 .unwrap_or_else(|p| p.into_inner());
         }
         state.at_boundary = false;
+    }
+
+    fn before_transient_compute(&self) {
+        let signal = self.transient_compute.lock().unwrap().take();
+        if let Some((entered, release)) = signal {
+            let _ = entered.send(());
+            let _ = release.recv_timeout(Duration::from_secs(5));
+        }
     }
     #[cfg(target_os = "linux")]
     fn arm_feature_terminal(&self) -> CatalogTestFeatureTerminalPause<'_> {
@@ -630,6 +648,13 @@ pub enum CatalogCommand {
         request: SourceSimilarityRequest,
         /// Cancellation retained through queued delivery.
         cancellation: SimilarityCancellation,
+    },
+    /// Compute one bounded native-frame transient result for an audited audio entry.
+    RequestTransientMarkers {
+        /// Exact Source and detector request.
+        request: SourceTransientRequest,
+        /// Retained cancellation through compute and queued delivery.
+        cancellation: FeatureAnalysisCancellation,
     },
     /// Compute one bounded WAV feature job at an exact retained source revision.
     RequestFeatureAnalysis {
@@ -1539,6 +1564,24 @@ pub enum CatalogEvent {
         /// Owner-validated existing descriptor result.
         result: Result<SourceSimilarityResult, SimilarityDispatchFailure>,
     },
+    /// One audited manifest entry acquired its previously deferred scanner digest.
+    SourceContentDigestCommitted {
+        /// Source lifecycle and previous revision that admitted the write.
+        request: SourceTransientRequest,
+        /// New authoritative revision. The directory generation is unchanged.
+        committed_revision: u64,
+        /// Exact manifest entry with its digest filled in.
+        entry: SourceManifestEntry,
+    },
+    /// Exact owner-validated transient markers or a bounded failure.
+    TransientMarkersCompleted {
+        /// Original immutable request and caller correlation.
+        request: SourceTransientRequest,
+        /// Retained cancellation through queued delivery.
+        cancellation: FeatureAnalysisCancellation,
+        /// Frame-domain result or refusal from the retained Source.
+        result: Result<TransientJobOutcome, TransientRequestFailure>,
+    },
     /// One request's truthful state; ready requires validated durable feature bytes.
     FeatureAnalysisState {
         /// Stable source.
@@ -2009,6 +2052,10 @@ impl CatalogDelivery {
         {
             return None;
         }
+        if matches!(&event, CatalogEvent::TransientMarkersCompleted { cancellation, .. } if cancellation.is_cancelled())
+        {
+            return None;
+        }
         if let CatalogEvent::CollectionHistoryCompleted {
             cancellation,
             result,
@@ -2252,6 +2299,7 @@ struct AdmissionState {
     tag_read_payload_bytes: usize,
     sources: HashMap<SourceId, DesiredSource>,
     active_audits: HashMap<SourceId, (u64, Arc<AtomicBool>)>,
+    active_transient: Option<(SourceId, FeatureAnalysisCancellation)>,
     index_queries: HashMap<SourceId, (u64, u64, Arc<AtomicBool>)>,
     index_inspections: HashMap<SourceId, IndexInspectionCancellation>,
 }
@@ -2279,13 +2327,28 @@ impl AdmissionState {
             tag_read_payload_bytes: 0,
             sources: HashMap::new(),
             active_audits: HashMap::new(),
+            active_transient: None,
             index_queries: HashMap::new(),
             index_inspections: HashMap::new(),
         }
     }
 
+    fn cancel_transient(&mut self, source: &SourceId) {
+        if self
+            .active_transient
+            .as_ref()
+            .is_some_and(|(id, _)| id == source)
+            && let Some((_, cancellation)) = self.active_transient.take()
+        {
+            cancellation.cancel();
+        }
+    }
+
     fn invalidate_all(&mut self) {
         self.retained_harvest.cancel_all();
+        if let Some((_, cancellation)) = self.active_transient.take() {
+            cancellation.cancel();
+        }
         #[cfg(feature = "test-support")]
         {
             self.compound_batch_fault = None;
@@ -2586,9 +2649,26 @@ impl EventReservation<'_> {
     }
 }
 
+impl<'a> EventReservation<'a> {
+    fn split_read_event(&mut self, bytes: usize) -> Self {
+        assert!(self.remaining > 0 && self.tag_read_payload_bytes >= bytes);
+        self.remaining -= 1;
+        self.tag_read_payload_bytes -= bytes;
+        Self {
+            hub: self.hub,
+            admission: self.admission,
+            remaining: 1,
+            curation_payload_bytes: 0,
+            curation_update_count: 0,
+            tag_read_payload_bytes: bytes,
+        }
+    }
+}
+
 fn validate_command(command: &CatalogCommand) -> Result<(), CatalogSubmitError> {
     match command {
         CatalogCommand::RequestSimilarity { .. }
+        | CatalogCommand::RequestTransientMarkers { .. }
         | CatalogCommand::RequestCollectionHistory { .. }
         | CatalogCommand::RequestCollectionHistoryGroup { .. } => {}
         CatalogCommand::RequestFeatureAnalysis {
@@ -2992,6 +3072,7 @@ fn encoded_path_len(path: &Path) -> usize {
 fn command_event_budget(command: &CatalogCommand) -> usize {
     match command {
         CatalogCommand::RequestFeatureAnalysis { .. } => 6,
+        CatalogCommand::RequestTransientMarkers { request, .. } => request.event_budget(),
         CatalogCommand::ConsumeReplay { .. } => 0,
 
         CatalogCommand::Register { .. } | CatalogCommand::RegisterVerified { .. } => 2,
@@ -3064,6 +3145,7 @@ fn command_tag_page_input_bytes(command: &CatalogCommand) -> usize {
         CatalogCommand::RequestCollectionHistory { request, .. } => request.input_bytes(),
         CatalogCommand::RequestCollectionHistoryGroup { request, .. } => request.input_bytes(),
         CatalogCommand::RequestSimilarity { request, .. } => request.input_bytes(),
+        CatalogCommand::RequestTransientMarkers { request, .. } => request.input_bytes(),
         CatalogCommand::ConsumeReplay { submission } => submission.input_bytes(),
         CatalogCommand::RequestIndexInspection { handle, .. } => handle.input_bytes(),
         CatalogCommand::RequestIndexPage {
@@ -3146,6 +3228,7 @@ fn command_tag_read_payload_bytes(command: &CatalogCommand) -> Result<usize, Cat
             Ok(request.charged_bytes())
         }
         CatalogCommand::RequestSimilarity { .. } => Ok(similarity_dispatch::MAX_RESULT_BYTES),
+        CatalogCommand::RequestTransientMarkers { request, .. } => Ok(request.result_bytes()),
         CatalogCommand::RequestIndexPage { .. } | CatalogCommand::RequestIndexInspection { .. } => {
             Ok(MAX_INDEX_PAGE_PAYLOAD_BYTES)
         }
@@ -3238,6 +3321,7 @@ fn admission_action(command: &CatalogCommand) -> AdmissionAction {
         },
         CatalogCommand::RequestWavMetadata { .. }
         | CatalogCommand::RequestFeatureAnalysis { .. }
+        | CatalogCommand::RequestTransientMarkers { .. }
         | CatalogCommand::RequestCollectionHistory { .. }
         | CatalogCommand::RequestCollectionHistoryGroup { .. }
         | CatalogCommand::RequestSimilarity { .. } => AdmissionAction::RequestWavMetadata,
@@ -3362,6 +3446,7 @@ fn apply_admission_action(state: &mut AdmissionState, action: AdmissionAction) {
                 .is_none_or(|source| lifecycle_generation > source.lifecycle_generation);
             if replace {
                 state.retained_harvest.cancel_source(&source_id);
+                state.cancel_transient(&source_id);
                 #[cfg(feature = "test-support")]
                 test_support::clear_source(state, &source_id);
                 state.active_audits.remove(&source_id);
@@ -3397,6 +3482,7 @@ fn apply_admission_action(state: &mut AdmissionState, action: AdmissionAction) {
                 .is_none_or(|source| lifecycle_generation >= source.lifecycle_generation);
             if replace {
                 state.retained_harvest.cancel_source(&source_id);
+                state.cancel_transient(&source_id);
                 #[cfg(feature = "test-support")]
                 test_support::clear_source(state, &source_id);
                 state.active_audits.remove(&source_id);
@@ -3428,6 +3514,7 @@ fn apply_admission_action(state: &mut AdmissionState, action: AdmissionAction) {
         }
         AdmissionAction::RequestAudit { source_id } => {
             state.retained_harvest.cancel_source(&source_id);
+            state.cancel_transient(&source_id);
             if let Some(cancellation) = state.index_inspections.remove(&source_id) {
                 cancellation.cancel();
             }
@@ -4116,6 +4203,7 @@ fn run_worker_with_sources(
         .take()
         .expect("single original source worker inbox");
     let mut preparations = source_wal_preparation::WorkerReservations::new(control);
+    let mut transients = transient_dispatch::Worker::default();
     let mut deferred = VecDeque::<QueuedCatalogCommand>::new();
     let mut pending_finalizations = HashMap::<SourceId, PendingSourceFinalization>::new();
     let mut idle = idle_maintenance::Pacing::new(Instant::now());
@@ -4126,6 +4214,9 @@ fn run_worker_with_sources(
         let closing = admission_state(&admission, |state| state.shutdown || state.closed);
         if closing {
             preparations.close(&mut sources);
+        }
+        if !preparations.has_slots() {
+            transients.poll(&admission, &mut sources, test_gate.as_ref());
         }
         // Do not enter journal-facing commands or teardown while its original settlement
         // still owns any native reservation. Keep accepted packets/credits in existing bounds.
@@ -4279,6 +4370,25 @@ fn run_worker_with_sources(
             reservation.finish();
             continue;
         }
+        let command = match command {
+            CatalogCommand::RequestTransientMarkers {
+                request,
+                cancellation,
+            } => {
+                transients.submit(
+                    transient_dispatch::Submission {
+                        request,
+                        cancellation,
+                        reservation,
+                    },
+                    &admission,
+                    &sources,
+                    test_gate.as_ref(),
+                );
+                continue;
+            }
+            command => command,
+        };
         if handle_command(
             command,
             &profile_guard,
@@ -4297,6 +4407,7 @@ fn run_worker_with_sources(
         reservation.finish();
         idle.activity(Instant::now());
     }
+    drop(transients);
     preparations.close(&mut sources);
     preparations.retire_failed(journal.as_ref(), &mut pending_finalizations);
     if let Some(journal) = journal.as_ref() {
@@ -4529,6 +4640,9 @@ fn handle_command(
         } => {
             similarity_dispatch::dispatch(request, cancellation, reservation, admission, sources);
             false
+        }
+        CatalogCommand::RequestTransientMarkers { .. } => {
+            unreachable!("transient requests are handled by the compute slot");
         }
         CatalogCommand::RequestFeatureAnalysis {
             source_id,
@@ -17466,4 +17580,6 @@ mod tests {
     mod history_selection_tests;
     mod similarity_dispatch_tests;
     mod similarity_query_tests;
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+    mod transient_dispatch_tests;
 }

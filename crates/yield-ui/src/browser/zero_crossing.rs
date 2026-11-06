@@ -83,6 +83,7 @@ impl ZeroCrossingBounds {
 }
 
 impl ZeroCrossingIntent {
+    #[cfg(test)]
     fn new(
         generation: u64,
         context: WaveformDetailContext,
@@ -418,16 +419,6 @@ pub(super) fn tooltip(_: &mut Window, cx: &mut App) -> AnyView {
     cx.new(|_| ZeroCrossingTooltip).into()
 }
 
-fn intent_for_raw(
-    browser: &Browser,
-    kind: WaveformSelectionKind,
-    start: f64,
-    end: f64,
-) -> Option<ZeroCrossingIntent> {
-    let context = browser.waveform.as_ref()?.detail_context.as_ref()?.clone();
-    ZeroCrossingIntent::new(browser.waveform_generation, context, kind, start, end)
-}
-
 fn intent_for_raw_with_edit_resize_effects(
     browser: &Browser,
     kind: WaveformSelectionKind,
@@ -541,27 +532,6 @@ pub(super) fn schedule_for_drag(browser: &mut Browser, cx: &mut Context<Browser>
     let Some(intent) = drag_intent(browser, drag) else {
         return;
     };
-    schedule_intent(browser, intent, cx);
-}
-
-/// Queue a zero-crossing request for a committed keyboard move.
-pub(super) fn schedule_for_committed_region(browser: &mut Browser, cx: &mut Context<Browser>) {
-    if !browser.zero_crossing.enabled() {
-        return;
-    }
-    let Some(raw) = browser
-        .waveform_play_region
-        .filter(|region| region.is_valid())
-    else {
-        return;
-    };
-    let Some(intent) = intent_for_raw(browser, WaveformSelectionKind::Play, raw.start, raw.end)
-    else {
-        return;
-    };
-    if !browser.zero_crossing.try_set_pending_commit(intent.clone()) {
-        return;
-    }
     schedule_intent(browser, intent, cx);
 }
 

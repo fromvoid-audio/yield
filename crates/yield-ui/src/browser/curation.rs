@@ -336,6 +336,27 @@ impl CurationState {
                 .any(|(retired_key, _)| retired_key == key)
     }
 
+    /// A scanner digest can advance the manifest without changing any curation values.
+    pub(super) fn advance_digest_revision(
+        &mut self,
+        key: &CurationLifecycleKey,
+        context: &super::catalog_metadata::CatalogMetadataContext,
+        revision: u64,
+    ) -> bool {
+        let Some(lineage) = self.lineages.get_mut(key).filter(|lineage| {
+            lineage.root_identity == context.root_identity
+                && lineage.directory_generation == context.directory_generation
+                && lineage.revision == context.revision
+                && lineage.revision.checked_add(1) == Some(revision)
+        }) else {
+            return false;
+        };
+        lineage.revision = revision;
+        self.collection_history
+            .advance_digest_revision(key, context.revision, revision);
+        true
+    }
+
     /// Verify that a browser metadata context still names this exact curation lineage.
     pub(super) fn authority_matches(
         &self,
@@ -3372,6 +3393,7 @@ impl Browser {
                 self.catalog_metadata
                     .advance_projection_revision(application.revision);
             }
+            super::transient_markers::schedule(self, cx);
             let display_curation_pending = self.curation_state.has_pending_for_lifecycle(&key);
             let display_context = self
                 .catalog_metadata
