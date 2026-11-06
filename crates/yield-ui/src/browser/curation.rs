@@ -1094,6 +1094,7 @@ impl CurationState {
                 SourceCurationUpdate::AddCollection { .. }
                     | SourceCurationUpdate::RemoveCollection { .. }
                     | SourceCurationUpdate::SetLocked { .. }
+                    | SourceCurationUpdate::AcceptKeep { .. }
             )
         });
         lineage.message = None;
@@ -1449,6 +1450,7 @@ fn source_update_may_change_tags(update: &SourceCurationUpdate) -> bool {
         SourceCurationUpdate::SetLastPlayedAt { .. }
             | SourceCurationUpdate::SetRating { .. }
             | SourceCurationUpdate::SetLocked { .. }
+            | SourceCurationUpdate::AcceptKeep { .. }
             | SourceCurationUpdate::AddCollection { .. }
             | SourceCurationUpdate::RemoveCollection { .. }
     )
@@ -1461,6 +1463,14 @@ fn updates_for_action(
     path: RootRelativePath,
 ) -> Vec<SourceCurationUpdate> {
     match action {
+        CurationAction::AdjustRating { delta }
+            if delta > 0
+                && current.rating().value() == yield_core::MAX_RATING
+                && !current.rating().locked()
+                && after.rating().locked() =>
+        {
+            vec![SourceCurationUpdate::AcceptKeep { path }]
+        }
         CurationAction::AdjustRating { .. } => {
             let mut updates = Vec::with_capacity(2);
             if current.rating().value() != after.rating().value()
@@ -4795,7 +4805,7 @@ mod tests {
     }
 
     #[test]
-    fn rating_and_lock_updates_stay_in_one_batch_and_large_selection_batches() {
+    fn fourth_keep_has_one_typed_update_and_large_selections_still_batch() {
         let mut entries = vec![entry("locked.wav", 3, false, 0)];
         entries.extend((0..129).map(|index| entry(&format!("{index:03}.wav"), 0, false, 0)));
         let mut state = install(&entries);
@@ -4804,16 +4814,20 @@ mod tests {
             CurationAction::AdjustRating { delta: 1 },
             &[PathBuf::from("locked.wav")],
         );
-        assert_eq!(lock_plan.batches[0].len(), 2);
+        assert_eq!(lock_plan.batches[0].len(), 1);
         assert!(matches!(
             lock_plan.batches[0][0],
-            SourceCurationUpdate::SetRating { .. }
-        ));
-        assert!(matches!(
-            lock_plan.batches[0][1],
-            SourceCurationUpdate::SetLocked { .. }
+            SourceCurationUpdate::AcceptKeep { .. }
         ));
         state.accept_operation(&key(), lock_plan);
+        assert!(matches!(
+            state.plan_action(
+                &key(),
+                CurationAction::AdjustRating { delta: 1 },
+                &[PathBuf::from("locked.wav")],
+            ),
+            CurationPlan::NoChange { trash_required: 0 }
+        ));
 
         let paths = (0..129)
             .map(|index| PathBuf::from(format!("{index:03}.wav")))

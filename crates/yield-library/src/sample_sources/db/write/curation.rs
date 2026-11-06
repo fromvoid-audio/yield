@@ -53,6 +53,11 @@ pub enum SourceCurationUpdate {
         /// Whether the keep rating should be locked.
         locked: bool,
     },
+    /// Accept the fourth keep only if the live rating is still unlocked Keep 3.
+    AcceptKeep {
+        /// Source-relative file locator.
+        path: RootRelativePath,
+    },
     /// Add one fixed collection membership for one live source member.
     AddCollection {
         /// Source-relative file locator.
@@ -104,6 +109,7 @@ impl SourceCurationUpdate {
             | Self::SetRating { path, .. }
             | Self::SetRatingAndLastCuratedAt { path, .. }
             | Self::SetLocked { path, .. }
+            | Self::AcceptKeep { path }
             | Self::AddCollection { path, .. }
             | Self::RemoveCollection { path, .. }
             | Self::AddTag { path, .. }
@@ -279,13 +285,30 @@ pub(super) fn normalize_update_paths(
 pub(super) fn validate_update_values(
     updates: &[SourceCurationUpdate],
 ) -> Result<(), SourceDbError> {
-    for update in updates {
+    for (index, update) in updates.iter().enumerate() {
         match update {
             SourceCurationUpdate::SetRating { rating, .. }
             | SourceCurationUpdate::SetRatingAndLastCuratedAt { rating, .. }
                 if !(-3..=3).contains(&rating.val()) =>
             {
                 return Err(SourceDbError::Unexpected);
+            }
+            SourceCurationUpdate::AcceptKeep { path }
+                if updates.iter().enumerate().any(|(other_index, other)| {
+                    other_index != index
+                        && matches!(
+                            other,
+                            SourceCurationUpdate::SetRating { .. }
+                                | SourceCurationUpdate::SetRatingAndLastCuratedAt { .. }
+                                | SourceCurationUpdate::SetLocked { .. }
+                                | SourceCurationUpdate::AcceptKeep { .. }
+                        )
+                        && other.path() == path
+                }) =>
+            {
+                return Err(SourceDbError::KeepAcceptanceConflict {
+                    path: path.as_path().to_owned(),
+                });
             }
             SourceCurationUpdate::AddCollection { collection, .. }
             | SourceCurationUpdate::RemoveCollection { collection, .. }
@@ -448,6 +471,26 @@ pub(super) fn apply_curation_updates(
             }
             SourceCurationUpdate::SetLocked { path, locked } => {
                 batch.set_locked(path.as_path(), *locked)?;
+            }
+            SourceCurationUpdate::AcceptKeep { path } => {
+                let normalized = super::super::normalize_relative_path(path.as_path())?;
+                let can_accept: bool = batch
+                    .curation_transaction()
+                    .query_row(
+                        "SELECT EXISTS(
+                            SELECT 1 FROM wav_files
+                            WHERE path = ?1 AND tag = ?2 AND locked = 0 AND missing = 0
+                        )",
+                        rusqlite::params![normalized, Rating::KEEP_3.as_i64()],
+                        |row| row.get(0),
+                    )
+                    .map_err(map_sql_error)?;
+                if !can_accept {
+                    return Err(SourceDbError::KeepAcceptanceConflict {
+                        path: path.as_path().to_owned(),
+                    });
+                }
+                batch.set_locked(path.as_path(), true)?;
             }
             SourceCurationUpdate::AddCollection { path, collection } => {
                 batch.add_collection(path.as_path(), *collection)?;

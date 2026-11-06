@@ -482,6 +482,7 @@ fn update_path(update: &SourceCurationUpdate) -> &Path {
         | SourceCurationUpdate::SetRating { path, .. }
         | SourceCurationUpdate::SetRatingAndLastCuratedAt { path, .. }
         | SourceCurationUpdate::SetLocked { path, .. }
+        | SourceCurationUpdate::AcceptKeep { path }
         | SourceCurationUpdate::AddCollection { path, .. }
         | SourceCurationUpdate::RemoveCollection { path, .. }
         | SourceCurationUpdate::AddTag { path, .. }
