@@ -1,35 +1,45 @@
 //! Bounded authored tempo reads and writes on the original Catalog owner.
 
 use super::*;
+pub use yield_library::sample_sources::SourcePlaymarkGridTempo;
 pub use yield_library::sample_sources::db::SourcePlaymarkTempo;
-use yield_library::sample_sources::readiness::SourceFeatureInputError;
+use yield_library::sample_sources::{SourceRevision, readiness::SourceFeatureInputError};
+
+/// Read or replace the authored span.
+pub type PlaymarkTempoOperation = PlaymarkValueOperation<SourcePlaymarkTempo>;
+/// Read or replace the explicit grid tempo.
+pub type PlaymarkGridTempoOperation = PlaymarkValueOperation<SourcePlaymarkGridTempo>;
+/// Exact audited Source request for the authored span.
+pub type SourcePlaymarkTempoRequest = SourcePlaymarkValueRequest<SourcePlaymarkTempo>;
+/// Exact audited Source request for the grid tempo.
+pub type SourcePlaymarkGridTempoRequest = SourcePlaymarkValueRequest<SourcePlaymarkGridTempo>;
 
 /// Read the current record or compare and replace the exact prior authored value.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PlaymarkTempoOperation {
+pub enum PlaymarkValueOperation<T> {
     /// Read without modifying source metadata.
     Read,
-    /// Atomically change the tempo tuple, with `None` representing an absent record.
+    /// Atomically change the tempo metadata, with `None` representing an absent record.
     Replace {
         /// Exact expected prior value.
-        previous: Option<SourcePlaymarkTempo>,
+        previous: Option<T>,
         /// Replacement value, or `None` to clear the record.
-        next: Option<SourcePlaymarkTempo>,
+        next: Option<T>,
     },
 }
 
 /// One request scoped to the current audited file and its Catalog lifecycle.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct SourcePlaymarkTempoRequest {
+pub struct SourcePlaymarkValueRequest<T> {
     source_id: SourceId,
     lifecycle_generation: u64,
     revision: u64,
     request_id: u64,
     path: RootRelativePath,
-    operation: PlaymarkTempoOperation,
+    operation: PlaymarkValueOperation<T>,
 }
 
-impl SourcePlaymarkTempoRequest {
+impl<T: Copy> SourcePlaymarkValueRequest<T> {
     /// Capture a bounded exact Source request and caller correlation ID.
     pub fn new(
         source_id: &SourceId,
@@ -37,7 +47,7 @@ impl SourcePlaymarkTempoRequest {
         revision: u64,
         request_id: u64,
         relative_path: &Path,
-        operation: PlaymarkTempoOperation,
+        operation: PlaymarkValueOperation<T>,
     ) -> Result<Self, PlaymarkTempoFailure> {
         if source_id.as_str().is_empty()
             || source_id.as_str().len() > 256
@@ -85,7 +95,7 @@ impl SourcePlaymarkTempoRequest {
     }
 
     /// Requested read or compare-and-set operation.
-    pub fn operation(&self) -> PlaymarkTempoOperation {
+    pub fn operation(&self) -> PlaymarkValueOperation<T> {
         self.operation
     }
 
@@ -126,8 +136,102 @@ impl From<SourceWriterError> for PlaymarkTempoFailure {
     }
 }
 
-pub(super) fn dispatch(
-    request: SourcePlaymarkTempoRequest,
+pub(super) trait PlaymarkValue: Copy {
+    fn read(
+        writer: &SourceWriter,
+        revision: &SourceRevision,
+        path: &RootRelativePath,
+    ) -> Result<Option<Self>, SourceWriterError>;
+
+    fn replace(
+        writer: &SourceWriter,
+        revision: &SourceRevision,
+        path: &RootRelativePath,
+        previous: Option<Self>,
+        next: Option<Self>,
+        cancellation: &AtomicBool,
+    ) -> Result<bool, SourceWriterError>;
+
+    fn receipt(
+        request: SourcePlaymarkValueRequest<Self>,
+        cancellation: Arc<AtomicBool>,
+        publication: CatalogPublicationStatus,
+        result: Result<Option<Self>, PlaymarkTempoFailure>,
+    ) -> CatalogEvent;
+}
+
+impl PlaymarkValue for SourcePlaymarkTempo {
+    fn read(
+        writer: &SourceWriter,
+        revision: &SourceRevision,
+        path: &RootRelativePath,
+    ) -> Result<Option<Self>, SourceWriterError> {
+        writer.read_playmark_tempo(revision, path)
+    }
+
+    fn replace(
+        writer: &SourceWriter,
+        revision: &SourceRevision,
+        path: &RootRelativePath,
+        previous: Option<Self>,
+        next: Option<Self>,
+        cancellation: &AtomicBool,
+    ) -> Result<bool, SourceWriterError> {
+        writer.compare_and_set_playmark_tempo(revision, path, previous, next, cancellation)
+    }
+
+    fn receipt(
+        request: SourcePlaymarkValueRequest<Self>,
+        cancellation: Arc<AtomicBool>,
+        publication: CatalogPublicationStatus,
+        result: Result<Option<Self>, PlaymarkTempoFailure>,
+    ) -> CatalogEvent {
+        CatalogEvent::PlaymarkTempoCompleted {
+            request,
+            cancellation,
+            publication,
+            result,
+        }
+    }
+}
+
+impl PlaymarkValue for SourcePlaymarkGridTempo {
+    fn read(
+        writer: &SourceWriter,
+        revision: &SourceRevision,
+        path: &RootRelativePath,
+    ) -> Result<Option<Self>, SourceWriterError> {
+        writer.read_playmark_grid_tempo(revision, path)
+    }
+
+    fn replace(
+        writer: &SourceWriter,
+        revision: &SourceRevision,
+        path: &RootRelativePath,
+        previous: Option<Self>,
+        next: Option<Self>,
+        cancellation: &AtomicBool,
+    ) -> Result<bool, SourceWriterError> {
+        writer.compare_and_set_playmark_grid_tempo(revision, path, previous, next, cancellation)
+    }
+
+    fn receipt(
+        request: SourcePlaymarkValueRequest<Self>,
+        cancellation: Arc<AtomicBool>,
+        publication: CatalogPublicationStatus,
+        result: Result<Option<Self>, PlaymarkTempoFailure>,
+    ) -> CatalogEvent {
+        CatalogEvent::PlaymarkGridTempoCompleted {
+            request,
+            cancellation,
+            publication,
+            result,
+        }
+    }
+}
+
+pub(super) fn dispatch<T: PlaymarkValue>(
+    request: SourcePlaymarkValueRequest<T>,
     cancellation: Arc<AtomicBool>,
     reservation: &mut EventReservation<'_>,
     admission: &Arc<Mutex<AdmissionState>>,
@@ -169,26 +273,21 @@ pub(super) fn dispatch(
         request.lifecycle_generation,
         None,
         source,
-        |publication| CatalogEvent::PlaymarkTempoCompleted {
-            request,
-            cancellation: Arc::clone(&cancellation),
-            publication,
-            result,
-        },
+        |publication| T::receipt(request, cancellation, publication, result),
     );
 }
 
-fn execute(
+fn execute<T: PlaymarkValue>(
     writer: &SourceWriter,
-    request: &SourcePlaymarkTempoRequest,
+    request: &SourcePlaymarkValueRequest<T>,
     cancellation: &AtomicBool,
-) -> Result<Option<SourcePlaymarkTempo>, PlaymarkTempoFailure> {
+) -> Result<Option<T>, PlaymarkTempoFailure> {
     if cancellation.load(Ordering::Acquire) {
         return Err(PlaymarkTempoFailure::Cancelled);
     }
     let revision = match request.operation {
-        PlaymarkTempoOperation::Read => writer.current_revision(),
-        PlaymarkTempoOperation::Replace { .. } => writer.current_revision_for_command(),
+        PlaymarkValueOperation::Read => writer.current_revision(),
+        PlaymarkValueOperation::Replace { .. } => writer.current_revision_for_command(),
     }?;
     if revision.revision() != request.revision
         || revision.lifecycle_generation() != request.lifecycle_generation
@@ -197,9 +296,10 @@ fn execute(
         return Err(PlaymarkTempoFailure::StaleSource);
     }
     match request.operation {
-        PlaymarkTempoOperation::Read => Ok(writer.read_playmark_tempo(&revision, &request.path)?),
-        PlaymarkTempoOperation::Replace { previous, next } => {
-            let committed = writer.compare_and_set_playmark_tempo(
+        PlaymarkValueOperation::Read => Ok(T::read(writer, &revision, &request.path)?),
+        PlaymarkValueOperation::Replace { previous, next } => {
+            let committed = T::replace(
+                writer,
                 &revision,
                 &request.path,
                 previous,
