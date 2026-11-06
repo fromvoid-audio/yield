@@ -79,9 +79,10 @@ use maintenance::{
 };
 use vocabulary::VocabularySlot;
 pub use yield_catalog::{
-    PlaymarkTempoFailure, PlaymarkTempoOperation, SourceContentDigestScope, SourcePlaymarkTempo,
-    SourcePlaymarkTempoRequest, SourceTransientRequest, TransientCacheUse, TransientMarkers,
-    TransientPreset, TransientRequestFailure,
+    PlaymarkTempoFailure, PlaymarkTempoOperation, SourceContentDigestFailure,
+    SourceContentDigestOrigin, SourceContentDigestRequest, SourceContentDigestScope,
+    SourcePlaymarkTempo, SourcePlaymarkTempoRequest, SourceTransientRequest, TransientCacheUse,
+    TransientMarkers, TransientPreset, TransientRequestFailure,
 };
 
 pub use maintenance::{

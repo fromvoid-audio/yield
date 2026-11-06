@@ -101,20 +101,26 @@ mod fixtures {
             matches!(event, CatalogEvent::SnapshotReady { .. })
         });
 
-        for id in [2, 3] {
-            service
-                .submit(CatalogCommand::RequestTransientMarkers {
-                    request: request(&source, revision, id),
-                    cancellation: FeatureAnalysisCancellation::new(),
-                })
-                .unwrap();
-        }
-        assert!(matches!(
-            delivery(&service, 3).into_event_if_live(),
-            Some(CatalogEvent::TransientMarkersCompleted {
-                result: Err(TransientRequestFailure::Busy),
-                ..
+        service
+            .submit(CatalogCommand::RequestTransientMarkers {
+                request: request(&source, revision, 2),
+                cancellation: FeatureAnalysisCancellation::new(),
             })
+            .unwrap();
+        let digest =
+            SourceContentDigestRequest::new(&source, 1, revision, 3, Path::new("attacks.wav"))
+                .unwrap();
+        service
+            .submit(CatalogCommand::RequestSourceContentDigest {
+                request: digest.clone(),
+                cancellation: FeatureAnalysisCancellation::new(),
+            })
+            .unwrap();
+        assert!(matches!(
+            receive_until(&service, |event| matches!(event, CatalogEvent::SourceContentDigestFailed { .. })),
+            CatalogEvent::SourceContentDigestFailed {
+                request, error: SourceContentDigestFailure::Busy, ..
+            } if request == digest
         ));
         cancellation.cancel();
         release_send.send(()).unwrap();
@@ -124,6 +130,113 @@ mod fixtures {
             panic!("expected waiting request");
         };
         assert_eq!(result.unwrap().markers.frames(), [1237, 9673]);
+        wait_for_tag_read_payload(&service, 0);
+        wait_for_tag_page_input_release(&service);
+        service.shutdown();
+    }
+
+    #[test]
+    fn digest_only_enriches_quick_audited_input_without_running_a_detector() {
+        use yield_library::sample_sources::readiness::FEATURE_INPUT_MAX_BYTES;
+        let frames = (FEATURE_INPUT_MAX_BYTES / 2) as u32 + 256;
+        let (_fixture, service, source, revision) = setup_attacks(frames, [32_767, frames - 73]);
+        let request =
+            SourceContentDigestRequest::new(&source, 1, revision, 1, Path::new("attacks.wav"))
+                .unwrap();
+        let cancellation = FeatureAnalysisCancellation::new();
+        service
+            .submit(CatalogCommand::RequestSourceContentDigest {
+                request: request.clone(),
+                cancellation: cancellation.clone(),
+            })
+            .unwrap();
+        let event = receive_until(&service, |event| {
+            matches!(
+                event,
+                CatalogEvent::SourceContentDigestCommitted { .. }
+                    | CatalogEvent::SourceContentDigestFailed { .. }
+            )
+        });
+        let CatalogEvent::SourceContentDigestCommitted {
+            scope,
+            origin,
+            committed_revision,
+            entry,
+        } = event
+        else {
+            panic!("expected digest-only enrichment, got {event:?}");
+        };
+        assert_eq!(&scope, request.scope());
+        assert_eq!(
+            origin,
+            SourceContentDigestOrigin::DigestOnly(request.request_id())
+        );
+        assert_eq!(committed_revision, revision + 1);
+        assert_eq!(entry.relative_path, Path::new("attacks.wav"));
+        assert_eq!(entry.content_hash.as_ref().map(String::len), Some(64));
+        wait_for_tag_read_payload(&service, 0);
+        wait_for_tag_page_input_release(&service);
+        assert!(!matches!(
+            service.try_recv_event(),
+            Ok(CatalogEvent::TransientMarkersCompleted { .. })
+        ));
+        service
+            .submit(CatalogCommand::RequestSourceContentDigest {
+                request: request.clone(),
+                cancellation,
+            })
+            .unwrap();
+        assert!(matches!(
+            receive_until(&service, |event| matches!(event, CatalogEvent::SourceContentDigestFailed { .. })),
+            CatalogEvent::SourceContentDigestFailed { request: rejected, error: SourceContentDigestFailure::StaleSource, .. }
+                if rejected == request
+        ));
+        service.shutdown();
+    }
+
+    #[test]
+    fn retiring_the_source_cancels_a_held_digest_and_refunds_its_credit() {
+        use yield_library::sample_sources::readiness::FEATURE_INPUT_MAX_BYTES;
+        let frames = (FEATURE_INPUT_MAX_BYTES / 2) as u32 + 256;
+        let fixture = Fixture::new("digest-only-retirement");
+        let path = Path::new("attacks.wav");
+        write_attacks(
+            &fixture.root.path().join(path),
+            frames,
+            [32_767, frames - 73],
+        );
+        let source = SourceId::from_string("digest-only-retirement");
+        let (service, gate) = CatalogService::start_with_test_gate(&fixture.guard).unwrap();
+        let revision =
+            register_and_audit(&service, fixture.root.path(), &source).committed_revision;
+        let (entered_send, entered_recv) = mpsc::sync_channel(1);
+        let (release_send, release_recv) = mpsc::sync_channel(1);
+        *gate.transient_compute.lock().unwrap() = Some((entered_send, release_recv));
+        let cancellation = FeatureAnalysisCancellation::new();
+        service
+            .submit(CatalogCommand::RequestSourceContentDigest {
+                request: SourceContentDigestRequest::new(&source, 1, revision, 1, path).unwrap(),
+                cancellation: cancellation.clone(),
+            })
+            .unwrap();
+        entered_recv.recv_timeout(Duration::from_secs(2)).unwrap();
+        service
+            .submit(CatalogCommand::Remove {
+                source_id: source,
+                lifecycle_generation: 1,
+            })
+            .unwrap();
+        assert!(cancellation.is_cancelled());
+        release_send.send(()).unwrap();
+        let event = receive_until(&service, |event| {
+            matches!(
+                event,
+                CatalogEvent::Removed { .. }
+                    | CatalogEvent::SourceContentDigestCommitted { .. }
+                    | CatalogEvent::SourceContentDigestFailed { .. }
+            )
+        });
+        assert!(matches!(event, CatalogEvent::Removed { .. }), "{event:?}");
         wait_for_tag_read_payload(&service, 0);
         wait_for_tag_page_input_release(&service);
         service.shutdown();
@@ -270,7 +383,7 @@ mod fixtures {
             .unwrap();
         let CatalogEvent::SourceContentDigestCommitted {
             scope,
-            transient_request_id,
+            origin,
             committed_revision,
             entry,
         } = receive_until(&service, |event| {
@@ -280,7 +393,10 @@ mod fixtures {
             unreachable!()
         };
         assert!(request.matches_digest_scope(&scope));
-        assert_eq!(transient_request_id, Some(request.request_id()));
+        assert_eq!(
+            origin,
+            SourceContentDigestOrigin::Transients(request.request_id())
+        );
         assert_eq!(committed_revision, before.committed_revision + 1);
         assert_eq!(entry.relative_path, Path::new("attacks.wav"));
         assert!(entry.content_hash.is_some());
