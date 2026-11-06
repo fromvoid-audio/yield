@@ -774,7 +774,7 @@ mod tests {
             install_waveform(view, &path, preview);
             install_source(view, root, &snapshot);
             view.set_waveform_play_region(baseline);
-            assert!(playmark_tempo::save_released_tempo(view, first, cx));
+            assert!(playmark_tempo::save_authored_tempo(view, first, cx));
             assert_eq!(view.waveform_play_region, baseline);
             assert_eq!(view.playback_status, "Saving playmark tempo…");
         });
@@ -791,7 +791,7 @@ mod tests {
                 Some((2_000, 8_000))
             );
             assert_eq!(view.beat_count_input.read(cx).count(), 6);
-            assert!(playmark_tempo::save_released_tempo(view, second, cx));
+            assert!(playmark_tempo::save_authored_tempo(view, second, cx));
         });
         let second_receipt = next_tempo_delivery(cx);
         browser.update(cx, |view, cx| {
@@ -840,7 +840,7 @@ mod tests {
             install_waveform(view, &path, preview);
             install_source(view, root, &snapshot);
             view.set_waveform_play_region(baseline);
-            assert!(playmark_tempo::save_released_tempo(view, tempo, cx));
+            assert!(playmark_tempo::save_authored_tempo(view, tempo, cx));
         });
         for _ in 0..2 {
             let delivery = next_tempo_delivery(cx);
@@ -879,6 +879,91 @@ mod tests {
         });
         cx.update(|app| {
             app.update_global::<SourceRegistryGlobal, _>(|global, _| global.shutdown())
+        });
+    }
+
+    #[gpui::test]
+    fn timing_editor_saves_bpm_and_keeps_duration_edits_local(cx: &mut TestAppContext) {
+        use super::super::{
+            playmark_tempo, source_registry::SourceRegistryGlobal, waveform::WaveformPlayRegion,
+        };
+        use yield_session::SourcePlaymarkTempo;
+
+        let (_directory, path, preview) = fixture();
+        let root = path.parent().unwrap();
+        let config = tempfile::tempdir().unwrap();
+        let _base = ConfigBaseGuard::set(config.path().canonicalize().unwrap());
+        let _profile = PersistenceProfileGuard::named("gpui-manual-tempo");
+        let guard = WritableProfileGuard::acquire_current().unwrap();
+        let (service, snapshot) = audited_owner(&guard, root);
+        cx.set_global(SourceRegistryGlobal::for_catalog_fixture(service));
+        let (browser, cx) = install(cx, &path, preview);
+        let baseline = WaveformPlayRegion::new(0.125, 0.25);
+        browser.update(cx, |view, _| {
+            install_source(view, root, &snapshot);
+            view.set_waveform_play_region(baseline);
+        });
+        let enter = KeyDownEvent {
+            keystroke: Keystroke::parse("enter").unwrap(),
+            is_held: false,
+        };
+        cx.update(|window, app| {
+            browser.update(app, |view, cx| {
+                assert!(view.begin_playmark_timing_edit(window, cx));
+                view.playmark_timing_input
+                    .update(cx, |input, cx| input.set_content("640 BpM", cx));
+                view.handle_key_down(&enter, window, cx);
+                assert!(view.waveform_focus_handle.is_focused(window));
+                assert_eq!(view.waveform_play_region, baseline);
+            });
+        });
+        let prior = next_tempo_delivery(&mut cx.cx);
+        browser.update(cx, |view, cx| {
+            assert!(view.apply_catalog_delivery(prior, cx))
+        });
+        let (event, fence) = next_tempo_delivery(&mut cx.cx)
+            .into_parts_if_live()
+            .unwrap();
+        let expected = SourcePlaymarkTempo::new(2_000, 8_000, 16_000, 16_000, 4);
+        assert!(matches!(
+            event,
+            CatalogEvent::PlaymarkTempoCompleted { result, .. } if result == Ok(expected)
+        ));
+        cx.update(|window, app| {
+            browser.update(app, |view, cx| {
+                assert!(playmark_tempo::apply_catalog_event(
+                    view,
+                    &event,
+                    fence.as_ref(),
+                    cx
+                ));
+                assert_eq!(
+                    view.waveform_play_region,
+                    WaveformPlayRegion::new(0.125, 0.5)
+                );
+                assert!(view.begin_playmark_timing_edit(window, cx));
+                view.playmark_timing_input
+                    .update(cx, |input, cx| input.set_content("250ms", cx));
+                view.handle_key_down(&enter, window, cx);
+                assert_eq!(
+                    view.waveform_play_region,
+                    WaveformPlayRegion::new(0.125, 0.375)
+                );
+                assert!(view.playback_init_intent.is_none());
+                view.invalidate_waveform_generation();
+                assert!(playmark_tempo::load_for_waveform(view, cx));
+            });
+        });
+        let reopened = next_tempo_delivery(&mut cx.cx);
+        browser.update(cx, |view, cx| {
+            assert!(view.apply_catalog_delivery(reopened, cx));
+            assert_eq!(
+                view.waveform_play_region,
+                WaveformPlayRegion::new(0.125, 0.5)
+            );
+        });
+        cx.update(|_, app| {
+            app.update_global::<SourceRegistryGlobal, _>(|global, _| global.shutdown());
         });
     }
 
