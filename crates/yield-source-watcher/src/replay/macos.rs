@@ -209,29 +209,30 @@ fn source_absolute_path(volume_root: &Path, volume_relative_path: &Path) -> Opti
     Some(volume_root.join(relative))
 }
 
-const KNOWN_FLAGS: fs::FSEventStreamEventFlags = fs::kFSEventStreamEventFlagMustScanSubDirs
-    | fs::kFSEventStreamEventFlagUserDropped
-    | fs::kFSEventStreamEventFlagKernelDropped
-    | fs::kFSEventStreamEventFlagEventIdsWrapped
-    | fs::kFSEventStreamEventFlagHistoryDone
-    | fs::kFSEventStreamEventFlagRootChanged
-    | fs::kFSEventStreamEventFlagMount
-    | fs::kFSEventStreamEventFlagUnmount
-    | fs::kFSEventStreamEventFlagItemCreated
-    | fs::kFSEventStreamEventFlagItemRemoved
-    | fs::kFSEventStreamEventFlagItemInodeMetaMod
-    | fs::kFSEventStreamEventFlagItemRenamed
-    | fs::kFSEventStreamEventFlagItemModified
-    | fs::kFSEventStreamEventFlagItemFinderInfoMod
-    | fs::kFSEventStreamEventFlagItemChangeOwner
-    | fs::kFSEventStreamEventFlagItemXattrMod
-    | fs::kFSEventStreamEventFlagItemIsFile
-    | fs::kFSEventStreamEventFlagItemIsDir
-    | fs::kFSEventStreamEventFlagItemIsSymlink
-    | fs::kFSEventStreamEventFlagOwnEvent
-    | fs::kFSEventStreamEventFlagItemIsHardlink
-    | fs::kFSEventStreamEventFlagItemIsLastHardlink
-    | fs::kFSEventStreamEventFlagItemCloned;
+pub(crate) const KNOWN_FLAGS: fs::FSEventStreamEventFlags =
+    fs::kFSEventStreamEventFlagMustScanSubDirs
+        | fs::kFSEventStreamEventFlagUserDropped
+        | fs::kFSEventStreamEventFlagKernelDropped
+        | fs::kFSEventStreamEventFlagEventIdsWrapped
+        | fs::kFSEventStreamEventFlagHistoryDone
+        | fs::kFSEventStreamEventFlagRootChanged
+        | fs::kFSEventStreamEventFlagMount
+        | fs::kFSEventStreamEventFlagUnmount
+        | fs::kFSEventStreamEventFlagItemCreated
+        | fs::kFSEventStreamEventFlagItemRemoved
+        | fs::kFSEventStreamEventFlagItemInodeMetaMod
+        | fs::kFSEventStreamEventFlagItemRenamed
+        | fs::kFSEventStreamEventFlagItemModified
+        | fs::kFSEventStreamEventFlagItemFinderInfoMod
+        | fs::kFSEventStreamEventFlagItemChangeOwner
+        | fs::kFSEventStreamEventFlagItemXattrMod
+        | fs::kFSEventStreamEventFlagItemIsFile
+        | fs::kFSEventStreamEventFlagItemIsDir
+        | fs::kFSEventStreamEventFlagItemIsSymlink
+        | fs::kFSEventStreamEventFlagOwnEvent
+        | fs::kFSEventStreamEventFlagItemIsHardlink
+        | fs::kFSEventStreamEventFlagItemIsLastHardlink
+        | fs::kFSEventStreamEventFlagItemCloned;
 
 #[cfg(test)]
 mod tests {
