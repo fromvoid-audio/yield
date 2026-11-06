@@ -7,7 +7,8 @@ use std::sync::{
 use std::time::{Duration, Instant};
 
 use gpui::{
-    AppContext, ClickEvent, Context, FocusHandle, KeyDownEvent, Task, Window, div, prelude::*, px,
+    App, AppContext, ClickEvent, Context, FocusHandle, KeyDownEvent, Task, Window, div, prelude::*,
+    px,
 };
 use yield_issue_gateway::{
     AuthRequestId, CreatedIssue, GatewayClient, GatewayError, SecretToken, TokenStore,
@@ -24,6 +25,12 @@ const POLL_LIMIT: usize = 40;
 const AUTH_TIMEOUT: Duration = Duration::from_secs(120);
 const BODY_LIMIT: usize = 60_000;
 const TITLE_LIMIT: usize = 200;
+const REPORT_SECTIONS: [(&str, f32); 4] = [
+    ("Description", 104.0),
+    ("Reproduction steps or workflow", 72.0),
+    ("Expected result", 64.0),
+    ("Actual result", 64.0),
+];
 
 trait FeedbackService: Send + Sync + 'static {
     fn check(&self) -> Result<Connection, ServiceError>;
@@ -228,7 +235,7 @@ pub(super) struct FeedbackIssueState {
     focus: FocusHandle,
     previous_focus: Option<FocusHandle>,
     title: gpui::Entity<SearchInput>,
-    body: gpui::Entity<MultilineTextInput>,
+    sections: [gpui::Entity<MultilineTextInput>; REPORT_SECTIONS.len()],
     kind: IssueKind,
     connection: Connection,
     submission: Submission,
@@ -239,7 +246,7 @@ pub(super) struct FeedbackIssueState {
     auth_task: Option<Task<()>>,
     scroll_handle: gpui::ScrollHandle,
     _title_subscription: gpui::Subscription,
-    _body_subscription: gpui::Subscription,
+    _section_subscriptions: [gpui::Subscription; REPORT_SECTIONS.len()],
     submit_generation: u64,
     submit_task: Option<Task<()>>,
     allow_unknown_retry: bool,
@@ -250,19 +257,22 @@ impl FeedbackIssueState {
     pub(super) fn new(cx: &mut Context<Browser>) -> Self {
         let title =
             cx.new(|cx| SearchInput::new_with_options(cx, SearchInputOptions::feedback_title()));
-        let body = cx.new(MultilineTextInput::new);
+        let sections = REPORT_SECTIONS
+            .map(|(_, height)| cx.new(|cx| MultilineTextInput::new(cx).with_height(px(height))));
         let title_subscription = cx.subscribe(&title, |_, _, _: &SearchChanged, cx| cx.notify());
-        let body_subscription = cx.subscribe(
-            &body,
-            |_, _, _: &crate::multiline_text_input::Changed, cx| cx.notify(),
-        );
+        let section_subscriptions = sections.each_ref().map(|input| {
+            cx.subscribe(
+                input,
+                |_, _, _: &crate::multiline_text_input::Changed, cx| cx.notify(),
+            )
+        });
         title.read(cx).focus_handle().tab_stop(true);
         Self {
             open: false,
             focus: cx.focus_handle(),
             previous_focus: None,
             title,
-            body,
+            sections,
             kind: IssueKind::Bug,
             connection: Connection::Checking,
             submission: Submission::Idle,
@@ -273,12 +283,16 @@ impl FeedbackIssueState {
             auth_task: None,
             scroll_handle: gpui::ScrollHandle::new(),
             _title_subscription: title_subscription,
-            _body_subscription: body_subscription,
+            _section_subscriptions: section_subscriptions,
             submit_generation: 0,
             submit_task: None,
             allow_unknown_retry: false,
             message: None,
         }
+    }
+
+    fn report_body(&self, cx: &App) -> Result<String, ReportBodyError> {
+        compose_body(self.sections.each_ref().map(|input| input.read(cx).text()))
     }
 
     #[cfg(test)]
@@ -519,18 +533,18 @@ impl Browser {
             .to_owned();
         let Some(title) = issue_title(self.feedback_issue.kind, &draft) else {
             self.feedback_issue.message =
-                Some("Title must be 3–200 UTF-8 bytes including its type prefix".into());
+                Some("Enter at least 3 UTF-8 bytes. The title and category prefix must fit in 200 bytes.".into());
             cx.notify();
             return;
         };
-        let raw_body = self.feedback_issue.body.read(cx).text().to_owned();
-        let body = compose_body(&raw_body);
-        if body.len() > BODY_LIMIT {
-            self.feedback_issue.message =
-                Some("Description is too long after adding app diagnostics".into());
-            cx.notify();
-            return;
-        }
+        let body = match self.feedback_issue.report_body(cx) {
+            Ok(body) => body,
+            Err(error) => {
+                self.feedback_issue.message = Some(error.message());
+                cx.notify();
+                return;
+            }
+        };
         self.feedback_issue.submission = Submission::Pending;
         self.feedback_issue.allow_unknown_retry = false;
         self.feedback_issue.message = Some("Submitting one issue…".into());
@@ -590,9 +604,9 @@ impl Browser {
         self.feedback_issue
             .title
             .update(cx, |title, cx| title.set_content("", cx));
-        self.feedback_issue
-            .body
-            .update(cx, |body, cx| body.set_text("", cx));
+        for input in &self.feedback_issue.sections {
+            input.update(cx, |input, cx| input.set_text("", cx));
+        }
         self.feedback_issue.kind = IssueKind::Bug;
         self.feedback_issue.submission = Submission::Idle;
         self.feedback_issue.allow_unknown_retry = false;
@@ -687,15 +701,56 @@ fn issue_title(kind: IssueKind, draft: &str) -> Option<String> {
     (title.len() <= TITLE_LIMIT).then_some(title)
 }
 
-fn compose_body(description: &str) -> String {
-    let diagnostics = format!(
-        "\n\n---\nYield {} · {} {} ({})",
+#[derive(Debug, Eq, PartialEq)]
+enum ReportBodyError {
+    Missing(&'static str),
+    TooLong(usize),
+}
+
+impl ReportBodyError {
+    fn message(&self) -> String {
+        match self {
+            Self::Missing(field) => format!("Complete the required field ‘{field}’."),
+            Self::TooLong(bytes) => format!(
+                "Report and build context use {bytes} UTF-8 bytes. The limit is {BODY_LIMIT}."
+            ),
+        }
+    }
+}
+
+fn compose_body(fields: [&str; REPORT_SECTIONS.len()]) -> Result<String, ReportBodyError> {
+    let fields = fields.map(str::trim);
+    if let Some(missing) = fields.iter().position(|text| text.is_empty()) {
+        return Err(ReportBodyError::Missing(REPORT_SECTIONS[missing].0));
+    }
+    let build_context = format!(
+        "---\nYield {} · {} {} ({})",
         env!("CARGO_PKG_VERSION"),
         std::env::consts::OS,
         std::env::consts::ARCH,
         safe_build_id(option_env!("YIELD_BUILD_ID"))
     );
-    format!("{}{}", description.trim(), diagnostics)
+    let section_bytes = REPORT_SECTIONS
+        .iter()
+        .zip(fields)
+        .map(|((heading, _), text)| {
+            "## ".len() + heading.len() + "\n\n".len() + text.len() + "\n\n".len()
+        })
+        .sum::<usize>();
+    let body_len = section_bytes + build_context.len();
+    if body_len > BODY_LIMIT {
+        return Err(ReportBodyError::TooLong(body_len));
+    }
+    let mut body = String::with_capacity(body_len);
+    for ((heading, _), text) in REPORT_SECTIONS.into_iter().zip(fields) {
+        body.push_str("## ");
+        body.push_str(heading);
+        body.push_str("\n\n");
+        body.push_str(text);
+        body.push_str("\n\n");
+    }
+    body.push_str(&build_context);
+    Ok(body)
 }
 
 fn safe_build_id(build_id: Option<&str>) -> String {
@@ -747,19 +802,22 @@ pub(super) fn render(
     let connection = connection_label(&state.connection);
     let issue = submission_label(&state.submission);
     let title = state.title.clone();
-    let body = state.body.clone();
     let draft_len = title.read(cx).content().trim().len();
     let title_len = draft_len + state.kind.prefix().len();
-    let body_len = compose_body(body.read(cx).text()).len();
+    let report_body = state.report_body(cx);
     let can_submit = matches!(state.connection, Connection::Connected)
-        && !matches!(
-            state.submission,
-            Submission::Pending | Submission::Confirmed(_)
-        )
-        && (state.submission != Submission::Unknown || state.allow_unknown_retry)
+        && submission_can_start(&state.submission, state.allow_unknown_retry)
         && draft_len >= 3
         && title_len <= TITLE_LIMIT
-        && body_len <= BODY_LIMIT;
+        && report_body.is_ok();
+    let body_warning = matches!(report_body, Err(ReportBodyError::TooLong(_)));
+    let report_status = match report_body {
+        Ok(body) => format!(
+            "{} / {BODY_LIMIT} UTF-8 bytes including build context",
+            body.len()
+        ),
+        Err(error) => error.message(),
+    };
     let kind_enabled = !matches!(
         state.submission,
         Submission::Pending | Submission::Confirmed(_)
@@ -769,6 +827,7 @@ pub(super) fn render(
     let accent = color(theme.colors.accent);
     let mut modal = div()
         .id("feedback-issue-modal")
+        .debug_selector(|| "feedback-issue-modal".into())
         .track_focus(&state.focus)
         .tab_group()
         .w(px((f32::from(window_size.width) - 48.0).clamp(420.0, 720.0)))
@@ -831,18 +890,24 @@ pub(super) fn render(
         .child(div().text_color(color(theme.colors.text_muted)).child(format!(
             "{title_len} / {TITLE_LIMIT} UTF-8 bytes including prefix; enter at least 3 bytes"
         )))
-        .child(div().child("Description (Enter inserts a new line)"))
-        .child(body)
+        .child(div().text_color(color(theme.colors.text_muted)).child("All report fields are required. Enter inserts a new line."))
+        .children(REPORT_SECTIONS.iter().zip(&state.sections).map(|((label, _), field)| {
+            div()
+                .flex()
+                .flex_col()
+                .flex_none()
+                .gap(px(theme.spacing.control_gap))
+                .child(div().child(*label))
+                .child(field.clone())
+        }))
         .child(
             div()
-                .text_color(color(if body_len > BODY_LIMIT {
+                .text_color(color(if body_warning {
                     theme.colors.warning
                 } else {
                     theme.colors.text_muted
                 }))
-                .child(format!(
-                    "{body_len} / {BODY_LIMIT} UTF-8 bytes including diagnostics; oversized edits are rejected"
-                )),
+                .child(report_status),
         )
         .child(
             div()
@@ -934,6 +999,7 @@ fn button(
 ) -> impl IntoElement {
     div()
         .id(id)
+        .debug_selector(move || id.into())
         .tab_stop(true)
         .when(enabled, |element| element.cursor_pointer())
         .p(px(6.0))
@@ -963,13 +1029,20 @@ mod tests {
     use std::collections::VecDeque;
     use std::sync::Mutex;
 
+    const COMPLETE_FIELDS: [&str; REPORT_SECTIONS.len()] = [
+        "  Report details  ",
+        "Open a disposable file\nPress Play",
+        "Hear the file",
+        "Playback stops",
+    ];
+
     #[derive(Default)]
     struct MockService {
         polls: Mutex<VecDeque<Result<Option<SecretToken>, ServiceError>>>,
         cancel_on_poll: Mutex<Option<Arc<AtomicBool>>>,
         poll_count: Mutex<usize>,
         stored: Mutex<usize>,
-        submissions: Mutex<usize>,
+        submissions: Mutex<Vec<(String, String)>>,
     }
 
     impl FeedbackService for MockService {
@@ -991,8 +1064,11 @@ mod tests {
             *self.stored.lock().unwrap() += 1;
             Ok(())
         }
-        fn submit(&self, _: &str, _: &str) -> Result<CreatedIssue, SubmitError> {
-            *self.submissions.lock().unwrap() += 1;
+        fn submit(&self, title: &str, body: &str) -> Result<CreatedIssue, SubmitError> {
+            self.submissions
+                .lock()
+                .unwrap()
+                .push((title.into(), body.into()));
             Err(SubmitError::Unknown)
         }
     }
@@ -1017,10 +1093,32 @@ mod tests {
         assert_eq!(safe_build_id(None), "build id unavailable");
         assert_eq!(safe_build_id(Some("../private/token")), "..privatetoken");
         assert!(safe_build_id(Some(&"a".repeat(200))).len() <= 64);
-        let body = compose_body("  report  ");
-        assert!(body.starts_with("report\n\n---\nYield "));
+        let body = compose_body(COMPLETE_FIELDS).unwrap();
+        assert!(body.starts_with("## Description\n\nReport details\n\n## Reproduction steps or workflow\n\nOpen a disposable file\nPress Play\n\n## Expected result\n\nHear the file\n\n## Actual result\n\nPlayback stops\n\n---\nYield "));
         assert!(body.contains(std::env::consts::OS));
         assert!(body.contains(std::env::consts::ARCH));
+    }
+
+    #[test]
+    fn structured_body_requires_each_field_and_enforces_aggregate_bytes() {
+        for (index, (label, _)) in REPORT_SECTIONS.into_iter().enumerate() {
+            let mut missing = COMPLETE_FIELDS;
+            missing[index] = "  \n\t";
+            assert_eq!(compose_body(missing), Err(ReportBodyError::Missing(label)));
+        }
+        let base = compose_body(["x", "step", "expected", "actual"]).unwrap();
+        let exact = "x".repeat(BODY_LIMIT - base.len() + 1);
+        assert_eq!(
+            compose_body([&exact, "step", "expected", "actual"])
+                .unwrap()
+                .len(),
+            BODY_LIMIT
+        );
+        let oversized = format!("{exact}é");
+        assert_eq!(
+            compose_body([&oversized, "step", "expected", "actual"]),
+            Err(ReportBodyError::TooLong(BODY_LIMIT + 2))
+        );
     }
     #[test]
     fn polling_delay_is_bounded_and_backoff_capped() {
@@ -1111,7 +1209,7 @@ mod tests {
         if submission_can_start(&submission, acknowledged) {
             let _ = service.submit("Bug: broken", "details");
         }
-        assert_eq!(*service.submissions.lock().unwrap(), 1);
+        assert_eq!(service.submissions.lock().unwrap().len(), 1);
         let mut open = true;
         close_prompt(&mut open);
         assert!(!open);
@@ -1127,6 +1225,83 @@ mod tests {
                 .unwrap()
                 .contains("Check")
         );
+    }
+
+    #[gpui::test]
+    fn constrained_structured_feedback_submits_one_complete_mock_report(cx: &mut TestAppContext) {
+        use gpui::{
+            Bounds, Modifiers, MouseButton, ScrollDelta, ScrollWheelEvent, TouchPhase,
+            VisualTestContext, WindowBounds, WindowOptions, point, size,
+        };
+        let enlarged = crate::theme::with_text_scale(&yield_design::Theme::default(), 200);
+        cx.set_global(crate::theme::ActiveTheme(Arc::new(enlarged)));
+        let window = cx.update(|app| {
+            app.open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(Bounds::new(
+                        point(px(0.0), px(0.0)),
+                        size(px(960.0), px(560.0)),
+                    ))),
+                    ..Default::default()
+                },
+                |_, app| app.new(Browser::new),
+            )
+            .unwrap()
+        });
+        let browser = window.root(cx).unwrap();
+        let mut cx = VisualTestContext::from_window(window.into(), cx);
+        let service = Arc::new(MockService::default());
+        browser.update(&mut cx, |view, cx| {
+            view.feedback_issue.service = service.clone();
+            view.feedback_issue.open = true;
+            view.feedback_issue.connection = Connection::Connected;
+            view.feedback_issue
+                .title
+                .update(cx, |title, cx| title.set_content("Sound stopped", cx));
+            view.feedback_issue.sections[0]
+                .update(cx, |input, cx| input.set_text(COMPLETE_FIELDS[0], cx));
+            view.submit_feedback_issue(cx);
+            assert_eq!(view.feedback_issue.submission, Submission::Idle);
+            assert!(service.submissions.lock().unwrap().is_empty());
+            for (input, text) in view.feedback_issue.sections.iter().zip(COMPLETE_FIELDS) {
+                input.update(cx, |input, cx| input.set_text(text, cx));
+            }
+        });
+        cx.refresh().unwrap();
+        cx.run_until_parked();
+        let modal = cx.debug_bounds("feedback-issue-modal").unwrap();
+        assert!(modal.bottom() <= px(560.0));
+        cx.simulate_event(ScrollWheelEvent {
+            position: point(modal.left() + px(8.0), modal.top() + px(8.0)),
+            delta: ScrollDelta::Pixels(point(px(0.0), px(-4000.0))),
+            modifiers: Modifiers::none(),
+            touch_phase: TouchPhase::Moved,
+        });
+        cx.refresh().unwrap();
+        let submit = cx.debug_bounds("feedback-submit").unwrap();
+        assert!(submit.top() >= modal.top() && submit.bottom() <= modal.bottom());
+        let center = point(
+            submit.left() + submit.size.width / 2.0,
+            submit.top() + submit.size.height / 2.0,
+        );
+        cx.simulate_mouse_down(center, MouseButton::Left, Modifiers::none());
+        cx.simulate_mouse_up(center, MouseButton::Left, Modifiers::none());
+        cx.run_until_parked();
+
+        let reports = service.submissions.lock().unwrap();
+        assert_eq!(
+            reports.as_slice(),
+            [(
+                String::from("Bug: Sound stopped"),
+                compose_body(COMPLETE_FIELDS).unwrap()
+            )]
+        );
+        browser.update(&mut cx, |view, cx| {
+            assert_eq!(view.feedback_issue.submission, Submission::Unknown);
+            for (input, text) in view.feedback_issue.sections.iter().zip(COMPLETE_FIELDS) {
+                assert_eq!(input.read(cx).text(), text);
+            }
+        });
     }
 
     #[gpui::test]
@@ -1148,9 +1323,9 @@ mod tests {
                 view.feedback_issue
                     .title
                     .update(cx, |title, cx| title.set_content("Something broke", cx));
-                view.feedback_issue
-                    .body
-                    .update(cx, |body, cx| body.set_text("Please fix this", cx));
+                for (input, text) in view.feedback_issue.sections.iter().zip(COMPLETE_FIELDS) {
+                    input.update(cx, |input, cx| input.set_text(text, cx));
+                }
                 view.close_feedback_issue(window, cx);
                 assert!(!view.feedback_issue.open);
             });
@@ -1165,10 +1340,18 @@ mod tests {
                     view.feedback_issue.submission,
                     Submission::Confirmed(_)
                 ));
+                for (input, text) in view.feedback_issue.sections.iter().zip(COMPLETE_FIELDS) {
+                    assert_eq!(input.read(cx).text(), text);
+                }
                 view.new_feedback_report(cx);
                 assert_eq!(view.feedback_issue.submission, Submission::Idle);
                 assert_eq!(view.feedback_issue.title.read(cx).content(), "");
-                assert_eq!(view.feedback_issue.body.read(cx).text(), "");
+                assert!(
+                    view.feedback_issue
+                        .sections
+                        .iter()
+                        .all(|input| input.read(cx).text().is_empty())
+                );
                 view.feedback_issue.submission = Submission::Unknown;
                 view.new_feedback_report(cx);
                 assert_eq!(view.feedback_issue.submission, Submission::Unknown);
