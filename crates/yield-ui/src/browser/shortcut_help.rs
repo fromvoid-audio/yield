@@ -390,6 +390,10 @@ const WAVEFORM_ROWS: &[ShortcutRow] = &[
         description: "Preview BPM from the new selection length and current beat count",
     },
     ShortcutRow {
+        keys: "Cmd/Ctrl-Z / Shift-Cmd/Ctrl-Z (waveform)",
+        description: "Undo / redo the saved playmark tempo",
+    },
+    ShortcutRow {
         keys: "Option or Shift + Left / Right",
         description: "Nudge the play selection by one audio frame",
     },
