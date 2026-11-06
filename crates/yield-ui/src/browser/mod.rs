@@ -422,6 +422,7 @@ pub(crate) struct Browser {
     pane_resize_environment_subscriptions: Vec<gpui::Subscription>,
     waveform_zoom_anchor_ratio: f64,
     waveform_play_region: Option<waveform::WaveformPlayRegion>,
+    waveform_play_grid: Option<yield_core::SnappedPlaymark>,
     playmark_tempo: playmark_tempo::PlaymarkTempoState,
     playmark_resize_anchor: Option<playmark_resize::ResizeAnchor>,
     held_playmark_slide: Option<waveform::WaveformRegionSlide>,
@@ -672,6 +673,7 @@ impl Browser {
             |view, _input, event: &BeatCountChanged, cx| {
                 if view.waveform.is_some() && view.beat_guide_count != event.count {
                     view.playmark_tempo.preserve_local_edit();
+                    view.waveform_play_grid = None;
                 }
                 view.beat_guide_count = event.count;
                 if event.committed {
@@ -793,6 +795,7 @@ impl Browser {
             pane_resize_environment_subscriptions: Vec::new(),
             waveform_zoom_anchor_ratio: 0.5,
             waveform_play_region: None,
+            waveform_play_grid: None,
             playmark_tempo: playmark_tempo::PlaymarkTempoState::default(),
             playmark_resize_anchor: None,
             held_playmark_slide: None,
@@ -1003,12 +1006,14 @@ impl Browser {
         let Some(core_region) = region.core() else {
             return false;
         };
-        let Some(original_text) = playmark_selection_label(
-            core_region,
-            preview.total_frames,
-            preview.sample_rate,
-            self.beat_guides_enabled.then_some(self.beat_guide_count),
-        ) else {
+        let Some(original_text) = self.painted_tempo_label().or_else(|| {
+            playmark_selection_label(
+                core_region,
+                preview.total_frames,
+                preview.sample_rate,
+                self.beat_guides_enabled.then_some(self.beat_guide_count),
+            )
+        }) else {
             return false;
         };
         self.playmark_timing_editor = Some(PlaymarkTimingEditorState {

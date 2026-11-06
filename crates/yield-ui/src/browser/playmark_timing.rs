@@ -177,8 +177,12 @@ pub(super) fn label_layout(
     total_frames: usize,
     sample_rate: u32,
     beat_count: Option<u8>,
+    tempo_label: Option<String>,
 ) -> Option<(String, PlaymarkLabelLayout)> {
-    let label = playmark_selection_label(region.core()?, total_frames, sample_rate, beat_count)?;
+    let label = match tempo_label {
+        Some(label) => label,
+        None => playmark_selection_label(region.core()?, total_frames, sample_rate, beat_count)?,
+    };
     let layout = playmark_label_layout(
         bounds,
         selection_rect(bounds, viewport, region)?,
@@ -230,23 +234,15 @@ pub(super) fn render_overlay(
 ) -> impl IntoElement {
     canvas(
         move |bounds, window, cx| {
-            let (label, layout) = if let Some(label) = tempo_preview_label {
-                let layout = playmark_label_layout(
-                    bounds,
-                    selection_rect(bounds, viewport, region)?,
-                    label.len(),
-                )?;
-                (label, layout)
-            } else {
-                label_layout(
-                    bounds,
-                    viewport,
-                    region,
-                    total_frames,
-                    sample_rate,
-                    beat_count,
-                )?
-            };
+            let (label, layout) = label_layout(
+                bounds,
+                viewport,
+                region,
+                total_frames,
+                sample_rate,
+                beat_count,
+                tempo_preview_label,
+            )?;
             let input = editor_input.map(|input| {
                 if let Some(set_frame) = editor_ax_frame.as_ref() {
                     set_frame(layout.rect);

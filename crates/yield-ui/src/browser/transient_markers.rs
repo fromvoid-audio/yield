@@ -1140,9 +1140,9 @@ mod tests {
         cx.simulate_mouse_down(at(0.875), left, plain);
         browser.update(cx, |view, cx| view.toggle_bpm_snap(cx));
         cx.simulate_mouse_move(at(0.425), left, plain);
-        browser.read_with(cx, |view, _| {
-            let preview =
-                zero_crossing::preview_drag_region(view, view.waveform_region_drag.unwrap());
+        let captured = browser.read_with(cx, |view, _| {
+            let drag = view.waveform_region_drag.unwrap();
+            let preview = zero_crossing::preview_drag_region(view, drag);
             assert_eq!(
                 preview.and_then(|span| span.frame_bounds(16_000)),
                 Some((6_000, 14_000))
@@ -1151,20 +1151,32 @@ mod tests {
                 view.waveform_play_region,
                 WaveformPlayRegion::new(0.125, 0.625)
             );
+            let paint = drag.snapped_paint().unwrap();
+            assert_eq!(
+                paint.guide_frames((0, 16_000), 20).collect::<Vec<_>>(),
+                [10_000]
+            );
+            paint
         });
         cx.simulate_mouse_up(at(0.425), left, plain);
-        browser.read_with(cx, |view, _| {
+        browser.update(cx, |view, _| {
             assert_eq!(
                 view.waveform_play_region.unwrap().frame_bounds(16_000),
                 Some((6_000, 14_000))
             );
             assert!(!view.bpm_snap_enabled);
+            assert_eq!(view.waveform_play_grid, Some(captured));
+            view.beat_guides_enabled = true;
+            assert_eq!(view.painted_tempo_label().as_deref(), Some("240 BPM"));
         });
         cx.simulate_mouse_down(at(0.125), left, plain);
         cx.simulate_mouse_move(at(0.25), left, plain);
         cx.simulate_mouse_up(at(0.25), left, plain);
         let free = WaveformPlayRegion::new(0.125, 0.25);
-        browser.read_with(cx, |view, _| assert_eq!(view.waveform_play_region, free));
+        browser.read_with(cx, |view, _| {
+            assert_eq!(view.waveform_play_region, free);
+            assert!(view.waveform_play_grid.is_none());
+        });
 
         browser.update(cx, |view, cx| view.toggle_bpm_snap(cx));
         cx.simulate_mouse_down(at(0.75), left, plain);
