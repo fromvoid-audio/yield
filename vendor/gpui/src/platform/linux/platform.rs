@@ -68,6 +68,10 @@ pub trait LinuxClient {
     fn reveal_path(&self, path: PathBuf);
     fn write_to_primary(&self, item: ClipboardItem);
     fn write_to_clipboard(&self, item: ClipboardItem);
+    #[cfg(target_os = "linux")]
+    fn write_files_to_clipboard(&self, _paths: &[PathBuf]) -> Result<()> {
+        Err(anyhow!("File copy is unavailable on this Linux desktop backend"))
+    }
     fn read_from_primary(&self) -> Option<ClipboardItem>;
     fn read_from_clipboard(&self) -> Option<ClipboardItem>;
     fn active_window(&self) -> Option<AnyWindowHandle>;
@@ -579,6 +583,11 @@ impl<P: LinuxClient + 'static> Platform for P {
 
     fn write_to_clipboard(&self, item: ClipboardItem) {
         self.write_to_clipboard(item)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn write_files_to_clipboard(&self, paths: &[PathBuf]) -> Result<()> {
+        LinuxClient::write_files_to_clipboard(self, paths)
     }
 
     fn read_from_primary(&self) -> Option<ClipboardItem> {

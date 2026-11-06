@@ -1566,6 +1566,15 @@ impl LinuxClient for X11Client {
         state.clipboard_item.replace(item);
     }
 
+    #[cfg(target_os = "linux")]
+    fn write_files_to_clipboard(&self, paths: &[PathBuf]) -> anyhow::Result<()> {
+        let payload = super::super::file_clipboard::FileClipboardPayload::from_paths(paths)?;
+        let mut state = self.0.borrow_mut();
+        state.clipboard.set_file_list(payload)?;
+        state.clipboard_item.take();
+        Ok(())
+    }
+
     fn read_from_primary(&self) -> Option<crate::ClipboardItem> {
         let state = self.0.borrow_mut();
         state

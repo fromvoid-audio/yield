@@ -6,7 +6,7 @@ use yield_library::sample_sources::is_rejected_source_file_path;
 
 #[cfg(target_os = "macos")]
 mod macos;
-#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 mod unsupported;
 #[cfg(target_os = "windows")]
 mod windows;
@@ -31,6 +31,7 @@ impl PreparedFilePaths {
         &self.paths
     }
 
+    #[cfg(not(target_os = "linux"))]
     fn is_empty(&self) -> bool {
         self.paths.is_empty()
     }
@@ -44,10 +45,10 @@ pub(crate) enum FileClipboardError {
     /// The supplied paths contained no eligible existing regular absolute files.
     NoExistingFiles,
     /// The current platform has no native file clipboard implementation.
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
     UnsupportedPlatform,
     /// The native clipboard rejected the handoff.
-    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     Platform(String),
 }
 
@@ -58,11 +59,11 @@ impl Display for FileClipboardError {
             Self::NoExistingFiles => {
                 formatter.write_str("No selected files are available for clipboard handoff")
             }
-            #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+            #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
             Self::UnsupportedPlatform => {
                 formatter.write_str("Native file clipboard handoff is unsupported on this platform")
             }
-            #[cfg(any(target_os = "macos", target_os = "windows"))]
+            #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
             Self::Platform(message) => formatter.write_str(message),
         }
     }
@@ -100,6 +101,7 @@ pub(crate) fn prepare_file_paths(
 /// value returned by [`prepare_file_paths`] and invoke it from the GPUI UI
 /// thread so AppKit or Windows clipboard APIs run in the foreground window's
 /// thread.
+#[cfg(not(target_os = "linux"))]
 pub(crate) fn copy_file_paths(paths: &PreparedFilePaths) -> Result<(), FileClipboardError> {
     if paths.is_empty() {
         return Err(FileClipboardError::NoPathsProvided);
@@ -128,7 +130,7 @@ pub(crate) fn copy_text(text: &str) -> Result<(), String> {
 
 #[cfg(target_os = "macos")]
 use macos as platform;
-#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 use unsupported as platform;
 #[cfg(target_os = "windows")]
 use windows as platform;
@@ -181,6 +183,7 @@ mod tests {
         assert_eq!(prepared.as_slice(), &[second, first]);
     }
 
+    #[cfg(not(target_os = "linux"))]
     #[test]
     fn copy_rejects_an_empty_prepared_value_before_platform_access() {
         let empty = super::PreparedFilePaths::new(Vec::new());

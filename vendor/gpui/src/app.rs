@@ -1042,6 +1042,12 @@ impl App {
         self.platform.write_to_clipboard(item)
     }
 
+    /// Offers absolute file paths for copying through the Linux desktop clipboard.
+    #[cfg(target_os = "linux")]
+    pub fn write_files_to_clipboard(&self, paths: &[PathBuf]) -> Result<()> {
+        self.platform.write_files_to_clipboard(paths)
+    }
+
     /// Reads data from the primary selection buffer.
     /// Only available on Linux.
     #[cfg(any(target_os = "linux", target_os = "freebsd"))]
