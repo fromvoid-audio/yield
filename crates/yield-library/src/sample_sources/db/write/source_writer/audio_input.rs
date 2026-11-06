@@ -99,14 +99,15 @@ impl SourceWriter {
     ) -> Result<SourceFeatureInput, SourceWriterError> {
         let relative = RootRelativePath::try_from_path(path.into())
             .map_err(|_| SourceWriterError::InvalidRequest("invalid audio input path"))?;
-        let (size, modified, identity, content): (i64, i64, String, String) = self
+        let (size, modified, identity, content): (i64, i64, String, Option<String>) = self
             .database
             .connection
             .query_row(
                 "SELECT file_size, modified_ns, file_identity, content_hash FROM wav_files
                  WHERE path = ?1 AND missing = 0
                  AND (?2 IS NULL OR file_identity = ?2) AND (?3 IS NULL OR content_hash = ?3)
-                 AND length(file_identity) <= 512 AND length(content_hash) = 64",
+                 AND length(file_identity) <= 512
+                 AND (content_hash IS NULL OR length(content_hash) = 64)",
                 params![path, identity, content],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
@@ -116,6 +117,7 @@ impl SourceWriter {
         if size > byte_limit {
             return Err(InputError::ByteLimit.into());
         }
+        let content = content.ok_or(InputError::ContentPending)?;
         let permit = InputPermit::acquire()?;
         let fence = self.database.source_publication_fence()?;
         let root = self

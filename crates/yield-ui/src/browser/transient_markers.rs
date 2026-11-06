@@ -297,6 +297,7 @@ pub(super) fn apply_catalog_event(
                 tracing::debug!(
                     request_id = request.request_id(),
                     cache = ?outcome.cache,
+                    detector_version = outcome.detector_version,
                     marker_count = markers.frames().len(),
                     elapsed_ms = outcome.elapsed.as_millis() as u64,
                     "Transient analysis ready"

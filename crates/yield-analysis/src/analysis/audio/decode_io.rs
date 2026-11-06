@@ -297,7 +297,8 @@ pub(crate) fn decode_feature_wav_bytes(
     bytes: &[u8],
     cancel: &std::sync::atomic::AtomicBool,
 ) -> Result<AnalysisAudio, String> {
-    let pcm = super::wav_pcm::decode_pcm(bytes, Some(8), cancel)?;
+    let pcm =
+        super::wav_pcm::decode_pcm(bytes, Some(8), cancel).map_err(|error| error.message())?;
     let mut mono = Vec::new();
     downmix_to_mono_into(&mut mono, pcm.samples(), pcm.channels());
     let mut resampled = Vec::new();
