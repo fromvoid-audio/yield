@@ -292,6 +292,98 @@ mod fixtures {
             replacement.validate_pending_content_digest(&proof),
             Err(SourceWriterError::StaleFence)
         ));
+        assert!(matches!(
+            replacement.commit_pending_content_digest(proof, &AtomicBool::new(false)),
+            Err(SourceWriterError::StaleFence)
+        ));
+    }
+
+    #[test]
+    fn pending_source_digest_commit_preserves_the_authoritative_audit_on_reopen() {
+        use yield_library::sample_sources::db::SourceDirectoryTruthState;
+        use yield_library::sample_sources::readiness::{
+            FEATURE_INPUT_MAX_BYTES, SourceFeatureInputError,
+        };
+        let frames = (FEATURE_INPUT_MAX_BYTES / 2) as u32 + 1024;
+        let (fixture, service, source, _) = setup_attacks(frames, [32_767, 3_500_073]);
+        service.shutdown();
+        let open = || {
+            SourceDatabase::open_for_catalog_with_profile_guard(
+                fixture.root.path(),
+                &fixture.guard,
+                catalog_profile_child(&source),
+            )
+            .unwrap()
+        };
+        let writer = SourceWriter::new(open(), source.clone(), 2).unwrap();
+        let revision = writer.current_revision().unwrap();
+        let original_generation = writer
+            .catalog_database()
+            .source_directory_truth_state()
+            .unwrap()
+            .active_generation()
+            .unwrap();
+        let original_metadata = writer
+            .catalog_database()
+            .browser_metadata_snapshot()
+            .unwrap();
+        let path = RootRelativePath::try_from_path("attacks.wav".into()).unwrap();
+        let proof = || {
+            writer
+                .prepare_pending_content_digest(&revision, &path)
+                .unwrap()
+                .compute(&AtomicBool::new(false))
+                .unwrap()
+        };
+        assert!(matches!(
+            writer.commit_pending_content_digest(proof(), &AtomicBool::new(true)),
+            Err(SourceWriterError::FeatureInput(
+                SourceFeatureInputError::Cancelled
+            ))
+        ));
+        assert_eq!(writer.current_revision().unwrap(), revision);
+        let stale = proof();
+        let (committed, entry) = writer
+            .commit_pending_content_digest(proof(), &AtomicBool::new(false))
+            .unwrap();
+        assert_eq!(committed.revision(), revision.revision() + 1);
+        assert_eq!(writer.current_revision().unwrap(), committed);
+        assert!(matches!(
+            writer.commit_pending_content_digest(stale, &AtomicBool::new(false)),
+            Err(SourceWriterError::StaleRevision { .. })
+        ));
+        drop(writer);
+
+        let reopened = SourceWriter::new(open(), source.clone(), 3).unwrap();
+        let current = reopened.current_revision().unwrap();
+        assert_eq!(current.revision(), committed.revision());
+        assert_eq!(
+            reopened
+                .catalog_database()
+                .source_directory_truth_state()
+                .unwrap(),
+            SourceDirectoryTruthState::Active {
+                generation: original_generation,
+                published_source_revision: current.revision(),
+            },
+        );
+        assert_eq!(
+            reopened
+                .catalog_database()
+                .browser_metadata_snapshot()
+                .unwrap()
+                .files,
+            original_metadata.files,
+        );
+        let (actual_revision, entries) = reopened
+            .catalog_database()
+            .manifest_snapshot_with_revision_for_exact_paths(std::slice::from_ref(&path))
+            .unwrap();
+        assert_eq!(actual_revision, current.revision());
+        assert_eq!(entries, [entry]);
+        reopened
+            .prepare_transient_stream_input(&current, &path)
+            .unwrap();
     }
 
     #[test]
