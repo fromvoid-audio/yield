@@ -155,7 +155,12 @@ impl Browser {
                     return;
                 };
                 cx.reveal_path(path);
-                self.set_playback_status(format!("Revealed {}", path.display()));
+                let status = if cfg!(target_os = "linux") {
+                    "Reveal requested:"
+                } else {
+                    "Revealed"
+                };
+                self.set_playback_status(format!("{status} {}", path.display()));
             }
         }
     }
