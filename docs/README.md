@@ -21,6 +21,8 @@ Machine-consumed check allowlists do not live here anymore. They now live under
     test suite map
 - `docs/GPUI_BROWSER_PERFORMANCE.md`
   - reproducible 20k browser projection CPU workload and host-scoped regression baseline
+- [Reson audition resampling](RESON_RESAMPLING.md)
+  - rate-conversion quality and realtime contracts with the reproducible linear baseline
 - `docs/TARGET.md`
   - product target, architecture ownership, runtime contracts, recovery rules,
     automation surfaces, data formats, UI/performance direction, and the
