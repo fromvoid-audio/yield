@@ -1,23 +1,77 @@
 //! Time-stretch helpers for BPM-synced playback.
 
-use std::f64::consts::PI;
+use std::fmt;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Instant;
 
 const MIN_STRETCH_RATIO: f64 = 0.5;
 const MAX_STRETCH_RATIO: f64 = 2.0;
+const UNITY_TOLERANCE: f64 = 1e-3;
 const SILENCE_ENERGY: f32 = 1e-6;
 const SIMILARITY_THRESHOLD: f32 = 0.2;
 
-/// WSOLA time-stretcher tuned for rhythmic material.
-/// Lightweight WSOLA-style time-stretch helper for interleaved audio samples.
+/// Maximum interleaved PCM samples admitted by tempo audition.
+pub const MAX_TEMPO_INPUT_SAMPLES: usize = 1_048_576;
+
+/// Maximum source duration in seconds admitted by tempo audition.
+pub const MAX_TEMPO_SPAN_SECONDS: u32 = 8;
+
+/// Result of preparing a bounded tempo audition span.
+#[derive(Debug)]
+pub struct PreparedTempoStretch {
+    /// Interleaved PCM at the original sample rate and channel layout.
+    pub samples: Vec<f32>,
+    /// Exact number of source frames.
+    pub source_frames: usize,
+    /// Exact number of prepared playback frames.
+    pub output_frames: usize,
+}
+
+/// Why a bounded audition span could not be stretched.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StretchPreparationError {
+    /// PCM is empty, non-finite, or has invalid frame layout.
+    InvalidPcm,
+    /// The input exceeds the duration or sample budget.
+    InputTooLarge,
+    /// The target/source tempo ratio is outside the supported range.
+    UnsupportedRatio,
+    /// The tempo is effectively unchanged.
+    UnityRatio,
+    /// The input is too short for a full overlap.
+    InputTooShort,
+    /// The owner canceled preparation.
+    Canceled,
+    /// The worker exceeded its deadline.
+    DeadlineExceeded,
+}
+
+impl fmt::Display for StretchPreparationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::InvalidPcm => "invalid tempo audition PCM",
+            Self::InputTooLarge => "tempo audition exceeds the input budget",
+            Self::UnsupportedRatio => "unsupported tempo audition ratio",
+            Self::UnityRatio => "tempo audition already matches the target",
+            Self::InputTooShort => "tempo audition span is too short",
+            Self::Canceled => "tempo audition preparation canceled",
+            Self::DeadlineExceeded => "tempo audition preparation timed out",
+        })
+    }
+}
+
+impl std::error::Error for StretchPreparationError {}
+
+/// WSOLA time-stretcher for interleaved audition PCM.
 pub struct Wsola {
+    sample_rate: u32,
     window_size: usize,
-    hop_s: usize,
+    hop: usize,
     search_radius: usize,
-    window: Vec<f32>,
+    fade_in: Vec<f32>,
 }
 
 impl Wsola {
-    /// Build a WSOLA helper for a given sample rate.
     /// Build a WSOLA helper for a given sample rate.
     pub fn new(sample_rate: u32) -> Self {
         let mut window_size = ((sample_rate.max(1) as f32) * 0.025).round() as usize;
@@ -25,179 +79,336 @@ impl Wsola {
         if !window_size.is_multiple_of(2) {
             window_size += 1;
         }
-        let hop_s = window_size / 2;
-        let search_radius = hop_s / 2;
-        let window = hann_window(window_size);
+        let hop = window_size / 2;
+        let fade_in = (0..hop)
+            .map(|frame| {
+                let phase = std::f64::consts::PI * frame as f64 / (hop - 1) as f64;
+                (0.5 - 0.5 * phase.cos()) as f32
+            })
+            .collect();
         Self {
+            sample_rate,
             window_size,
-            hop_s,
-            search_radius,
-            window,
+            hop,
+            search_radius: hop / 2,
+            fade_in,
         }
     }
 
-    /// Stretch interleaved samples using WSOLA, preserving pitch.
-    /// Stretch interleaved samples by `ratio` while preserving channel layout.
+    /// Stretch interleaved audio. Unchanged or too-short input returns a copy of the original.
     pub fn stretch(&self, input: &[f32], channels: usize, ratio: f64) -> Vec<f32> {
         let channels = channels.max(1);
-        if input.is_empty() || self.hop_s == 0 {
+        if !ratio.is_finite()
+            || (ratio - 1.0).abs() < UNITY_TOLERANCE
+            || input.len() / channels < self.window_size * 2
+        {
             return input.to_vec();
         }
-        let ratio = ratio.clamp(MIN_STRETCH_RATIO, MAX_STRETCH_RATIO);
-        if (ratio - 1.0).abs() < 1e-3 {
-            return input.to_vec();
-        }
-        let input_frames = input.len() / channels;
-        if input_frames < self.window_size * 2 {
-            return input.to_vec();
-        }
-        let output_frames = ((input_frames as f64) / ratio).round().max(1.0) as usize;
-        let mut output = vec![0.0; output_frames * channels];
-        let mono_input = mono_from_interleaved(input, channels);
-        let mut mono_output = vec![0.0; output_frames];
+        self.stretch_inner(
+            input,
+            channels,
+            ratio.clamp(MIN_STRETCH_RATIO, MAX_STRETCH_RATIO),
+            || Ok(()),
+        )
+        .unwrap_or_else(|_| input.to_vec())
+    }
 
-        let initial_frames = self.window_size.min(output_frames);
-        for i in 0..initial_frames {
-            let window = self.window[i];
-            for ch in 0..channels {
-                output[i * channels + ch] = input[i * channels + ch] * window;
-            }
-            mono_output[i] = mono_input[i] * window;
-        }
-
-        let mut analysis_pos = self.hop_s as f64 * ratio;
-        let mut synthesis_pos = self.hop_s;
-        let max_analysis_start = input_frames.saturating_sub(self.window_size);
-
-        while synthesis_pos + self.window_size <= output_frames && max_analysis_start > 0 {
-            let expected = analysis_pos.round() as isize;
-            let expected_clamped = expected.clamp(0, max_analysis_start as isize) as usize;
-            let search_start = expected.saturating_sub(self.search_radius as isize).max(0) as usize;
-            let search_end = (expected + self.search_radius as isize)
-                .min(max_analysis_start as isize)
-                .max(0) as usize;
-
-            let prev_start = synthesis_pos.saturating_sub(self.hop_s);
-            let prev_tail = &mono_output[prev_start..synthesis_pos];
-            let prev_energy = prev_tail.iter().map(|v| v * v).sum::<f32>();
-
-            let mut best_pos = expected_clamped;
-            let mut best_score = f32::NEG_INFINITY;
-            if prev_energy > SILENCE_ENERGY {
-                for candidate in search_start..=search_end {
-                    let mut sum_xy = 0.0f32;
-                    let mut sum_y2 = 0.0f32;
-                    for i in 0..self.hop_s {
-                        let prev = prev_tail[i];
-                        let next = mono_input[candidate + i];
-                        sum_xy += prev * next;
-                        sum_y2 += next * next;
-                    }
-                    if sum_y2 <= SILENCE_ENERGY {
-                        continue;
-                    }
-                    let score = sum_xy / (prev_energy * sum_y2).sqrt();
-                    if score > best_score {
-                        best_score = score;
-                        best_pos = candidate;
-                    }
-                }
-            }
-
-            let chosen = if best_score < SIMILARITY_THRESHOLD {
-                expected_clamped
+    /// Prepare a bounded audition span on a worker. The ratio is target BPM divided by source BPM.
+    ///
+    /// The caller keeps the original PCM available for raw fallback on any preparation error.
+    pub fn prepare_audition(
+        &self,
+        input: &[f32],
+        channels: usize,
+        ratio: f64,
+        cancel: &AtomicBool,
+        deadline: Instant,
+    ) -> Result<PreparedTempoStretch, StretchPreparationError> {
+        let checkpoint = || {
+            if cancel.load(Ordering::Acquire) {
+                Err(StretchPreparationError::Canceled)
+            } else if Instant::now() >= deadline {
+                Err(StretchPreparationError::DeadlineExceeded)
             } else {
-                best_pos
-            };
-
-            for i in 0..self.window_size {
-                let src_frame = chosen + i;
-                let dst_frame = synthesis_pos + i;
-                let window = self.window[i];
-                for ch in 0..channels {
-                    output[dst_frame * channels + ch] += input[src_frame * channels + ch] * window;
-                }
-                mono_output[dst_frame] += mono_input[src_frame] * window;
+                Ok(())
             }
-
-            analysis_pos += self.hop_s as f64 * ratio;
-            synthesis_pos += self.hop_s;
+        };
+        checkpoint()?;
+        if channels == 0
+            || self.sample_rate == 0
+            || input.is_empty()
+            || !input.len().is_multiple_of(channels)
+        {
+            return Err(StretchPreparationError::InvalidPcm);
+        }
+        let source_frames = input.len() / channels;
+        if input.len() > MAX_TEMPO_INPUT_SAMPLES
+            || source_frames as u64
+                > u64::from(self.sample_rate) * u64::from(MAX_TEMPO_SPAN_SECONDS)
+        {
+            return Err(StretchPreparationError::InputTooLarge);
+        }
+        if !(MIN_STRETCH_RATIO..=MAX_STRETCH_RATIO).contains(&ratio) {
+            return Err(StretchPreparationError::UnsupportedRatio);
+        }
+        if (ratio - 1.0).abs() < UNITY_TOLERANCE {
+            return Err(StretchPreparationError::UnityRatio);
+        }
+        if source_frames < self.window_size * 2 {
+            return Err(StretchPreparationError::InputTooShort);
+        }
+        if input.iter().any(|sample| !sample.is_finite()) {
+            return Err(StretchPreparationError::InvalidPcm);
         }
 
-        output
-    }
-}
-
-fn hann_window(size: usize) -> Vec<f32> {
-    if size <= 1 {
-        return vec![1.0; size];
-    }
-    let denom = (size - 1) as f64;
-    (0..size)
-        .map(|i| {
-            let phase = 2.0 * PI * (i as f64) / denom;
-            (0.5 - 0.5 * phase.cos()) as f32
+        let samples = self.stretch_inner(input, channels, ratio, &checkpoint)?;
+        if samples.iter().any(|sample| !sample.is_finite()) {
+            return Err(StretchPreparationError::InvalidPcm);
+        }
+        checkpoint()?;
+        Ok(PreparedTempoStretch {
+            output_frames: samples.len() / channels,
+            source_frames,
+            samples,
         })
-        .collect()
-}
-
-fn mono_from_interleaved(samples: &[f32], channels: usize) -> Vec<f32> {
-    let channels = channels.max(1);
-    let frames = samples.len() / channels;
-    let mut mono = vec![0.0; frames];
-    for (frame, mono_slot) in mono.iter_mut().enumerate() {
-        let mut sum = 0.0f32;
-        let base = frame * channels;
-        for ch in 0..channels {
-            sum += samples[base + ch];
-        }
-        *mono_slot = sum / channels as f32;
     }
-    mono
+
+    fn stretch_inner(
+        &self,
+        input: &[f32],
+        channels: usize,
+        ratio: f64,
+        checkpoint: impl Fn() -> Result<(), StretchPreparationError>,
+    ) -> Result<Vec<f32>, StretchPreparationError> {
+        checkpoint()?;
+        let input_frames = input.len() / channels;
+        let output_frames = (input_frames as f64 / ratio).round() as usize;
+        let output_len = output_frames
+            .checked_mul(channels)
+            .ok_or(StretchPreparationError::InputTooLarge)?;
+        let mut output = vec![0.0; output_len];
+        let mut covered = self.window_size.min(output_frames);
+        let initial_len = covered * channels;
+        output[..initial_len].copy_from_slice(&input[..initial_len]);
+
+        let mut synthesis = self.hop;
+        while covered < output_frames {
+            checkpoint()?;
+            let block_frames = self.window_size.min(output_frames - synthesis);
+            let overlap_frames = covered - synthesis;
+            let output_start = synthesis * channels;
+            let overlap_end = covered * channels;
+            let max_source_frame = input_frames - block_frames;
+            let expected = ((synthesis as f64 * ratio).round() as usize).min(max_source_frame);
+            let source_frame = self.best_overlap(
+                input,
+                &output[output_start..overlap_end],
+                channels,
+                expected,
+                max_source_frame,
+                &checkpoint,
+            )?;
+            let source_start = source_frame * channels;
+            for frame in 0..overlap_frames {
+                let fade_in = self.fade_in[frame];
+                let offset = frame * channels;
+                for channel in 0..channels {
+                    let old = &mut output[output_start + offset + channel];
+                    let new = input[source_start + offset + channel];
+                    *old = *old * (1.0 - fade_in) + new * fade_in;
+                }
+            }
+            covered = synthesis + block_frames;
+            let source_overlap_end = source_start + overlap_frames * channels;
+            let source_end = source_start + block_frames * channels;
+            output[overlap_end..covered * channels]
+                .copy_from_slice(&input[source_overlap_end..source_end]);
+            synthesis += self.hop;
+        }
+        Ok(output)
+    }
+
+    fn best_overlap(
+        &self,
+        input: &[f32],
+        reference: &[f32],
+        channels: usize,
+        expected: usize,
+        max_source_frame: usize,
+        checkpoint: &impl Fn() -> Result<(), StretchPreparationError>,
+    ) -> Result<usize, StretchPreparationError> {
+        let reference_energy = reference.iter().map(|sample| sample * sample).sum::<f32>();
+        if reference_energy <= SILENCE_ENERGY {
+            return Ok(expected);
+        }
+        let first = expected.saturating_sub(self.search_radius);
+        let last = (expected + self.search_radius).min(max_source_frame);
+        let mut best = expected;
+        let mut best_score = SIMILARITY_THRESHOLD;
+        for frame in first..=last {
+            if (frame - first).is_multiple_of(32) {
+                checkpoint()?;
+            }
+            let start = frame * channels;
+            let candidate = &input[start..start + reference.len()];
+            let (dot, energy) = reference
+                .iter()
+                .zip(candidate)
+                .fold((0.0, 0.0), |(dot, energy), (left, right)| {
+                    (dot + left * right, energy + right * right)
+                });
+            if energy <= SILENCE_ENERGY {
+                continue;
+            }
+            let score = dot / (reference_energy * energy).sqrt();
+            if score > best_score
+                || (score == best_score && frame.abs_diff(expected) < best.abs_diff(expected))
+            {
+                best_score = score;
+                best = frame;
+            }
+        }
+        Ok(best)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
+    use std::time::Duration;
 
     #[test]
-    fn wsola_keeps_length_near_ratio() {
-        let sample_rate = 48_000;
-        let input_frames = 4_800;
-        let mut input = vec![0.0f32; input_frames];
-        for (idx, sample) in input.iter_mut().enumerate() {
-            *sample = (idx as f32) / input_frames as f32;
-        }
+    fn bounded_stretch_keeps_exact_length_and_fills_partial_tail() {
+        let sample_rate = 12_000;
+        let frames = 2_000;
+        let samples: Vec<_> = (0..frames).flat_map(|_| [0.25, -0.125]).collect();
         let wsola = Wsola::new(sample_rate);
-        let ratio = 2.0;
-        let output = wsola.stretch(&input, 1, ratio);
-        let expected_frames = ((input_frames as f64) / ratio).round() as isize;
-        let actual_frames = output.len() as isize;
-        let tolerance = wsola.window_size as isize;
-        assert!((actual_frames - expected_frames).abs() <= tolerance);
+        for ratio in [0.5, 0.8, 1.5, 2.0] {
+            let prepared = wsola
+                .prepare_audition(
+                    &samples,
+                    2,
+                    ratio,
+                    &AtomicBool::new(false),
+                    Instant::now() + Duration::from_millis(500),
+                )
+                .unwrap();
+            let expected = (frames as f64 / ratio).round() as usize;
+            assert_eq!(prepared.source_frames, frames);
+            assert_eq!(prepared.output_frames, expected);
+            assert_eq!(prepared.samples.len(), expected * 2);
+            for frame in prepared.samples.chunks_exact(2) {
+                assert!((frame[0] - 0.25).abs() < 1e-6);
+                assert!((frame[1] + 0.125).abs() < 1e-6);
+            }
+        }
+    }
+
+    #[test]
+    fn wsola_preserves_tone_pitch_and_antiphase_stereo() {
+        let rate = 12_000;
+        let frequency = 400.0;
+        let input = (0..6_000)
+            .flat_map(|frame| {
+                let phase = std::f32::consts::TAU * frequency * frame as f32 / rate as f32;
+                let left = phase.sin() * 0.5;
+                [left, -left]
+            })
+            .collect::<Vec<_>>();
+        let wsola = Wsola::new(rate);
+        for ratio in [0.75, 1.5] {
+            let output = wsola.stretch(&input, 2, ratio);
+            let frames = output.len() / 2;
+            let interior = &output[600..output.len() - 600];
+            let crossings = interior
+                .chunks_exact(2)
+                .map(|frame| {
+                    assert!((frame[0] + frame[1]).abs() < 1e-6);
+                    frame[0]
+                })
+                .collect::<Vec<_>>()
+                .windows(2)
+                .filter(|pair| pair[0] <= 0.0 && pair[1] > 0.0)
+                .count();
+            let measured = crossings as f32 * rate as f32 / (frames - 600) as f32;
+            assert!((measured - frequency).abs() < 5.0, "{ratio}: {measured}");
+        }
+    }
+
+    #[test]
+    fn bounded_audition_reports_fallback_reasons_without_partial_pcm() {
+        let wsola = Wsola::new(12_000);
+        let samples = vec![0.0; 1_000];
+        let cancel = AtomicBool::new(false);
+        let deadline = Instant::now() + Duration::from_millis(500);
+        for (input, channels, ratio, expected) in [
+            (&samples[..], 1, 1.0, StretchPreparationError::UnityRatio),
+            (
+                &samples[..],
+                1,
+                f64::NAN,
+                StretchPreparationError::UnsupportedRatio,
+            ),
+            (
+                &samples[..],
+                1,
+                2.5,
+                StretchPreparationError::UnsupportedRatio,
+            ),
+            (&samples[..3], 2, 1.5, StretchPreparationError::InvalidPcm),
+            (
+                &samples[..4],
+                2,
+                1.5,
+                StretchPreparationError::InputTooShort,
+            ),
+        ] {
+            assert_eq!(
+                wsola
+                    .prepare_audition(input, channels, ratio, &cancel, deadline)
+                    .unwrap_err(),
+                expected
+            );
+        }
+        assert_eq!(
+            wsola
+                .prepare_audition(&samples, 1, 1.5, &cancel, Instant::now())
+                .unwrap_err(),
+            StretchPreparationError::DeadlineExceeded
+        );
+        cancel.store(true, Ordering::Release);
+        assert_eq!(
+            wsola
+                .prepare_audition(&samples, 1, 1.5, &cancel, deadline)
+                .unwrap_err(),
+            StretchPreparationError::Canceled
+        );
+    }
+
+    #[test]
+    fn synthesis_checks_cancellation_during_overlap_search() {
+        let wsola = Wsola::new(12_000);
+        let checkpoints = Cell::new(0);
+        let result = wsola.stretch_inner(&vec![0.25; 2_000], 1, 0.5, || {
+            let count = checkpoints.get() + 1;
+            checkpoints.set(count);
+            if count == 3 {
+                Err(StretchPreparationError::Canceled)
+            } else {
+                Ok(())
+            }
+        });
+        assert_eq!(result.unwrap_err(), StretchPreparationError::Canceled);
+        assert_eq!(checkpoints.get(), 3);
     }
 
     #[test]
     fn wsola_preserves_silence() {
-        let sample_rate = 44_100;
-        let input = vec![0.0f32; 2_000];
-        let wsola = Wsola::new(sample_rate);
+        let wsola = Wsola::new(44_100);
+        let input = vec![0.0; 4_000];
         let output = wsola.stretch(&input, 1, 1.5);
-        let max = output
-            .iter()
-            .fold(0.0f32, |acc, sample| acc.max(sample.abs()));
-        assert!(max <= 1e-6);
-    }
-
-    #[test]
-    fn mono_from_interleaved_averages_channels() {
-        let samples = [1.0f32, 3.0, 5.0, 7.0];
-        assert_eq!(mono_from_interleaved(&samples, 2), vec![2.0, 6.0]);
-    }
-
-    #[test]
-    fn mono_from_interleaved_treats_zero_channels_as_mono() {
-        let samples = [1.0f32, 2.0, 3.0];
-        assert_eq!(mono_from_interleaved(&samples, 0), samples.to_vec());
+        assert_eq!(output.len(), 2_667);
+        assert!(output.iter().all(|sample| *sample == 0.0));
     }
 }

@@ -74,7 +74,10 @@ pub use player::{
 pub use recording::{AudioRecorder, InputMonitor, RecordingOutcome};
 pub use recording::{RecordingHealth, RecordingLimits, RecordingPrefixState, RecordingSink};
 #[cfg(feature = "native-audio")]
-pub use time_stretch::Wsola;
+pub use time_stretch::{
+    MAX_TEMPO_INPUT_SAMPLES, MAX_TEMPO_SPAN_SECONDS, PreparedTempoStretch, StretchPreparationError,
+    Wsola,
+};
 
 #[cfg(feature = "native-audio")]
 pub(crate) use async_decode::AsyncSource;
