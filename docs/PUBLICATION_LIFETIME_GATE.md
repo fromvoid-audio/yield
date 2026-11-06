@@ -625,21 +625,21 @@ rollback succeeds.
 The actual `OwnerRuntime::checkpoint_and_grant_staging` checks its original
 resource admission gate before issuance. A typed uncertain write invalidates that
 same original gate permanently; a later successful write or activation attempt
-cannot reopen it. Original counted reads refuse admission and shutdown remains
-unclean. Retained durable checkpoint/reservation bytes remain evidence; replay
-cannot construct a fresh private acknowledgement or grant.
+cannot reopen it. The exact operation slot also remains uncertain after the
+issuer drops it. It fences conflicting operation mutations, charge release and
+source retirement in that runtime. Original counted reads refuse admission and
+shutdown remains unclean. Retained durable checkpoint/reservation bytes remain
+evidence; replay cannot construct a fresh private acknowledgement or grant.
 
 Portable tests exercise the original runtime gate, actual SQLite transaction
 faults, real authorization denial of COMMIT and actual postcommit row readback,
 retained rows and replay. The genuine macOS source/file-owner issuer harness adds
-four checkpoint/grant executed-commit and lost-acknowledgement cases. Supported
-macOS SDK compile and native execution are tracked in OPT-2293; Linux and Windows
-compilation do not validate macOS-only bodies.
+four checkpoint/grant executed-commit and lost-acknowledgement cases and check
+that cancellation and unused chunk release leave the durable rows intact.
 
-This does not fence previously issued source-only grants or other mutation and
-release routes. Those require the complete OPT-2215 slot implementation. Unknown
-quarantine does not qualify native publication, issue permission, refund a
-reservation or complete settlement.
+Previously issued source-only grants and the remaining mutation routes still
+require the complete OPT-2215 slot implementation. Native publication,
+permission, refund and settlement require their own evidence.
 
 ## Original issued-grant runtime custody (OPT-2296)
 
