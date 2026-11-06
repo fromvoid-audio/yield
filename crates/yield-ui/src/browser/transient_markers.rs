@@ -1097,6 +1097,94 @@ mod tests {
     }
 
     #[gpui::test]
+    fn bpm_paint_captures_the_authored_tempo_until_release(cx: &mut TestAppContext) {
+        use super::super::{
+            playmark_tempo, source_registry::SourceRegistryGlobal, waveform::WaveformPlayRegion,
+            zero_crossing,
+        };
+        use gpui::{Modifiers, MouseButton, point, px};
+        use yield_session::SourcePlaymarkTempo;
+
+        let (_directory, path, preview) = fixture();
+        let root = path.parent().unwrap();
+        let config = tempfile::tempdir().unwrap();
+        let _base = ConfigBaseGuard::set(config.path().canonicalize().unwrap());
+        let _profile = PersistenceProfileGuard::named("gpui-bpm-paint");
+        let guard = WritableProfileGuard::acquire_current().unwrap();
+        let (service, snapshot) = audited_owner(&guard, root);
+        cx.set_global(SourceRegistryGlobal::for_catalog_fixture(service));
+        let (browser, cx) = install(cx, &path, preview);
+        let tempo = SourcePlaymarkTempo::new(2_000, 10_000, 16_000, 16_000, 2).unwrap();
+        browser.update(cx, |view, cx| {
+            install_source(view, root, &snapshot);
+            assert!(playmark_tempo::save_authored_tempo(view, tempo, cx));
+        });
+        for _ in 0..2 {
+            let delivery = next_tempo_delivery(&mut cx.cx);
+            browser.update(cx, |view, cx| {
+                assert!(view.apply_catalog_delivery(delivery, cx))
+            });
+        }
+        browser.update(cx, |view, cx| view.toggle_bpm_snap(cx));
+        cx.update(|window, _| window.activate_window());
+        cx.refresh().unwrap();
+        let bounds = cx.debug_bounds("waveform").unwrap();
+        let at = |fraction: f32| {
+            point(
+                bounds.left() + bounds.size.width * fraction,
+                bounds.top() + px(2.0),
+            )
+        };
+        let left = MouseButton::Left;
+        let plain = Modifiers::none();
+        cx.simulate_mouse_down(at(0.875), left, plain);
+        browser.update(cx, |view, cx| view.toggle_bpm_snap(cx));
+        cx.simulate_mouse_move(at(0.425), left, plain);
+        browser.read_with(cx, |view, _| {
+            let preview =
+                zero_crossing::preview_drag_region(view, view.waveform_region_drag.unwrap());
+            assert_eq!(
+                preview.and_then(|span| span.frame_bounds(16_000)),
+                Some((6_000, 14_000))
+            );
+            assert_eq!(
+                view.waveform_play_region,
+                WaveformPlayRegion::new(0.125, 0.625)
+            );
+        });
+        cx.simulate_mouse_up(at(0.425), left, plain);
+        browser.read_with(cx, |view, _| {
+            assert_eq!(
+                view.waveform_play_region.unwrap().frame_bounds(16_000),
+                Some((6_000, 14_000))
+            );
+            assert!(!view.bpm_snap_enabled);
+        });
+        cx.simulate_mouse_down(at(0.125), left, plain);
+        cx.simulate_mouse_move(at(0.25), left, plain);
+        cx.simulate_mouse_up(at(0.25), left, plain);
+        let free = WaveformPlayRegion::new(0.125, 0.25);
+        browser.read_with(cx, |view, _| assert_eq!(view.waveform_play_region, free));
+
+        browser.update(cx, |view, cx| view.toggle_bpm_snap(cx));
+        cx.simulate_mouse_down(at(0.75), left, plain);
+        cx.refresh().unwrap();
+        cx.simulate_mouse_move(at(0.5), left, plain);
+        cx.update(|window, app| {
+            window.focus(&browser.read(app).search_input.read(app).focus_handle());
+        });
+        cx.refresh().unwrap();
+        cx.simulate_mouse_up(at(0.5), left, plain);
+        browser.read_with(cx, |view, _| {
+            assert!(view.waveform_region_drag.is_none());
+            assert_eq!(view.waveform_play_region, free);
+        });
+        cx.update(|_, app| {
+            app.update_global::<SourceRegistryGlobal, _>(|global, _| global.shutdown())
+        });
+    }
+
+    #[gpui::test]
     fn quick_audited_recording_advances_the_source_without_reloading_the_waveform(
         cx: &mut TestAppContext,
     ) {
