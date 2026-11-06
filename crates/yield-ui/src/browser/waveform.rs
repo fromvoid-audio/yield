@@ -12,9 +12,9 @@ use gpui::{
     ScrollDelta, ScrollWheelEvent, Window, canvas, div, fill, point, prelude::*, px,
 };
 use yield_core::{
-    PlaymarkBeatGrid, WaveformEditFade, WaveformEditFadeDrag, WaveformEditFadeHandle,
-    WaveformEditRegion, WaveformEditSettings, WaveformRegion, WaveformViewport,
-    snap_resize_ratio_to_whole_bpm,
+    PlaymarkBeatGrid, SnappedPlaymark, WaveformEditFade, WaveformEditFadeDrag,
+    WaveformEditFadeHandle, WaveformEditRegion, WaveformEditSettings, WaveformRegion,
+    WaveformViewport, snap_resize_ratio_to_whole_bpm,
 };
 use yield_design::Theme;
 use yield_session::SourcePlaymarkTempo;
@@ -649,12 +649,11 @@ impl WaveformRegionDrag {
         }
     }
 
-    fn snapped_paint_region(self, grid: PlaymarkBeatGrid) -> Option<WaveformPlayRegion> {
+    pub(super) fn snapped_paint(self) -> Option<SnappedPlaymark> {
+        let grid = self.paint_grid.filter(|_| self.moved)?;
         let total = grid.total_frames() as f64;
         let pointer = (self.current.clamp(0.0, 1.0) * total).round() as usize;
-        let snapped = grid.snap(pointer, self.current < self.anchor)?;
-        let (first, end) = snapped.frames;
-        WaveformPlayRegion::new(first as f64 / total, end as f64 / total)
+        grid.snap(pointer, self.current < self.anchor)
     }
 
     fn tempo_resize_region(self, capture: PlaymarkTempoResize) -> Option<WaveformPlayRegion> {
@@ -721,13 +720,16 @@ impl WaveformRegionDrag {
         match self.mode {
             WaveformRegionDragMode::Create {
                 kind: WaveformSelectionKind::Play,
-            } => match self.paint_grid {
-                Some(grid) => self
-                    .moved
-                    .then(|| self.snapped_paint_region(grid))
-                    .flatten(),
-                None => WaveformPlayRegion::new(self.anchor, self.current),
-            },
+            } => {
+                if self.paint_grid.is_some() {
+                    let snapped = self.snapped_paint()?;
+                    let (first, end) = snapped.frames();
+                    let total = snapped.total_frames() as f64;
+                    WaveformPlayRegion::new(first as f64 / total, end as f64 / total)
+                } else {
+                    WaveformPlayRegion::new(self.anchor, self.current)
+                }
+            }
             WaveformRegionDragMode::MovePlay { baseline } => baseline
                 .moved_by(self.current - self.anchor)
                 .map(WaveformPlayRegion::from_core),
@@ -1926,6 +1928,11 @@ pub(super) fn render_waveform(
         .waveform_region_drag
         .and_then(|drag| drag.tempo_resize);
     let snapped_paint = drag.is_some_and(|drag| drag.moved && drag.paint_grid.is_some());
+    let paint = match drag {
+        Some(drag) if snapped_paint => drag.snapped_paint(),
+        None if browser.beat_guides_enabled => browser.waveform_play_grid,
+        _ => None,
+    };
     let beat_count = tempo_resize.map_or(browser.beat_guide_count, |capture| capture.beat_count);
     let beat_guides = (!snapped_paint && (browser.beat_guides_enabled || tempo_resize.is_some()))
         .then_some((
@@ -1941,20 +1948,30 @@ pub(super) fn render_waveform(
             browser.waveform_viewport,
             color(theme.colors.selection_fill),
             color(theme.colors.waveform_playhead),
-            beat_guides_for_region(
-                beat_guides,
-                active_selection_kind,
-                WaveformSelectionKind::Play,
-            ),
+            if let Some(paint) = paint {
+                Some((
+                    RegionBeatGuides::Snapped(paint),
+                    color(theme.colors.waveform_playhead).opacity(150.0 / 255.0),
+                ))
+            } else {
+                beat_guides_for_region(
+                    beat_guides,
+                    active_selection_kind,
+                    WaveformSelectionKind::Play,
+                )
+                .map(|(count, color)| (RegionBeatGuides::Uniform(count), color))
+            },
         ));
         if let Some(preview) = browser.waveform.as_ref() {
-            let tempo_label = tempo_resize.and_then(|capture| {
-                let (start, end) = region.frame_bounds(capture.total_frames)?;
-                yield_core::playmark_frame_tempo_label(
-                    end - start,
-                    capture.sample_rate,
-                    capture.beat_count,
-                )
+            let tempo_label = paint.map(paint_tempo_label).or_else(|| {
+                tempo_resize.and_then(|capture| {
+                    let (start, end) = region.frame_bounds(capture.total_frames)?;
+                    yield_core::playmark_frame_tempo_label(
+                        end - start,
+                        capture.sample_rate,
+                        capture.beat_count,
+                    )
+                })
             });
             bars = bars.child(playmark_timing::render_overlay(
                 region,
@@ -2186,6 +2203,7 @@ pub(super) fn render_waveform(
                         preview.total_frames,
                         preview.sample_rate,
                         view.beat_guides_enabled.then_some(view.beat_guide_count),
+                        view.painted_tempo_label(),
                     )
                     && layout.rect.contains(&event.position)
                     && view.begin_playmark_timing_edit(window, cx)
@@ -2301,6 +2319,12 @@ pub(super) fn render_waveform(
 }
 
 impl Browser {
+    pub(super) fn painted_tempo_label(&self) -> Option<String> {
+        self.waveform_play_grid
+            .filter(|_| self.beat_guides_enabled)
+            .map(paint_tempo_label)
+    }
+
     pub(super) fn update_waveform_fade_hover(
         &mut self,
         position: Point<Pixels>,
@@ -2368,6 +2392,7 @@ impl Browser {
         self.similar_sections.cancel();
         zero_crossing::cancel_for_interruption(self);
         self.waveform_play_region = None;
+        self.waveform_play_grid = None;
         self.waveform_edit_region = None;
         self.waveform_edit_settings = default_edit_settings();
         self.clear_waveform_fade_hover();
@@ -2378,6 +2403,7 @@ impl Browser {
     }
 
     pub(super) fn set_waveform_play_region(&mut self, region: Option<WaveformPlayRegion>) {
+        self.waveform_play_grid = None;
         if self.waveform_play_region != region {
             self.playmark_tempo.preserve_local_edit();
             self.held_playmark_slide = None;
@@ -2815,6 +2841,7 @@ impl Browser {
             }
             if let Some(region) = region {
                 self.set_waveform_play_region(Some(region));
+                self.waveform_play_grid = drag.snapped_paint();
                 similar_sections::invalidate_if_stale(self);
                 if drag.zero_crossing_applies(bpm_snap) {
                     zero_crossing::commit_or_schedule(self, region, cx);
@@ -3413,12 +3440,35 @@ pub(super) fn waveform_region_navigation_key(
     }
 }
 
+#[derive(Clone, Copy)]
+enum RegionBeatGuides {
+    Uniform(u8),
+    Snapped(SnappedPlaymark),
+}
+
+fn paint_tempo_label(paint: SnappedPlaymark) -> String {
+    format!("{} BPM", paint.bpm())
+}
+
+fn snapped_guide_projection(
+    paint: SnappedPlaymark,
+    viewport: WaveformViewport,
+    limit: usize,
+) -> impl Iterator<Item = f64> {
+    let total = paint.total_frames() as f64;
+    let first = (viewport.start * total).floor() as usize;
+    let last = (viewport.end * total).ceil() as usize;
+    paint
+        .guide_frames((first, last), limit)
+        .filter_map(move |frame| viewport.visible_ratio_from_absolute(frame as f64 / total))
+}
+
 fn waveform_region_overlay(
     region: WaveformPlayRegion,
     viewport: WaveformViewport,
     selection_color: gpui::Hsla,
     edge_color: gpui::Hsla,
-    beat_guides: Option<(u8, gpui::Hsla)>,
+    beat_guides: Option<(RegionBeatGuides, gpui::Hsla)>,
 ) -> impl IntoElement {
     waveform_selection_overlay(
         region.start,
@@ -3468,7 +3518,7 @@ fn waveform_edit_region_overlay(
         EDIT_REGION_RESIZE_HANDLE_HEIGHT,
         EDIT_REGION_MOVE_GRIP_HEIGHT,
         EDIT_REGION_MOVE_GRIP_INSET,
-        beat_guides,
+        beat_guides.map(|(count, color)| (RegionBeatGuides::Uniform(count), color)),
     )
 }
 
@@ -3511,7 +3561,7 @@ fn waveform_selection_overlay(
     resize_handle_height: f32,
     move_grip_height: f32,
     move_grip_inset: f32,
-    beat_guides: Option<(u8, gpui::Hsla)>,
+    beat_guides: Option<(RegionBeatGuides, gpui::Hsla)>,
 ) -> impl IntoElement {
     canvas(
         move |_, _, _| (),
@@ -3536,15 +3586,13 @@ fn waveform_selection_overlay(
                 point(bounds.left() + px(end), bounds.bottom()),
             );
             window.paint_quad(fill(selection_bounds, selection_color));
-            if let Some((beat_count, guide_color)) = beat_guides {
+            if let Some((guides, guide_color)) = beat_guides {
                 let guide_width = BEAT_GUIDE_WIDTH.min(width);
                 let guide_height = (height * BEAT_GUIDE_HEIGHT_FRACTION)
                     .round()
                     .clamp(guide_width.min(height), height);
                 let guide_top = (height - guide_height) * 0.5;
-                for visible_ratio in
-                    beat_guide_projection(start_ratio, end_ratio, viewport, beat_count)
-                {
+                let paint_guide = |visible_ratio: f64| {
                     let center = width * visible_ratio as f32;
                     let left =
                         (center - guide_width * 0.5).clamp(0.0, (width - guide_width).max(0.0));
@@ -3556,6 +3604,16 @@ fn waveform_selection_overlay(
                         ),
                     );
                     window.paint_quad(fill(guide_bounds, guide_color));
+                };
+                match guides {
+                    RegionBeatGuides::Uniform(count) => {
+                        beat_guide_projection(start_ratio, end_ratio, viewport, count)
+                            .for_each(paint_guide);
+                    }
+                    RegionBeatGuides::Snapped(paint) => {
+                        let limit = (((end - start) / 3.0).floor() as usize).clamp(1, 1024);
+                        snapped_guide_projection(paint, viewport, limit).for_each(paint_guide);
+                    }
                 }
             }
             let edge_width = WAVEFORM_SELECTION_EDGE_WIDTH.min(width);
@@ -5011,6 +5069,20 @@ mod tests {
             beat_guide_projection(outside_region.start, outside_region.end, viewport, 4,).count(),
             0
         );
+    }
+
+    #[test]
+    fn snapped_guide_projection_uses_exact_frames_in_a_zoomed_viewport() {
+        let grid = PlaymarkBeatGrid::new(100, 200, 17, 300.0).unwrap();
+        let paint = grid.snap(117, false).unwrap();
+        let viewport = WaveformViewport {
+            start: 106.0 / 200.0,
+            end: 112.0 / 200.0,
+        };
+        let positions: Vec<_> = snapped_guide_projection(paint, viewport, 8).collect();
+        assert_eq!(positions.len(), 2);
+        assert!((positions[0] - 1.0 / 6.0).abs() < 1e-12);
+        assert!((positions[1] - 4.0 / 6.0).abs() < 1e-12);
     }
 
     #[test]
