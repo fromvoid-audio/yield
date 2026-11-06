@@ -107,12 +107,6 @@ current_persistence_profile() {
   printf "%s" "live"
 }
 
-config_base_dir="$(default_config_base_dir)"
-used_sandbox_config_home="false"
-if [[ -z "${YIELD_CONFIG_HOME:-}" ]] && [[ "$config_base_dir" == "$sandbox_config_home" ]]; then
-  used_sandbox_config_home="true"
-fi
-
 extract_app_data_dir_from_config() {
   local config_path="$1"
   [[ -f "$config_path" ]] || return 1
@@ -146,9 +140,19 @@ resolve_app_root_dir() {
   printf "%s" "$default_root"
 }
 
-app_root="$(resolve_app_root_dir)"
-logs_dir="${app_root}/logs"
-config_path="${app_root}/config.toml"
+if [[ "$os_name" == linux ]]; then
+  source "$ROOT_DIR/scripts/internal/run/linux_diagnostics_paths.sh"
+  resolve_linux_diagnostics_paths "$invocation_dir" "$sandbox_config_home" "$USE_SANDBOX"
+else
+  config_base_dir="$(default_config_base_dir)"
+  used_sandbox_config_home="false"
+  if [[ -z "${YIELD_CONFIG_HOME:-}" ]] && [[ "$config_base_dir" == "$sandbox_config_home" ]]; then
+    used_sandbox_config_home="true"
+  fi
+  app_root="$(resolve_app_root_dir)"
+  logs_dir="${app_root}/logs"
+  config_path="${app_root}/config.toml"
+fi
 
 timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
 
