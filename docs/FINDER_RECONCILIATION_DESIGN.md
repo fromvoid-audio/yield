@@ -323,6 +323,41 @@ must be idempotent at the workflow/source-writer boundary and must not advance a
 checkpoint until the corresponding work is committed and projected according to
 the existing contract.
 
+### macOS live registration capability
+
+The pinned live backend, `notify` 6.1.1, synchronously starts its stream once
+for the recursive source root and restarts it to add the nonrecursive parent.
+Its worker sends the run-loop handle only after the Apple registration call
+returns. Both initial registration and retry use this path, and the backend
+joins its worker on retirement. An observed registration RPC stall took
+17.043 seconds for the root and another 13.750 seconds for the parent.
+
+Apple's [stream creation API](https://developer.apple.com/documentation/coreservices/1443980-fseventstreamcreate)
+accepts multiple roots in one stream. The disposable QA probe linked below
+confirms that both configured paths can share one successful start on this
+host. Preserving the intended observation scope would require accepting source
+descendants and root lifecycle evidence while excluding unrelated parent events.
+Apple's [stream start API](https://developer.apple.com/documentation/coreservices/1448000-fseventstreamstart)
+provides a synchronous result without a timeout or cancellation contract.
+One registration call reduces duplicate work and still leaves the caller
+exposed to that call's latency. Current in-process startup and retirement are
+therefore unqualified for a hard deadline.
+
+A follow-on should first qualify an owned process boundary on macOS. The
+catalog can fail closed at its deadline, retain its audit obligation, and
+continue to own the retiring process until exit is confirmed. The process
+boundary must bind each result to the exact source, root identity, and
+generation. Keep one in-flight start per source across retry, rebind, removal,
+and shutdown, with no retry while the previous process is retiring. Verify
+that stale starts cannot publish, late exit does not advance a checkpoint, and
+both observation scopes survive recovery. The existing two-second production
+bootstrap capture and authoritative-audit fallback remain required. Deployment
+of a helper would require its own packaging and lifecycle qualification.
+
+The [disposable native registration probe](../scripts/qa/README.md#macos-live-watcher-start-probe)
+measures successful registration and teardown. Its timings give no guarantee
+about daemon stalls or event delivery.
+
 ## PR sequence with bounded library slices
 
 1. Pure model/normalizer library PR: define the bounded raw envelope,
