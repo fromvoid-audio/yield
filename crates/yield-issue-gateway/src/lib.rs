@@ -4,6 +4,7 @@
 //! after submission has an unknown outcome and requires user reconciliation.
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::fmt;
 use std::io::Read;
 use std::time::Duration;
@@ -13,6 +14,8 @@ use uuid::Uuid;
 const KEYRING_SERVICE: &str = "yield";
 const KEYRING_KEY: &str = "yield_github_issue_token";
 const MAX_RESPONSE_BYTES: u64 = 64 * 1024;
+const APPROVED_ISSUE_OWNER: &str = "PORTALSURFER";
+const APPROVED_ISSUE_REPO: &str = "yield";
 
 /// Opaque gateway session credential. Debug output never reveals it.
 #[derive(Clone)]
@@ -90,19 +93,33 @@ impl TokenStore {
     }
 }
 
-/// A random identifier binding browser OAuth completion to one app request.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct AuthRequestId(String);
+/// The public OAuth request identifier and its app-held polling proof.
+#[derive(Clone, Eq, PartialEq)]
+pub struct AuthRequestId {
+    request_id: String,
+    poll_proof: String,
+}
 
 impl AuthRequestId {
-    /// Create an unpredictable request identifier.
+    /// Generate a polling proof and derive the browser-safe identifier.
     pub fn new() -> Self {
-        Self(Uuid::new_v4().simple().to_string())
+        let poll_proof = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
+        let request_id = format!("{:x}", Sha256::digest(poll_proof.as_bytes()));
+        Self {
+            request_id,
+            poll_proof,
+        }
     }
 
     /// Read the non-secret request identifier.
     pub fn as_str(&self) -> &str {
-        &self.0
+        &self.request_id
+    }
+}
+
+impl fmt::Debug for AuthRequestId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("AuthRequestId([REDACTED])")
     }
 }
 
@@ -224,7 +241,15 @@ impl GatewayClient {
         let mut url = self.endpoint("auth/poll")?;
         url.query_pairs_mut()
             .append_pair("requestId", request_id.as_str());
-        let response = match self.agent.get(url.as_str()).call() {
+        let response = match self
+            .agent
+            .get(url.as_str())
+            .set(
+                "Authorization",
+                &format!("Bearer {}", request_id.poll_proof),
+            )
+            .call()
+        {
             Ok(response) => response,
             Err(ureq::Error::Status(202, _)) => return Ok(None),
             Err(ureq::Error::Status(401 | 403, _)) => return Err(GatewayError::Unauthorized),
@@ -283,8 +308,8 @@ impl GatewayClient {
             || url.fragment().is_some()
             || !matches!(url.path_segments().map(|segments| segments.collect::<Vec<_>>()),
                 Some(segments) if segments.len() == 4
-                    && !segments[0].is_empty()
-                    && !segments[1].is_empty()
+                    && segments[0] == APPROVED_ISSUE_OWNER
+                    && segments[1] == APPROVED_ISSUE_REPO
                     && segments[2] == "issues"
                     && segments[3] == parsed.number.to_string())
         {
@@ -428,6 +453,31 @@ mod tests {
         let url = client.auth_start_url(&first).unwrap();
         assert_eq!(url.path(), "/auth/start");
         assert!(url.as_str().contains(first.as_str()));
+        assert_eq!(
+            first.as_str(),
+            format!("{:x}", Sha256::digest(first.poll_proof.as_bytes()))
+        );
+        assert_eq!(first.poll_proof.len(), 64);
+        assert!(!url.as_str().contains(&first.poll_proof));
+        assert!(!format!("{first:?}").contains(&first.poll_proof));
+    }
+
+    #[test]
+    fn auth_poll_sends_app_proof_only_in_the_header() {
+        let (address, server) = serve_once("200 OK", "{\"ok\":false}");
+        let client = GatewayClient::new(&address).unwrap();
+        let request = AuthRequestId::new();
+        assert!(client.poll(&request).unwrap().is_none());
+        let received = server.join().unwrap();
+        let request_line = received.lines().next().unwrap();
+        assert!(request_line.contains(&format!("/auth/poll?requestId={}", request.as_str())));
+        assert!(!request_line.contains(&request.poll_proof));
+        assert!(received.lines().any(|line| {
+            line.split_once(':').is_some_and(|(name, value)| {
+                name.eq_ignore_ascii_case("authorization")
+                    && value.trim() == format!("Bearer {}", request.poll_proof)
+            })
+        }));
     }
 
     #[test]
@@ -463,7 +513,7 @@ mod tests {
     fn confirmed_issue_response_is_returned_without_reposting() {
         let (address, server) = serve_once(
             "200 OK",
-            "{\"ok\":true,\"issue_url\":\"https://github.com/PORTALSURFER/yield-feedback/issues/7\",\"number\":7}",
+            "{\"ok\":true,\"issue_url\":\"https://github.com/PORTALSURFER/yield/issues/7\",\"number\":7}",
         );
         let client = GatewayClient::new(&address).unwrap();
         let token = SecretToken::new("s".repeat(43)).unwrap();
@@ -473,7 +523,7 @@ mod tests {
         assert_eq!(created.number, 7);
         assert_eq!(
             created.url.as_str(),
-            "https://github.com/PORTALSURFER/yield-feedback/issues/7"
+            "https://github.com/PORTALSURFER/yield/issues/7"
         );
         let request = server.join().expect("one server request");
         assert!(request.starts_with("POST /issue HTTP/1.1"));
@@ -481,16 +531,18 @@ mod tests {
 
     #[test]
     fn unrelated_github_url_is_not_a_confirmed_issue() {
-        let (address, server) = serve_once(
-            "200 OK",
-            "{\"ok\":true,\"issue_url\":\"https://github.com/PORTALSURFER/yield-feedback/issues/7?unexpected=1\",\"number\":7}",
-        );
-        let client = GatewayClient::new(&address).unwrap();
         let token = SecretToken::new("s".repeat(43)).unwrap();
-        assert!(matches!(
-            client.create_issue(&token, "Bug: sample", "Details"),
-            Err(GatewayError::UnknownOutcome)
-        ));
-        server.join().expect("one server request");
+        for response in [
+            "{\"ok\":true,\"issue_url\":\"https://github.com/PORTALSURFER/yield-feedback/issues/7\",\"number\":7}",
+            "{\"ok\":true,\"issue_url\":\"https://github.com/PORTALSURFER/yield/issues/7?unexpected=1\",\"number\":7}",
+        ] {
+            let (address, server) = serve_once("200 OK", response);
+            let client = GatewayClient::new(&address).unwrap();
+            assert!(matches!(
+                client.create_issue(&token, "Bug: sample", "Details"),
+                Err(GatewayError::UnknownOutcome)
+            ));
+            server.join().expect("one server request");
+        }
     }
 }

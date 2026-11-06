@@ -1,12 +1,15 @@
 import { describe, expect, it } from 'vitest';
+import { createHash } from 'node:crypto';
 import { createWorker, type GatewayEnv, type RateLimiter, type SessionStore } from '../src/index';
 
 class MemoryStore implements SessionStore {
   values = new Map<string, string>();
   expirations = new Map<string, number>();
   now = 0;
+  reads: string[] = [];
   advance(seconds: number) { this.now += seconds; }
   async get(key: string) {
+    this.reads.push(key);
     if ((this.expirations.get(key) ?? Infinity) <= this.now) {
       await this.delete(key);
       return null;
@@ -53,8 +56,13 @@ function fixture(fetcher: typeof fetch = async () => { throw new Error('unexpect
   return { sessions, env, call, edgeLimit, issueLimit };
 }
 
-const requestId = 'a'.repeat(43);
+const pollProof = 'a'.repeat(64);
+const requestId = createHash('sha256').update(pollProof).digest('hex');
 const sessionId = 'b'.repeat(43);
+
+function pollRequest(call: ReturnType<typeof fixture>['call'], proof = pollProof) {
+  return call(`/auth/poll?requestId=${requestId}`, { headers: { authorization: `Bearer ${proof}` } });
+}
 
 async function connect(call: ReturnType<typeof fixture>['call'], sessions: MemoryStore) {
   const start = await call(`/auth/start?requestId=${requestId}`);
@@ -167,11 +175,16 @@ describe('Yield issue gateway', () => {
     expect(page).not.toContain('sess:');
     expect((await call(`/auth/callback?code=one-use-code&state=${state}`)).status).toBe(400);
     expect(exchanges).toBe(1);
-    const poll = await call(`/auth/poll?requestId=${requestId}`);
+    const readCount = sessions.reads.length;
+    expect((await call(`/auth/poll?requestId=${requestId}`)).status).toBe(401);
+    expect((await pollRequest(call, 'c'.repeat(64))).status).toBe(401);
+    expect(sessions.reads.length).toBe(readCount);
+    expect(sessions.values.has(`poll:${requestId}`)).toBe(true);
+    const poll = await pollRequest(call);
     const result = await poll.json() as { ok: boolean; sessionId: string };
     expect(result.ok).toBe(true);
     expect(result.sessionId).toMatch(/^[A-Za-z0-9_-]{32,128}$/);
-    expect((await call(`/auth/poll?requestId=${requestId}`)).status).toBe(202);
+    expect((await pollRequest(call)).status).toBe(202);
   });
 
   it('reports auth exchange failure without reflecting secrets', async () => {
@@ -180,7 +193,7 @@ describe('Yield issue gateway', () => {
     const response = await call(`/auth/callback?code=bad&state=${state}`);
     expect(response.status).toBe(502);
     expect(await response.text()).not.toContain('private-secret-never-show');
-    expect((await call(`/auth/poll?requestId=${requestId}`)).status).toBe(202);
+    expect((await pollRequest(call)).status).toBe(202);
   });
 
   it('reports OAuth denial to the poller and consumes the state once', async () => {
@@ -193,10 +206,10 @@ describe('Yield issue gateway', () => {
     const callback = await call(`/auth/callback?error=access_denied&state=${state}`);
     expect(callback.status).toBe(200);
     expect(await callback.text()).toContain('canceled');
-    const poll = await call(`/auth/poll?requestId=${requestId}`);
+    const poll = await pollRequest(call);
     expect(poll.status).toBe(403);
     expect(await poll.json()).toEqual({ error: 'GitHub connection canceled' });
-    expect((await call(`/auth/poll?requestId=${requestId}`)).status).toBe(202);
+    expect((await pollRequest(call)).status).toBe(202);
     expect((await call(`/auth/callback?error=access_denied&state=${state}`)).status).toBe(400);
     expect(exchanges).toBe(0);
   });
@@ -214,7 +227,7 @@ describe('Yield issue gateway', () => {
     expect((await call(`/auth/callback?code=valid&state=${state}`)).status).toBe(200);
     const sessionId = sessions.values.get(`poll:${requestId}`)!;
     sessions.advance(301);
-    expect((await call(`/auth/poll?requestId=${requestId}`)).status).toBe(202);
+    expect((await pollRequest(call)).status).toBe(202);
     expect((await call('/issue', {
       method: 'POST',
       headers: { authorization: `Bearer ${sessionId}` },
