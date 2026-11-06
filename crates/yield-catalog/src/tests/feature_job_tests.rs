@@ -3,11 +3,12 @@ mod fixtures {
     use super::super::*;
     use crate::{FeatureJobFailure, FeatureJobOutcome, prepare_feature_job};
     use crate::{TransientJobError, prepare_transient_job};
+    use std::io::{self, Seek, SeekFrom, Write};
     use yield_analysis::transients::TransientPreset;
     use yield_library::sample_sources::db::transient_cache::CachedTransientMarkers;
     use yield_library::sample_sources::readiness::{
-        FeatureArtifactPublication, ReadinessClassification, ReadinessDeficit, ReadinessTarget,
-        SourceFeatureInputError,
+        FEATURE_INPUT_MAX_BYTES, FeatureArtifactPublication, ReadinessClassification,
+        ReadinessDeficit, ReadinessTarget, SourceAudioStreamError, SourceFeatureInputError,
     };
     use yield_library::sample_sources::{SourceDatabaseConnectionRole, SourceWriter};
 
@@ -25,23 +26,32 @@ mod fixtures {
         relative: &Path,
         sample: impl Fn(usize) -> i16,
     ) -> (Fixture, SourceWriter, ReadinessTarget) {
+        setup_written_file(relative, |file| {
+            let mut wav = hound::WavWriter::create(
+                file,
+                hound::WavSpec {
+                    channels: 1,
+                    sample_rate: 16_000,
+                    bits_per_sample: 16,
+                    sample_format: hound::SampleFormat::Int,
+                },
+            )
+            .unwrap();
+            for frame in 0..16_000 {
+                wav.write_sample(sample(frame)).unwrap();
+            }
+            wav.finalize().unwrap();
+        })
+    }
+
+    fn setup_written_file(
+        relative: &Path,
+        write: impl FnOnce(&Path),
+    ) -> (Fixture, SourceWriter, ReadinessTarget) {
         let fixture = Fixture::new("feature-job-tests");
         let file = fixture.root.path().join(relative);
         fs::create_dir_all(file.parent().unwrap()).unwrap();
-        let mut wav = hound::WavWriter::create(
-            &file,
-            hound::WavSpec {
-                channels: 1,
-                sample_rate: 16_000,
-                bits_per_sample: 16,
-                sample_format: hound::SampleFormat::Int,
-            },
-        )
-        .unwrap();
-        for frame in 0..16_000 {
-            wav.write_sample(sample(frame)).unwrap();
-        }
-        wav.finalize().unwrap();
+        write(&file);
         let bytes = fs::read(&file).unwrap();
         let content = blake3::hash(&bytes).to_hex().to_string();
         let meta = file.metadata().unwrap();
@@ -119,6 +129,96 @@ mod fixtures {
                 r.get(0)
             })
             .unwrap()
+    }
+
+    #[test]
+    fn held_audio_stream_reads_past_the_whole_file_allocation_limit() {
+        let data_bytes = FEATURE_INPUT_MAX_BYTES as u32 + 2;
+        let relative = Path::new("long.wav");
+        let (_fixture, writer, _) = setup_written_file(relative, |path| {
+            let mut file = fs::File::create(path).unwrap();
+            file.write_all(b"RIFF").unwrap();
+            file.write_all(&(data_bytes + 36).to_le_bytes()).unwrap();
+            file.write_all(b"WAVEfmt \x10\0\0\0\x01\0\x01\0\x80\x3e\0\0\0\x7d\0\0\x02\0\x10\0data")
+                .unwrap();
+            file.write_all(&data_bytes.to_le_bytes()).unwrap();
+            file.set_len(u64::from(data_bytes) + 44).unwrap();
+        });
+        let path = RootRelativePath::try_from_path(relative.into()).unwrap();
+        let revision = writer.current_revision().unwrap();
+        assert!(matches!(
+            writer.prepare_audio_input(&revision, &path),
+            Err(SourceWriterError::FeatureInput(
+                SourceFeatureInputError::ByteLimit
+            ))
+        ));
+        let held = writer
+            .prepare_transient_stream_input(&revision, &path)
+            .unwrap();
+        let cancel = AtomicBool::new(false);
+        assert_eq!(
+            held.read_verified_bytes(&cancel),
+            Err(SourceFeatureInputError::ByteLimit)
+        );
+        let count = held
+            .with_verified_audio_reader(&cancel, |reader| {
+                let mut header = [0; 12];
+                reader.read_exact(&mut header)?;
+                assert_eq!(&header[..4], b"RIFF");
+                assert_eq!(&header[8..], b"WAVE");
+                io::copy(reader, &mut io::sink()).map(|rest| rest + header.len() as u64)
+            })
+            .unwrap();
+        assert_eq!(count, u64::from(data_bytes) + 44);
+        writer.validate_audio_input(&held).unwrap();
+    }
+
+    #[test]
+    fn held_audio_stream_checks_unread_trailing_bytes_and_cancellation() {
+        let (fixture, writer, _) = setup();
+        let path = RootRelativePath::try_from_path("tone.wav".into()).unwrap();
+        let revision = writer.current_revision().unwrap();
+        let held = writer
+            .prepare_transient_stream_input(&revision, &path)
+            .unwrap();
+        let cancel = AtomicBool::new(false);
+        let read_header = |reader: &mut dyn io::Read| {
+            let mut header = [0; 12];
+            reader.read_exact(&mut header)?;
+            Ok::<_, io::Error>(header)
+        };
+        assert_eq!(
+            &held
+                .with_verified_audio_reader(&cancel, read_header)
+                .unwrap()[..4],
+            b"RIFF"
+        );
+        assert!(matches!(
+            held.with_verified_audio_reader(&cancel, |reader| {
+                let header = read_header(reader)?;
+                cancel.store(true, Ordering::Release);
+                Ok::<_, io::Error>(header)
+            }),
+            Err(SourceAudioStreamError::Input(
+                SourceFeatureInputError::Cancelled
+            ))
+        ));
+        let file_path = fixture.root.path().join(path.as_path());
+        let original = fs::read(&file_path).unwrap();
+        let modified = file_path.metadata().unwrap().modified().unwrap();
+        let mut file = fs::OpenOptions::new().write(true).open(file_path).unwrap();
+        file.seek(SeekFrom::End(-1)).unwrap();
+        file.write_all(&[original[original.len() - 1] ^ 1]).unwrap();
+        file.set_times(fs::FileTimes::new().set_modified(modified))
+            .unwrap();
+        drop(file);
+        held.validate().unwrap();
+        assert!(matches!(
+            held.with_verified_audio_reader(&AtomicBool::new(false), read_header),
+            Err(SourceAudioStreamError::Input(
+                SourceFeatureInputError::ContentChanged
+            ))
+        ));
     }
 
     #[test]
