@@ -12,7 +12,7 @@ REPLAY_FIXTURE_RECORD="$(python3 scripts/internal/ci/prepare_native_metadata_fix
   --checkout "$REPLAY_REPO_ROOT" --state-dir "$REPLAY_COMMON_DIR/local-ci")"
 REPLAY_FIXTURE_ROOT="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["source_root"])' <<<"$REPLAY_FIXTURE_RECORD")"
 export YIELD_NATIVE_METADATA_FIXTURE_ROOT="$REPLAY_FIXTURE_ROOT"
-REPLAY_EVIDENCE_DIR="$REPLAY_REPO_ROOT/artifacts/macos-catalog-native-replay"
+REPLAY_EVIDENCE_DIR="${YIELD_NATIVE_VERIFICATION_OUTPUT:-$REPLAY_REPO_ROOT/artifacts/macos-catalog-native-replay}"
 mkdir -p "$REPLAY_EVIDENCE_DIR"
 printf '%s\n' "$REPLAY_FIXTURE_RECORD" > "$REPLAY_EVIDENCE_DIR/metadata-fixture.json"
 {

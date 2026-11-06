@@ -15,7 +15,7 @@ case "$NATIVE_OS:$HOST" in
   MINGW*:x86_64-pc-windows-msvc|MSYS*:x86_64-pc-windows-msvc) PLATFORM=windows ;;
   *) echo "Requires genuine macOS or Windows/MSVC execution: $NATIVE_OS:$HOST" >&2; exit 1 ;;
 esac
-OUTPUT_DIR="$ROOT_DIR/artifacts/native-prerequisites/$PLATFORM-$CASE"
+OUTPUT_DIR="${YIELD_NATIVE_VERIFICATION_OUTPUT:-$ROOT_DIR/artifacts/native-prerequisites/$PLATFORM-$CASE}"
 mkdir -p "$OUTPUT_DIR"
 {
   git rev-parse HEAD
