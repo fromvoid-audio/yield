@@ -683,6 +683,14 @@ impl Browser {
         publication_fence: Option<SourcePublicationFence>,
         cx: &mut Context<Self>,
     ) -> bool {
+        if super::transient_markers::apply_catalog_event(
+            self,
+            &mut event,
+            publication_fence.clone(),
+            cx,
+        ) {
+            return true;
+        }
         if super::similarity_list::apply_catalog_event(
             self,
             &mut event,
@@ -1238,6 +1246,7 @@ impl Browser {
             },
         );
         self.restore_projection_focus(restore_id, restore_position, cx);
+        super::transient_markers::schedule(self, cx);
         if audit_ready {
             let _ = self.maybe_start_rating_decay(cx);
         }
@@ -1258,6 +1267,7 @@ impl Browser {
             return;
         }
         self.similarity_list.cancel();
+        self.transient_markers.invalidate();
         super::source_recovery::cancel_for_source_change(self);
         super::rating_decay::invalidate_for_source_publication(self, status);
         super::unsupported_entries::cancel_for_source_change(self, cx);
