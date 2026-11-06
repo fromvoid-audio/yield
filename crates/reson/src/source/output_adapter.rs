@@ -40,8 +40,7 @@ impl StereoOutputPair {
 ///
 /// The playback callback mixes one interleaved sample per device-buffer slot, so
 /// queued sources must already match the opened output stream format. This
-/// adapter preserves playback speed with linear resampling and remaps channels
-/// so mono and stereo content reach the device predictably.
+/// adapter remaps channels and uses linear resampling when the rates differ.
 pub(crate) struct OutputAdapter<S> {
     inner: S,
     source_channels: usize,
@@ -83,15 +82,23 @@ where
         output_pair: StereoOutputPair,
     ) -> Self {
         let source_channels = inner.channels().max(1) as usize;
+        let source_rate = inner.sample_rate().max(1);
+        let target_rate = target_rate.max(1);
         let mut current_frame = vec![0.0; source_channels];
-        let current_frame_valid = read_frame_into(&mut inner, &mut current_frame);
-        let mut next_frame = vec![0.0; source_channels];
-        let next_frame_valid = read_frame_into(&mut inner, &mut next_frame);
+        let (current_frame_valid, next_frame, next_frame_valid) = if source_rate == target_rate {
+            // Routing alone needs one frame at a time and no interpolator history.
+            (true, Vec::new(), false)
+        } else {
+            let current_valid = read_frame_into(&mut inner, &mut current_frame);
+            let mut next_frame = vec![0.0; source_channels];
+            let next_valid = read_frame_into(&mut inner, &mut next_frame);
+            (current_valid, next_frame, next_valid)
+        };
         let target_channels = target_channels.max(1) as usize;
         let output_pair = output_pair.for_output_channels(target_channels);
         Self {
-            source_rate: inner.sample_rate().max(1),
-            target_rate: target_rate.max(1),
+            source_rate,
+            target_rate,
             target_channels,
             output_pair,
             inner,
@@ -108,17 +115,24 @@ where
     }
 
     fn fill_pending_output(&mut self) -> Option<()> {
-        self.align_to_position()?;
+        let fraction = if self.source_rate == self.target_rate {
+            self.current_frame_valid = self.current_frame_valid
+                && read_frame_into(&mut self.inner, &mut self.current_frame);
+            0.0
+        } else {
+            self.align_to_position()?;
+            let fraction =
+                (self.position_num % u64::from(self.target_rate)) as f32 / self.target_rate as f32;
+            self.position_num = self
+                .position_num
+                .saturating_add(u64::from(self.source_rate));
+            fraction
+        };
         if !self.current_frame_valid {
             return None;
         }
         let current = self.current_frame.as_slice();
         let next = self.next_frame_valid.then_some(self.next_frame.as_slice());
-        let fraction = if self.next_frame_valid {
-            (self.position_num % self.target_rate as u64) as f32 / self.target_rate as f32
-        } else {
-            0.0
-        };
 
         if self.target_channels == 1 && self.source_channels > 1 {
             let total = (0..self.source_channels)
@@ -143,7 +157,6 @@ where
         }
 
         self.pending_index = 0;
-        self.position_num = self.position_num.saturating_add(self.source_rate as u64);
         Some(())
     }
 
@@ -357,6 +370,31 @@ mod tests {
         let source = FrameSource::new(6, 48_000, vec![0.1, 0.2, 0.3, 0.4, 0.5, 0.6]);
         let samples: Vec<f32> = OutputAdapter::new(source, 48_000, 8).collect();
         assert_eq!(samples, [0.1, 0.2, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn equal_rate_routing_preserves_pcm_bits_and_reads_only_rendered_frames() {
+        let source = FrameSource::new(2, 48_000, vec![-0.0, f32::MAX, 0.0, -f32::MAX, 0.5]);
+        let mut adapted =
+            OutputAdapter::with_output_pair(source, 48_000, 4, StereoOutputPair::new(1));
+        assert_eq!(adapted.inner.index, 0);
+
+        let allocation_counts =
+            crate::test_support::count_thread_allocations_and_deallocations(|| {
+                for (index, (left, right)) in [(-0.0_f32, f32::MAX), (0.0, -f32::MAX)]
+                    .into_iter()
+                    .enumerate()
+                {
+                    for expected in [0.0_f32, 0.0, left, right] {
+                        assert_eq!(adapted.next().map(f32::to_bits), Some(expected.to_bits()));
+                        assert_eq!(adapted.inner.index, (index + 1) * 2);
+                    }
+                }
+                assert_eq!(adapted.next(), None);
+                assert_eq!(adapted.next(), None);
+                assert_eq!(adapted.inner.index, 5);
+            });
+        assert_eq!(allocation_counts, (0, 0));
     }
 
     #[test]
