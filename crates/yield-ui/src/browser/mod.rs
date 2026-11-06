@@ -483,6 +483,7 @@ pub(crate) struct Browser {
     scan_cancel: Option<Arc<AtomicBool>>,
     scan_task: Option<Task<()>>,
     external_source_drop_task: Option<Task<()>>,
+    external_source_drop_batch: Option<source_drop::SourceDropBatch>,
     source_registry_task: Option<Task<()>>,
     preferences_task: Option<Task<()>>,
     source_registry_loaded: bool,
@@ -862,6 +863,7 @@ impl Browser {
             scan_cancel: None,
             scan_task: None,
             external_source_drop_task: None,
+            external_source_drop_batch: None,
             source_registry_task: None,
             preferences_task: None,
             source_registry_loaded: false,
@@ -1507,9 +1509,18 @@ impl Browser {
                 }
                 view.scan_cancel = None;
                 match result {
+                    Ok(scan) if !view.dropped_scan_root_matches(generation, &scan.root) => {
+                        view.apply_scan_error(
+                            source_index,
+                            scan_root,
+                            "The dropped folder changed before scanning".into(),
+                            cx,
+                        );
+                    }
                     Ok(scan) => view.apply_scan_result(scan, source_index, cx),
                     Err(error) => view.apply_scan_error(source_index, scan_root, error, cx),
                 }
+                view.advance_external_source_drop(cx);
                 cx.notify();
             });
         }));
