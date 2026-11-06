@@ -2,6 +2,9 @@ mod publication_issuance {
     use super::super::publication_bindings::PublicationBindingDraft;
     use super::*;
     use crate::operation_journal::ParticipantId;
+    use crate::operation_journal::writer_acquisition_telemetry::{
+        JournalWriterCall, JournalWriterReturn, tests::Capture,
+    };
 
     // Authority-free durable row observations only. This fixture creates no Native provider,
     // source pin, live file-owner target, publication grant or physical allocation proof.
@@ -80,6 +83,51 @@ mod publication_issuance {
         };
         (fixture, store, staging, binding, sequence)
     }
+
+    #[test]
+    fn staging_writer_acquisition_reports_actual_sqlite_contention_and_retry() {
+        let telemetry = Capture::new();
+        let (_fixture, store, staging, binding, sequence) = prepared();
+        // Release the fixture's persistent exclusive lock before installing a
+        // competing writer. The original Store entry points still issue BEGIN EXCLUSIVE.
+        store
+            .connection
+            .execute_batch("PRAGMA locking_mode = NORMAL; BEGIN EXCLUSIVE; COMMIT;")
+            .unwrap();
+        store.connection.busy_timeout(std::time::Duration::ZERO).unwrap();
+        let blocker = rusqlite::Connection::open(&store.database_path).unwrap();
+        blocker.busy_timeout(std::time::Duration::ZERO).unwrap();
+        blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let checkpoint_error = store.checkpoint_staging(&staging).unwrap_err();
+        let reservation_error = store
+            .reserve_publication_binding_fixture(&staging, sequence, binding.clone())
+            .unwrap_err();
+        for error in [checkpoint_error, reservation_error] {
+            assert!(matches!(
+                error,
+                OperationJournalStoreError::Sql(rusqlite::Error::SqliteFailure(error, _))
+                    if error.code == rusqlite::ErrorCode::DatabaseBusy
+            ));
+        }
+        assert!(store.connection.is_autocommit());
+        assert!(!store.read_staging_checkpoint_row(staging.output_id()).unwrap().unwrap().2);
+        assert!(store.read_publication_binding(staging.output_id()).unwrap().is_none());
+
+        blocker.execute_batch("ROLLBACK").unwrap();
+        assert!(matches!(
+            store.checkpoint_staging(&staging).unwrap(),
+            staging_checkpoints::StagingCheckpointReceipt::Replay { .. }
+        ));
+        store
+            .reserve_publication_binding_fixture(&staging, sequence, binding)
+            .unwrap();
+        let snapshot = telemetry.snapshot();
+        assert_eq!(snapshot.count(JournalWriterCall::StagingCheckpoint, JournalWriterReturn::Busy), 1);
+        assert_eq!(snapshot.count(JournalWriterCall::PublicationReservation, JournalWriterReturn::Busy), 1);
+        assert_eq!(snapshot.count(JournalWriterCall::StagingCheckpoint, JournalWriterReturn::Acquired), 2);
+        assert_eq!(snapshot.count(JournalWriterCall::PublicationReservation, JournalWriterReturn::Acquired), 1);
+    }
+
     // Real original SQLite persistence under a test-only scalar slot; no physical grant.
     fn no_effect_prepared() -> (
         Fixture,

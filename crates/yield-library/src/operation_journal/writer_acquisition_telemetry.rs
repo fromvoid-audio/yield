@@ -15,7 +15,13 @@ pub enum JournalWriterCall {
     RetryPending,
     /// Original ordinary-claim release receipt persistence or exact replay.
     OrdinaryClaimRelease,
+    /// Original validated staging checkpoint persistence or exact replay.
+    StagingCheckpoint,
+    /// Original one-shot reservation of a validated stage for publication.
+    PublicationReservation,
 }
+
+const CALL_COUNT: usize = JournalWriterCall::PublicationReservation as usize + 1;
 
 /// Original acquisition return, before transaction body or commit.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -34,7 +40,7 @@ pub enum JournalWriterReturn {
 /// Process-lifetime saturating observations. Concurrent fields are approximate.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct JournalWriterTelemetrySnapshot {
-    counts: [[u64; 4]; 4],
+    counts: [[u64; 4]; CALL_COUNT],
     /// Original acquisition call only: <=1, <=10, <=100, <=1000, >1000 ms.
     pub elapsed_buckets: [u64; 5],
 }
@@ -46,13 +52,13 @@ impl JournalWriterTelemetrySnapshot {
 }
 
 struct Counters {
-    counts: [[AtomicU64; 4]; 4],
+    counts: [[AtomicU64; 4]; CALL_COUNT],
     elapsed: [AtomicU64; 5],
 }
 impl Counters {
     const fn new() -> Self {
         Self {
-            counts: [const { [const { AtomicU64::new(0) }; 4] }; 4],
+            counts: [const { [const { AtomicU64::new(0) }; 4] }; CALL_COUNT],
             elapsed: [const { AtomicU64::new(0) }; 5],
         }
     }

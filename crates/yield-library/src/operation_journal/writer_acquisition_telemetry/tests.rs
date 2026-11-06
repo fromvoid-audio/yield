@@ -31,8 +31,8 @@ pub(super) fn record(call: JournalWriterCall, result: JournalWriterReturn, elaps
 
 #[test]
 fn fixed_numeric_backing_saturation_and_elapsed_boundaries() {
-    assert_eq!(std::mem::size_of::<Counters>(), 168);
-    assert_eq!(std::mem::size_of::<JournalWriterTelemetrySnapshot>(), 168);
+    assert_eq!(std::mem::size_of::<Counters>(), 232);
+    assert_eq!(std::mem::size_of::<JournalWriterTelemetrySnapshot>(), 232);
     let counters = Counters::new();
     for millis in [0, 1, 2, 10, 11, 100, 101, 1000, 1001] {
         counters.record(
@@ -50,6 +50,8 @@ fn fixed_numeric_backing_saturation_and_elapsed_boundaries() {
         JournalWriterCall::CancellationRequest,
         JournalWriterCall::RetryPending,
         JournalWriterCall::OrdinaryClaimRelease,
+        JournalWriterCall::StagingCheckpoint,
+        JournalWriterCall::PublicationReservation,
     ] {
         for outcome in [
             JournalWriterReturn::Acquired,
