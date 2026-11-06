@@ -51,7 +51,7 @@ use yield_library::sample_sources::{
 use yield_scan::sample_sources::scanner::{
     ScanError, ScanWritePhase, ScanWriter,
     audit_manifest_for_catalog_with_budget_and_progress_and_writer,
-    read_wav_display_metadata_for_manifest,
+    read_audio_display_metadata_for_manifest,
 };
 #[cfg(test)]
 use yield_source_watcher::WatchHintEvidence;
@@ -7601,7 +7601,7 @@ fn attach_wav_metadata(
     expected_root_identity: &RootIdentity,
     mut should_cancel: impl FnMut() -> bool,
 ) -> Result<(), CatalogError> {
-    let metadata = read_wav_display_metadata_for_manifest(
+    let metadata = read_audio_display_metadata_for_manifest(
         root,
         expected_root_identity,
         &snapshot.manifest,

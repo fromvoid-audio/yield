@@ -19,6 +19,7 @@ mod source_entry;
 /// Sealed bounded pre-intent transport on the genuine source producer.
 pub mod wal_transport;
 
+pub(crate) use audio_support::matches_indexed_audio_extension;
 pub use audio_support::{
     is_apple_double_sidecar, is_recognized_audio, is_supported_audio, supported_audio_where_clause,
 };

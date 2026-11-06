@@ -433,12 +433,6 @@ const INDEX_SQL: &str = "CREATE INDEX IF NOT EXISTS idx_wav_files_missing
          ON wav_files(extension);
      CREATE INDEX IF NOT EXISTS idx_source_index_entries_classification_path
          ON source_index_entries(classification, path);
-     CREATE INDEX IF NOT EXISTS idx_source_content_audit_forward_path
-         ON wav_files(path)
-         WHERE missing = 0
-           AND extension IN ('wav')
-           AND path NOT GLOB '._*'
-           AND path NOT GLOB '*/._*';
      CREATE INDEX IF NOT EXISTS idx_source_content_audit_retry_due
          ON source_content_audit_entries(COALESCE(retry_at, 0), path)
          WHERE skip_reason IS NOT NULL;
@@ -507,5 +501,13 @@ pub(super) fn apply_base_schema(connection: &Connection) -> Result<(), SourceDbE
 /// Create all supporting indices used by the source database.
 pub(super) fn apply_indices(connection: &Connection) -> Result<(), SourceDbError> {
     connection.execute_batch(INDEX_SQL).map_err(map_sql_error)?;
+    // Keep the current schema image byte-for-byte stable while the format set is unchanged.
+    let filter =
+        crate::sample_sources::supported_audio_where_clause().replace(" AND ", "\n           AND ");
+    connection
+        .execute_batch(&format!(
+            "CREATE INDEX IF NOT EXISTS idx_source_content_audit_forward_path\n         ON wav_files(path)\n         WHERE missing = 0\n           AND {filter};"
+        ))
+        .map_err(map_sql_error)?;
     Ok(())
 }
