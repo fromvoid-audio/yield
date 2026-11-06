@@ -147,7 +147,6 @@ impl Browser {
 mod tests {
     use super::*;
     use gpui::{Keystroke, TestAppContext};
-    use yield_media::WaveformPreview;
 
     #[test]
     fn frame_resize_preserves_midpoint_round_trip_and_shifts_at_boundaries() {
@@ -189,47 +188,65 @@ mod tests {
     fn focused_waveform_resizes_but_search_and_unmodified_arrows_keep_their_routes(
         cx: &mut TestAppContext,
     ) {
+        let fixture = tempfile::tempdir().unwrap();
+        let path = fixture.path().join("playmark.wav");
+        let sample_rate = 48_000_u32;
+        let data_bytes = 100_u32 * 2;
+        let mut wav = b"RIFF".to_vec();
+        wav.extend_from_slice(&(36 + data_bytes).to_le_bytes());
+        wav.extend_from_slice(b"WAVEfmt ");
+        wav.extend_from_slice(&16_u32.to_le_bytes());
+        wav.extend_from_slice(&1_u16.to_le_bytes()); // PCM
+        wav.extend_from_slice(&1_u16.to_le_bytes()); // mono
+        wav.extend_from_slice(&sample_rate.to_le_bytes());
+        wav.extend_from_slice(&(sample_rate * 2).to_le_bytes());
+        wav.extend_from_slice(&2_u16.to_le_bytes()); // bytes per frame
+        wav.extend_from_slice(&16_u16.to_le_bytes());
+        wav.extend_from_slice(b"data");
+        wav.extend_from_slice(&data_bytes.to_le_bytes());
+        wav.resize(wav.len() + data_bytes as usize, 0);
+        std::fs::write(&path, wav).unwrap();
+        let preview = yield_media::load_waveform_preview(&path).unwrap();
+        assert_eq!(preview.total_frames, 100);
         cx.set_global(crate::theme::ActiveTheme::default());
         let (browser, cx) = cx.add_window_view(|_, cx| Browser::new(cx));
         cx.update(|window, app| {
             browser.update(app, |view, cx| {
-                view.waveform = Some(WaveformPreview {
-                    peaks: vec![0.5; 8],
-                    bands: Vec::new(),
-                    duration_seconds: 1.0,
-                    sample_rate: 100,
-                    total_frames: 100,
-                    detail_context: None,
-                });
-                view.set_waveform_play_region(WaveformPlayRegion::new(0.2, 0.6));
-                let event = KeyDownEvent {
-                    keystroke: Keystroke::parse("ctrl-left").unwrap(),
+                view.waveform = Some(preview);
+                view.set_waveform_play_region(WaveformPlayRegion::new(0.4, 0.46));
+                let key = |keys| KeyDownEvent {
+                    keystroke: Keystroke::parse(keys).unwrap(),
                     is_held: false,
                 };
+                let frames = |view: &Browser| view.waveform_play_region.unwrap().frame_bounds(100);
+                let half = key("secondary-left");
+                let double = key("secondary-right");
+                #[cfg(target_os = "macos")]
+                assert!(half.keystroke.modifiers.platform && !half.keystroke.modifiers.control);
                 window.focus(&view.waveform_focus_handle);
-                view.handle_key_down(&event, window, cx);
-                assert_eq!(
-                    view.waveform_play_region.unwrap().frame_bounds(100),
-                    Some((30, 50))
-                );
+                view.handle_key_down(&half, window, cx);
+                assert_eq!(frames(view), Some((41, 44)));
+                for excluded in [
+                    "secondary-shift-right",
+                    "secondary-alt-right",
+                    "secondary-fn-right",
+                ] {
+                    view.handle_key_down(&key(excluded), window, cx);
+                    assert_eq!(frames(view), Some((41, 44)));
+                }
                 window.focus(&view.search_input.read(cx).focus_handle());
-                view.handle_key_down(&event, window, cx);
-                assert_eq!(
-                    view.waveform_play_region.unwrap().frame_bounds(100),
-                    Some((30, 50))
-                );
+                view.handle_key_down(&double, window, cx);
+                assert_eq!(frames(view), Some((41, 44)));
+                window.focus(&view.focus_handle);
+                view.handle_key_down(&double, window, cx);
+                assert_eq!(frames(view), Some((41, 44)));
                 window.focus(&view.waveform_focus_handle);
-                let plain = KeyDownEvent {
-                    keystroke: Keystroke::parse("left").unwrap(),
-                    is_held: false,
-                };
-                view.handle_key_down(&plain, window, cx);
-                assert_eq!(
-                    view.waveform_play_region.unwrap().frame_bounds(100),
-                    Some((10, 30))
-                );
+                view.handle_key_down(&double, window, cx);
+                assert_eq!(frames(view), Some((40, 46)));
+                view.handle_key_down(&key("left"), window, cx);
+                assert_eq!(frames(view), Some((34, 40)));
                 view.set_waveform_play_region(None);
-                view.handle_key_down(&event, window, cx);
+                view.handle_key_down(&half, window, cx);
                 assert!(view.waveform_play_region.is_none());
             })
         });
