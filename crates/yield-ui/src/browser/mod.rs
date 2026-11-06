@@ -86,6 +86,7 @@ mod accessibility {
 }
 mod analysis;
 mod audio_output;
+mod bpm_snap_entry;
 mod catalog;
 mod catalog_metadata;
 mod collection_rename;
@@ -397,6 +398,7 @@ pub(crate) struct Browser {
     similarity_list: similarity_list::SimilarityListState,
     transient_markers: transient_markers::TransientMarkersState,
     bpm_snap_enabled: bool,
+    bpm_snap_entry: bpm_snap_entry::BpmSnapEntry,
     beat_guides_enabled: bool,
     beat_guide_count: u8,
     random_audition_sticky: bool,
@@ -648,6 +650,7 @@ impl Browser {
             });
         let playmark_timing_input =
             cx.new(|cx| SearchInput::new_with_options(cx, SearchInputOptions::playmark_timing()));
+        let bpm_snap_entry = bpm_snap_entry::BpmSnapEntry::new(cx);
         let playmark_timing_subscription = cx.subscribe(
             &playmark_timing_input,
             |view, _input, _: &SearchChanged, cx| {
@@ -770,6 +773,7 @@ impl Browser {
             similarity_list: similarity_list::SimilarityListState::default(),
             transient_markers: transient_markers::TransientMarkersState::default(),
             bpm_snap_enabled: false,
+            bpm_snap_entry,
             beat_guides_enabled: false,
             beat_guide_count: DEFAULT_BEAT_COUNT,
             random_audition_sticky: false,
@@ -1040,6 +1044,9 @@ impl Browser {
     }
 
     fn theme_changed_inputs(&self, cx: &mut Context<Self>) {
+        self.bpm_snap_entry
+            .input
+            .update(cx, |input, cx| input.theme_changed(cx));
         self.search_input
             .update(cx, |input, cx| input.theme_changed(cx));
         self.playmark_timing_input
@@ -3127,6 +3134,9 @@ impl Browser {
                 }
                 cx.stop_propagation();
             }
+            return;
+        }
+        if bpm_snap_entry::handle_key_down(self, event, window, cx) {
             return;
         }
         if key.eq_ignore_ascii_case("f") && secondary {
