@@ -97,10 +97,13 @@ ratio for the isolated stereo dot-product workload was 7.193 ms per second
 of output. The production streaming adapter must verify these targets with
 its actual history, routing, and callback integration.
 
-## Streaming qualification
+## Adapter qualification
 
-The standalone probe uses the kernel and streaming state intended for Reson.
-It runs the common-rate matrix and an interpolated 48,001 → 44,100 Hz pair.
+The standalone probe uses Reson's interleaved output adapter and its actual
+kernel and streaming state. It runs the common-rate matrix and an
+interpolated 48,001 → 44,100 Hz pair. The timing excludes device I/O, decoder
+work and retirement, and includes PCM frame reading, channel routing and
+position publication.
 The kernel caps future support at 512 frames and 2 ms of source audio. It
 keeps a minimum of one source frame when a frame itself exceeds 2 ms. The
 first output consumes the source center frame plus this future support. The
@@ -134,3 +137,22 @@ rustc +1.93.0 --edition=2024 -C opt-level=3 -C target-cpu=native --test scripts/
 rustc +1.93.0 --edition=2024 -C opt-level=3 -C target-cpu=native scripts/qa/reson_bandlimited_probe.rs -o "$scratch/probe"
 "$scratch/probe"
 ```
+
+## Native listening pass
+
+Use a signed optimized macOS candidate and record its source SHA, app build,
+device name, requested and actual sample rates, and device buffer size.
+
+1. Audition level-matched 44.1, 48, and 96 kHz mono and stereo references at
+   44.1 and 48 kHz device settings where supported. Compare matching-rate and
+   converted playback on the same output pair and record any tonal change,
+   unexpected image, or pitch change.
+2. On a mismatched source, test a short one-shot, repeated loop, Loop-off near
+   the boundary, quick source replacements, and waveform seek or drag
+   retarget. Test cached and lazy playback. Repeat with the metronome and
+   existing edit fades. Watch position and listen for an extra cycle, click,
+   stale audio or a slow retarget.
+3. Repeat a short rapid audition sequence on the same device and buffer at
+   matching and mismatched rates. Capture playback-start timing and any
+   decoder underrun events with the existing Reson telemetry. Record rates
+   or output hardware that were unavailable separately.
