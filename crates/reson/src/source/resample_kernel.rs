@@ -4,6 +4,7 @@ use std::f64::consts::PI;
 
 const BASE_RADIUS: u64 = 80;
 const MAX_RADIUS: u64 = 512;
+const MAX_LOOKAHEAD_MS: u64 = 2;
 const MAX_EXACT_PHASES: u32 = 320;
 const INTERPOLATED_PHASES: u32 = 128;
 const CUTOFF_FRACTION: f64 = 0.925;
@@ -23,8 +24,11 @@ impl ResampleKernel {
         let source_rate = source_rate.max(1);
         let target_rate = target_rate.max(1);
         let ratio_numerator = source_rate.max(target_rate);
+        // Keep initial source demand within the short transient prefill budget.
+        let time_limited_radius = (u64::from(source_rate) * MAX_LOOKAHEAD_MS / 1_000).max(1);
         let radius = (BASE_RADIUS * u64::from(ratio_numerator))
             .div_ceil(u64::from(target_rate))
+            .min(time_limited_radius)
             .min(MAX_RADIUS) as usize;
         let reduced_denominator = target_rate / gcd(source_rate, target_rate);
         let phase_intervals = if reduced_denominator <= MAX_EXACT_PHASES {
@@ -164,5 +168,20 @@ mod tests {
         let extreme = ResampleKernel::new(u32::MAX - 2, 320);
         assert_eq!(extreme.radius(), MAX_RADIUS as usize);
         assert_eq!(extreme.weights.len(), 321 * 2 * MAX_RADIUS as usize);
+    }
+
+    #[test]
+    fn lookahead_respects_source_time_and_retains_the_common_rate_filters() {
+        for (source, target, expected) in [
+            (499, 48_000, 1),
+            (8_000, 48_000, 16),
+            (44_100, 48_000, 80),
+            (48_000, 16_000, 96),
+            (48_000, 44_100, 88),
+            (96_000, 44_100, 175),
+            (384_000, 8_000, 512),
+        ] {
+            assert_eq!(ResampleKernel::new(source, target).radius(), expected);
+        }
     }
 }
