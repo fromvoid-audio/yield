@@ -291,6 +291,17 @@ const BASE_SCHEMA_SQL: &str = "CREATE TABLE IF NOT EXISTS metadata (
         digest BLOB NOT NULL CHECK(length(digest) = 32),
         UNIQUE(content_hash, detector_version, preset)
     );
+    CREATE TABLE IF NOT EXISTS source_playmark_tempo (
+        path TEXT PRIMARY KEY,
+        file_identity TEXT NOT NULL CHECK(length(file_identity) BETWEEN 1 AND 512),
+        content_hash TEXT NOT NULL CHECK(length(content_hash) = 64),
+        first_frame INTEGER NOT NULL CHECK(first_frame >= 0),
+        end_frame INTEGER NOT NULL CHECK(end_frame > first_frame),
+        source_frames INTEGER NOT NULL CHECK(source_frames >= end_frame),
+        sample_rate INTEGER NOT NULL CHECK(sample_rate BETWEEN 1 AND 4294967295),
+        beat_count INTEGER NOT NULL CHECK(beat_count BETWEEN 1 AND 255),
+        FOREIGN KEY(path) REFERENCES wav_files(path) ON UPDATE CASCADE ON DELETE CASCADE
+    ) WITHOUT ROWID;
     CREATE TABLE IF NOT EXISTS analysis_cache_embeddings (
         content_hash TEXT NOT NULL,
         analysis_version TEXT NOT NULL,

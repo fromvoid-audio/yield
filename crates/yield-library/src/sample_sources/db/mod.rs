@@ -165,12 +165,12 @@ pub use write::{
     SourceLayoutWalPreparation, SourceLayoutWalPreparationFailure,
     SourceLeaseMaintenanceAllocation, SourceLeaseMaintenanceBinding,
     SourceLeaseMaintenancePreparation, SourceLeaseMaintenancePreparationError,
-    SourceLeaseMaintenancePreparationFailure, SourceRevision, SourceScanFence, SourceSnapshotOwner,
-    SourceSnapshotPage, SourceSnapshotQueueMetrics, SourceTagAdmissionObservation,
-    SourceTagAssignmentMutation, SourceTagAssignmentSelection, SourceTagMetadataBudget,
-    SourceTagMetadataPolicy, SourceTagWalPreparation, SourceTagWalPreparationFailure,
-    SourceTagWrite, SourceWriteCommand, SourceWriter, SourceWriterCommandIdentity,
-    SourceWriterError, SourceWriterReceipt, SourceWriterRequest,
+    SourceLeaseMaintenancePreparationFailure, SourcePlaymarkTempo, SourceRevision, SourceScanFence,
+    SourceSnapshotOwner, SourceSnapshotPage, SourceSnapshotQueueMetrics,
+    SourceTagAdmissionObservation, SourceTagAssignmentMutation, SourceTagAssignmentSelection,
+    SourceTagMetadataBudget, SourceTagMetadataPolicy, SourceTagWalPreparation,
+    SourceTagWalPreparationFailure, SourceTagWrite, SourceWriteCommand, SourceWriter,
+    SourceWriterCommandIdentity, SourceWriterError, SourceWriterReceipt, SourceWriterRequest,
 };
 pub use write::{SourceAcquisitionMetricsSnapshot, source_acquisition_metrics_snapshot};
 

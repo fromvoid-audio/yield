@@ -17578,8 +17578,9 @@ mod tests {
     mod feature_request_tests;
     mod harvest_facts_tests;
     mod history_selection_tests;
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+    mod playmark_tempo_tests;
     mod similarity_dispatch_tests;
     mod similarity_query_tests;
-    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     mod transient_dispatch_tests;
 }
