@@ -8,12 +8,14 @@
 use super::super::{SourceReferenceFence, SourceReferenceFenceError};
 mod audio_input;
 mod collection_history_selection;
+mod playmark_tempo;
 mod transient_cache;
 pub use collection_history_selection::{
     SOURCE_COLLECTION_HISTORY_GROUP_MAX_BYTES, SOURCE_COLLECTION_HISTORY_GROUP_MAX_PATHS,
     SourceCollectionHistoryChange, SourceCollectionHistoryExecution, SourceCollectionHistoryGroup,
     SourceCollectionHistorySelection,
 };
+pub use playmark_tempo::SourcePlaymarkTempo;
 mod snapshot_metrics;
 pub use snapshot_metrics::SourceSnapshotQueueMetrics;
 use snapshot_metrics::{SnapshotCounters, SnapshotSender};
