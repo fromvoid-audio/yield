@@ -78,6 +78,8 @@ from process_tree import (  # noqa: E402
 )
 
 COORDINATOR_FD: Optional[int] = None
+FROZEN_PREFLIGHT_BRANCH = "codex/local-ci-frozen-preflight"
+FROZEN_PREFLIGHT_SLOT = "frozen-preflight"
 ADMISSION_MARKER = b"YIELD_ADMISSION_PROTOCOL_V1"
 # A full check can contain the runner's 40-second nested-validator cleanup.
 MANAGED_COMMAND_TERMINATION_GRACE_SECONDS = (40.0, 10.0, 5.0)
@@ -422,6 +424,131 @@ def exact_worktree(sha: str) -> Iterator[pathlib.Path]:
                 raise CiError(f"exact-source worktree cleanup failed: {message}")
 
 
+def frozen_checkout_identity(checkout: pathlib.Path, sha: str) -> dict[str, object]:
+    entry = checkout.lstat()
+    if not stat.S_ISDIR(entry.st_mode) or entry.st_uid != os.geteuid():
+        raise CiError("frozen checkout is not a current-user-owned directory")
+    git_file = (checkout / ".git").lstat()
+    if not stat.S_ISREG(git_file.st_mode) or git_file.st_uid != os.geteuid():
+        raise CiError("frozen checkout lacks its owned Git worktree pointer")
+    return {"schema": 1, "sha": sha, "device": entry.st_dev, "inode": entry.st_ino}
+
+
+def verify_frozen_checkout(state_dir: pathlib.Path, checkout: pathlib.Path, sha: str) -> None:
+    if pathlib.Path(command_output("git", "rev-parse", "--show-toplevel", cwd=checkout)) != checkout:
+        raise CiError("frozen Git worktree path does not match the checkout")
+    git_common = pathlib.Path(command_output(
+        "git", "rev-parse", "--path-format=absolute", "--git-common-dir", cwd=checkout
+    ))
+    if git_common != state_dir.parent:
+        raise CiError("frozen checkout belongs to a different Git repository")
+    branch = f"refs/heads/{FROZEN_PREFLIGHT_BRANCH}"
+    registrations = command_output("git", "worktree", "list", "--porcelain", "-z", cwd=checkout)
+    record = [f"worktree {checkout}", f"HEAD {sha}", f"branch {branch}"]
+    if record not in [item.split("\0") for item in registrations.split("\0\0")]:
+        raise CiError("frozen checkout does not have the expected worktree registration")
+    if command_output("git", "rev-parse", "HEAD", cwd=checkout) != sha:
+        raise CiError("frozen checkout is on a different commit")
+    if command_output("git", "symbolic-ref", "HEAD", cwd=checkout) != branch:
+        raise CiError("frozen checkout is on a different branch")
+    files = command_output("git", "ls-files", "-v", "-z", cwd=checkout)
+    if any(entry and not entry.startswith("H ") for entry in files.split("\0")):
+        raise CiError("frozen checkout has hidden or nonstandard index entries")
+    dirty = command_output(
+        "git", "-c", "core.fsmonitor=false", "-c", "core.untrackedCache=false",
+        "status", "--porcelain=v1", "--untracked-files=all", "--ignored=matching", cwd=checkout,
+    )
+    if dirty:
+        raise CiError("frozen checkout contains modified or extra files")
+
+
+def prepare_frozen_preflight(sha: str, state_dir: pathlib.Path) -> tuple[pathlib.Path, str]:
+    if COORDINATOR_FD is None:
+        raise CiError("frozen checkout requires the repository coordinator")
+    sha = source_sha(sha)
+    if command_output("git", "cat-file", "-t", sha) != "commit":
+        raise CiError("requested SHA is not an available commit")
+    if state_dir.is_symlink() or state_dir.stat().st_uid != os.geteuid():
+        raise CiError("frozen checkout requires an owned local-CI state directory")
+    slot = state_dir / FROZEN_PREFLIGHT_SLOT
+    checkout = slot / "checkout"
+    owner = slot / "owner.json"
+    try:
+        slot.mkdir(mode=0o700)
+    except FileExistsError:
+        entry = slot.lstat()
+        if not stat.S_ISDIR(entry.st_mode) or entry.st_uid != os.geteuid() or entry.st_mode & 0o077:
+            raise CiError("frozen checkout slot is not a private current-user-owned directory")
+        if os.path.lexists(slot / "active"):
+            raise CiError("frozen checkout has an unconfirmed previous process-group exit")
+        marker = owner.lstat()
+        if not stat.S_ISREG(marker.st_mode) or marker.st_uid != os.geteuid() or marker.st_size > 4096:
+            raise CiError("frozen checkout ownership marker is invalid")
+        try:
+            identity = json.loads(owner.read_text(encoding="utf-8"))
+        except (UnicodeError, ValueError) as error:
+            raise CiError("frozen checkout ownership marker is unreadable") from error
+        if not isinstance(identity, dict) or not isinstance(identity.get("sha"), str):
+            raise CiError("frozen checkout ownership marker is malformed")
+        previous = source_sha(identity["sha"])
+        if identity != frozen_checkout_identity(checkout, previous):
+            raise CiError("frozen checkout filesystem identity changed")
+        verify_frozen_checkout(state_dir, checkout, previous)
+        if sha == previous:
+            return checkout, "reused"
+        command_output(
+            "git", "-c", "core.hooksPath=/dev/null", "switch", "--no-overwrite-ignore",
+            "-C", FROZEN_PREFLIGHT_BRANCH, sha, cwd=checkout,
+        )
+        disposition = "updated"
+    else:
+        command_output(
+            "git", "-c", "core.hooksPath=/dev/null", "worktree", "add",
+            "-b", FROZEN_PREFLIGHT_BRANCH, str(checkout), sha,
+        )
+        disposition = "created"
+
+    verify_frozen_checkout(state_dir, checkout, sha)
+    write_build_record(owner, frozen_checkout_identity(checkout, sha))
+    return checkout, disposition
+
+
+@contextlib.contextmanager
+def validation_worktree(
+    sha: str, state_dir: pathlib.Path, lane: str
+) -> Iterator[tuple[pathlib.Path, str, Optional[str]]]:
+    rejected = None
+    if lane == "preflight":
+        try:
+            checkout, disposition = prepare_frozen_preflight(sha, state_dir)
+            lease = checkout.parent / "active"
+            fd = os.open(lease, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            try:
+                lease_identity = os.fstat(fd)
+            finally:
+                os.close(fd)
+        except (CiError, OSError) as error:
+            rejected = str(error)
+        else:
+            preserve_lease = False
+            try:
+                yield checkout, disposition, None
+            except BaseException as error:
+                preserve_lease = isinstance(error, GroupCleanupUnconfirmed) or isinstance(
+                    error.__cause__, GroupCleanupUnconfirmed
+                )
+                raise
+            finally:
+                if not preserve_lease:
+                    entry = lease.lstat()
+                    if (entry.st_dev, entry.st_ino) != (lease_identity.st_dev, lease_identity.st_ino):
+                        raise CiError("frozen checkout lease identity changed; preserved for inspection")
+                    lease.unlink()
+            return
+    with exact_worktree(sha) as checkout:
+        yield checkout, "temporary", rejected
+
+
 def cargo_env(state_dir: pathlib.Path, channel: str, checkout: pathlib.Path) -> dict[str, str]:
     env = os.environ.copy()
     if env.get("RUSTFLAGS") or env.get("CARGO_ENCODED_RUSTFLAGS"):
@@ -524,10 +651,18 @@ def _check(args: argparse.Namespace) -> None:
                 "audition-coreaudio requires inherited YIELD_TEST_AUDIO_OUTPUT=1; "
                 "opt in explicitly before any clean-state preparation"
             )
-    with common_coordinator() as state_dir, exact_worktree(sha) as checkout:
+    with (
+        common_coordinator() as state_dir,
+        validation_worktree(sha, state_dir, args.lane) as (checkout, disposition, cache_rejection),
+    ):
+        cached_identity = (
+            frozen_checkout_identity(checkout, sha) if disposition != "temporary" else None
+        )
         if args.lane in {"full", "native"}:
             require_maintenance_protocol(checkout, full_lane=args.lane == "full")
         env = cargo_env(state_dir, "check", checkout)
+        if cached_identity is not None:
+            env["PYTHONDONTWRITEBYTECODE"] = "1"
         if COORDINATOR_FD is not None:
             env["YIELD_LOCAL_CI_COORDINATOR_FD"] = str(COORDINATOR_FD)
         env["YIELD_LOCAL_CI_SOURCE_SHA"] = sha
@@ -582,6 +717,9 @@ def _check(args: argparse.Namespace) -> None:
                 raise CiError(f"frozen source lacks the allowlisted native validation runner: {runner.relative_to(checkout)}")
             commands = [["bash", str(runner)]]
         details = {"schema": 1, "run_id": run_id, "sha": sha, "lane": args.lane, "case": args.case, "platform": facts, "commands": commands, "results": []}
+        details["checkout"] = {"path": str(checkout), "disposition": disposition}
+        if cache_rejection is not None:
+            details["checkout"]["cache_rejection"] = cache_rejection
         with log_path.with_suffix(".log").open("w", encoding="utf-8") as log:
             native_state = None
             namespace_fd = transition_fd = None
@@ -653,6 +791,10 @@ def _check(args: argparse.Namespace) -> None:
                         break
                 else:
                     details["status"] = "passed"
+                if cached_identity is not None:
+                    if frozen_checkout_identity(checkout, sha) != cached_identity:
+                        raise CiError("frozen checkout filesystem identity changed during preflight")
+                    verify_frozen_checkout(state_dir, checkout, sha)
                 if args.lane == "native" and (
                     details.get("status") == "passed" or args.case == "audition-coreaudio"
                 ):

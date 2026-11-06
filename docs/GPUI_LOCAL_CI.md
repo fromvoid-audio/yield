@@ -93,6 +93,14 @@ not publish artifacts, merge code, or change branch state. An installed runner
 is a copy; rerun the installer after updating the scripts. Its result is macOS
 evidence only.
 
+The standalone `scripts/yield-local-ci check --lane preflight --sha <full-commit>`
+command uses one private checkout under `<git-common-dir>/local-ci/frozen-preflight`.
+The repository coordinator holds it through each run and the result records
+whether the checkout was created, reused, or advanced. Every invocation runs
+preflight. If verification rejects the cached checkout, the command preserves
+it for inspection and uses a temporary exact checkout. Full and native
+validation and packaging still use temporary checkouts.
+
 For a private bundle from an exact validated commit, follow
 [GPUI macOS packaging](GPUI_MACOS_PACKAGING.md).
 
