@@ -94,6 +94,16 @@ impl<T: Copy> SourcePlaymarkValueRequest<T> {
         self.path.as_path()
     }
 
+    /// Audited media binding shared by metadata and digest requests.
+    pub fn digest_scope(&self) -> SourceContentDigestScope {
+        SourceContentDigestScope {
+            source_id: self.source_id.clone(),
+            lifecycle_generation: self.lifecycle_generation,
+            previous_revision: self.revision,
+            relative_path: self.path.clone(),
+        }
+    }
+
     /// Requested read or compare-and-set operation.
     pub fn operation(&self) -> PlaymarkValueOperation<T> {
         self.operation

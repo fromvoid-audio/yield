@@ -1206,6 +1206,112 @@ mod tests {
     }
 
     #[gpui::test]
+    fn grid_and_authored_tempo_share_pending_digest_and_save_the_latest_grid(
+        cx: &mut TestAppContext,
+    ) {
+        use super::super::{
+            bpm_snap_entry, bpm_snap_persistence, playmark_tempo,
+            source_registry::SourceRegistryGlobal, waveform::WaveformPlayRegion,
+        };
+        use gpui::AppContext;
+        use std::collections::VecDeque;
+        use yield_library::sample_sources::readiness::FEATURE_INPUT_MAX_BYTES;
+        use yield_session::{SourcePlaymarkGridTempo, SourcePlaymarkTempo};
+
+        let frames = (FEATURE_INPUT_MAX_BYTES / 4) as u32 + 256;
+        let (_directory, path, preview) = fixture_frames(frames);
+        let root = path.parent().unwrap();
+        let config = tempfile::tempdir().unwrap();
+        let _base = ConfigBaseGuard::set(config.path().canonicalize().unwrap());
+        let _profile = PersistenceProfileGuard::named("gpui-grid-and-range-digest");
+        let guard = WritableProfileGuard::acquire_current().unwrap();
+        let (service, snapshot) = audited_owner(&guard, root);
+        assert!(snapshot.manifest[0].content_hash.is_none());
+        cx.set_global(SourceRegistryGlobal::for_catalog_fixture(service));
+        cx.set_global(crate::theme::ActiveTheme::default());
+        let browser = cx.new(Browser::new);
+        let range = SourcePlaymarkTempo::new(2_000, 8_000, u64::from(frames), 16_000, 6).unwrap();
+        let first = SourcePlaymarkGridTempo::parse("123.145").unwrap();
+        let latest = SourcePlaymarkGridTempo::parse("129.512").unwrap();
+        let baseline = WaveformPlayRegion::new(0.125, 0.25);
+        browser.update(cx, |view, cx| {
+            install_waveform(view, &path, preview);
+            install_digest_projection(view, root, &snapshot);
+            view.set_waveform_play_region(baseline);
+            assert!(playmark_tempo::save_authored_tempo(view, range, cx));
+            bpm_snap_persistence::commit_tempo(view, first, cx);
+        });
+        let mut queued = VecDeque::new();
+        let mut delivery = |cx: &mut TestAppContext| {
+            if queued.is_empty() {
+                queued.extend(wait_for(|| {
+                    cx.update(|app| {
+                        let mut deliveries = Vec::new();
+                        app.global::<SourceRegistryGlobal>()
+                            .drain_catalog_deliveries(&mut deliveries);
+                        (!deliveries.is_empty()).then_some(deliveries)
+                    })
+                }));
+            }
+            queued.pop_front().unwrap()
+        };
+        for _ in 0..2 {
+            let pending = delivery(cx);
+            browser.update(cx, |view, cx| {
+                assert!(view.apply_catalog_delivery(pending, cx))
+            });
+        }
+        browser.update(cx, |view, cx| {
+            assert_eq!(view.waveform_play_region, baseline);
+            assert_eq!(
+                view.playback_status,
+                "Verifying Source audio for BPM Snap tempo…"
+            );
+            assert_eq!(view.source_digest_requests.active_users(), 2);
+            bpm_snap_persistence::commit_tempo(view, latest, cx);
+            assert_eq!(bpm_snap_entry::effective_bpm(view), Some(129.512));
+        });
+        let digest = delivery(cx);
+        browser.update(cx, |view, cx| {
+            assert!(view.apply_catalog_delivery(digest, cx));
+            assert_eq!(
+                view.catalog_metadata.context_ref().unwrap().revision,
+                snapshot.committed_revision + 1
+            );
+            assert_eq!(view.waveform_generation, 7);
+            assert_eq!(view.waveform_play_region, baseline);
+            assert_eq!(view.source_digest_requests.active_users(), 0);
+        });
+        for _ in 0..4 {
+            let receipt = delivery(cx);
+            browser.update(cx, |view, cx| {
+                assert!(view.apply_catalog_delivery(receipt, cx))
+            });
+        }
+        browser.update(cx, |view, cx| {
+            assert_eq!(
+                view.waveform_play_region
+                    .unwrap()
+                    .frame_bounds(frames as usize),
+                Some((2_000, 8_000))
+            );
+            assert_eq!(view.beat_guide_count, 6);
+            assert_eq!(bpm_snap_entry::effective_bpm(view), Some(129.512));
+            assert!(view.playback_init_intent.is_none());
+            view.invalidate_waveform_generation();
+            assert!(bpm_snap_persistence::load_for_waveform(view, cx));
+        });
+        let reopened = delivery(cx);
+        browser.update(cx, |view, cx| {
+            assert!(view.apply_catalog_delivery(reopened, cx));
+            assert_eq!(bpm_snap_entry::effective_bpm(view), Some(129.512));
+        });
+        cx.update(|app| {
+            app.update_global::<SourceRegistryGlobal, _>(|global, _| global.shutdown())
+        });
+    }
+
+    #[gpui::test]
     fn bpm_paint_captures_the_authored_tempo_until_release(cx: &mut TestAppContext) {
         use super::super::{
             playmark_tempo, source_registry::SourceRegistryGlobal, waveform::WaveformPlayRegion,
@@ -1371,7 +1477,7 @@ mod tests {
 
     #[gpui::test]
     fn toolbar_projects_exact_owner_frames_and_rejects_the_old_preset(cx: &mut TestAppContext) {
-        use super::super::source_registry::SourceRegistryGlobal;
+        use super::super::{bpm_snap_persistence, source_registry::SourceRegistryGlobal};
         let (_directory, path, preview) = fixture();
         let root = path.parent().unwrap();
         let config = tempfile::tempdir().unwrap();
@@ -1385,6 +1491,11 @@ mod tests {
             install_source(view, root, &snapshot);
             // This fixture holds raw marker deliveries while changing presets.
             view.playmark_tempo.preserve_local_edit();
+            assert!(bpm_snap_persistence::load_for_waveform(view, cx));
+        });
+        let grid = next_tempo_delivery(&mut cx.cx);
+        browser.update(cx, |view, cx| {
+            assert!(view.apply_catalog_delivery(grid, cx));
             toggle(view, cx);
         });
         let old = next_delivery(cx);

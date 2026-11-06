@@ -10,10 +10,14 @@ use yield_library::sample_sources::{SourcePublicationFence, readiness::SourceFea
 use yield_media::WaveformFileRevision;
 use yield_session::{
     CatalogCommand, CatalogEvent, CatalogPublicationStatus, PlaymarkGridTempoOperation,
-    PlaymarkTempoFailure, SourcePlaymarkGridTempo, SourcePlaymarkGridTempoRequest,
+    PlaymarkTempoFailure, SourceContentDigestFailure, SourceContentDigestRequest,
+    SourceContentDigestScope, SourcePlaymarkGridTempo, SourcePlaymarkGridTempoRequest,
 };
 
-use super::{Browser, catalog};
+use super::{Browser, catalog, source_digest};
+
+const PENDING_DIGEST: PlaymarkTempoFailure =
+    PlaymarkTempoFailure::Input(SourceFeatureInputError::ContentPending);
 
 struct PendingRequest {
     request: SourcePlaymarkGridTempoRequest,
@@ -33,18 +37,29 @@ struct Binding {
     prior: Option<Result<Option<SourcePlaymarkGridTempo>, PlaymarkTempoFailure>>,
     desired: Option<SourcePlaymarkGridTempo>,
     writing: Option<PendingRequest>,
+    digest: Option<Arc<source_digest::PendingSourceDigest>>,
 }
 
 impl Binding {
     fn matches(&self, browser: &Browser) -> bool {
+        self.matches_waveform(browser, Some(self.read.request.revision()))
+    }
+
+    fn matches_waveform(&self, browser: &Browser, revision: Option<u64>) -> bool {
         catalog::audited_waveform_source(browser).is_some_and(|(entry, detail, source)| {
             self.waveform_generation == browser.waveform_generation
                 && self.file_revision == detail.file_revision
                 && self.read.request.source_id() == &source.source_id
                 && self.read.request.lifecycle_generation() == source.lifecycle_generation
-                && self.read.request.revision() == source.revision
+                && revision.is_none_or(|revision| revision == source.revision)
                 && self.read.request.relative_path() == entry.relative_path
         })
+    }
+
+    fn awaits_digest(&self, scope: &SourceContentDigestScope) -> bool {
+        self.desired.is_some()
+            && self.writing.is_none()
+            && self.read.request.digest_scope() == *scope
     }
 }
 
@@ -112,6 +127,7 @@ pub(super) fn load_for_waveform(browser: &mut Browser, cx: &mut Context<Browser>
         prior: None,
         desired: None,
         writing: None,
+        digest: None,
     });
     browser.start_source_registry_poll(cx);
     true
@@ -134,7 +150,11 @@ pub(super) fn commit_tempo(
         .persistence
         .binding
         .as_ref()
-        .is_some_and(|binding| binding.prior.is_some_and(|prior| prior.is_err()))
+        .is_some_and(|binding| {
+            binding
+                .prior
+                .is_some_and(|prior| prior.is_err_and(|error| error != PENDING_DIGEST))
+        })
     {
         browser.bpm_snap_entry.persistence.binding = None;
     }
@@ -183,6 +203,10 @@ fn save_if_ready(browser: &mut Browser, cx: &mut Context<Browser>) {
     };
     let prior = match prior {
         Ok(prior) => prior,
+        Err(PENDING_DIGEST) => {
+            request_digest(browser, cx);
+            return;
+        }
         Err(error) => {
             fail(browser, error);
             return;
@@ -220,6 +244,85 @@ fn save_if_ready(browser: &mut Browser, cx: &mut Context<Browser>) {
     }
 }
 
+fn request_digest(browser: &mut Browser, cx: &mut Context<Browser>) {
+    let Some(binding) = browser
+        .bpm_snap_entry
+        .persistence
+        .binding
+        .as_ref()
+        .filter(|binding| binding.matches(browser))
+    else {
+        fail(browser, PlaymarkTempoFailure::StaleSource);
+        return;
+    };
+    if binding.digest.is_none() {
+        let scope = binding.read.request.digest_scope();
+        let Some(digest) = source_digest::acquire(browser, &scope, cx) else {
+            fail(browser, PlaymarkTempoFailure::Store);
+            return;
+        };
+        if let Some(binding) = browser.bpm_snap_entry.persistence.binding.as_mut() {
+            binding.digest = Some(digest);
+        }
+    }
+    browser.set_playback_status("Verifying Source audio for BPM Snap tempo…");
+}
+
+pub(super) fn adopt_digest_revision(
+    browser: &mut Browser,
+    scope: &SourceContentDigestScope,
+    revision: u64,
+    cx: &mut Context<Browser>,
+) {
+    let state = &browser.bpm_snap_entry.persistence;
+    let Some(binding) = state
+        .binding
+        .as_ref()
+        .filter(|binding| binding.awaits_digest(scope))
+    else {
+        return;
+    };
+    if !binding.matches_waveform(browser, Some(revision)) {
+        fail(browser, PlaymarkTempoFailure::StaleSource);
+        cx.notify();
+        return;
+    }
+    let desired = browser
+        .bpm_snap_entry
+        .persistence
+        .binding
+        .take()
+        .and_then(|binding| binding.desired);
+    if load_for_waveform(browser, cx)
+        && let Some(binding) = browser.bpm_snap_entry.persistence.binding.as_mut()
+    {
+        binding.desired = desired;
+        browser.set_playback_status("Saving BPM Snap tempo…");
+    } else {
+        browser.set_playback_status(
+            "BPM Snap tempo applies to this session. Source save unavailable.",
+        );
+    }
+    cx.notify();
+}
+
+pub(super) fn reject_digest_revision(
+    browser: &mut Browser,
+    scope: &SourceContentDigestScope,
+    cx: &mut Context<Browser>,
+) {
+    if browser
+        .bpm_snap_entry
+        .persistence
+        .binding
+        .as_ref()
+        .is_some_and(|binding| binding.awaits_digest(scope))
+    {
+        fail(browser, PlaymarkTempoFailure::StaleSource);
+        cx.notify();
+    }
+}
+
 fn settle(browser: &mut Browser, tempo: SourcePlaymarkGridTempo) {
     let state = &mut browser.bpm_snap_entry.persistence;
     if let Some(binding) = state.binding.as_mut() {
@@ -235,17 +338,51 @@ fn fail(browser: &mut Browser, error: PlaymarkTempoFailure) {
     };
     binding.prior = Some(Err(error));
     binding.writing = None;
+    binding.digest = None;
     if binding.desired.take().is_some() {
         let message = match error {
             PlaymarkTempoFailure::Conflict => {
                 "BPM Snap tempo changed in the Source. Enter the BPM again to retry."
             }
-            PlaymarkTempoFailure::Input(SourceFeatureInputError::ContentPending) => {
-                "BPM Snap tempo applies to this session while Source audio verification is pending."
-            }
             _ => "BPM Snap tempo applies to this session. Source save unavailable.",
         };
         browser.set_playback_status(message);
+    }
+}
+
+pub(super) fn fail_digest(
+    browser: &mut Browser,
+    request: &SourceContentDigestRequest,
+    error: SourceContentDigestFailure,
+    cx: &mut Context<Browser>,
+) {
+    let current = browser
+        .bpm_snap_entry
+        .persistence
+        .binding
+        .as_ref()
+        .is_some_and(|binding| {
+            binding.matches_waveform(browser, None)
+                && binding
+                    .digest
+                    .as_ref()
+                    .is_some_and(|digest| digest.request == *request)
+        });
+    if current {
+        let failure = match error {
+            SourceContentDigestFailure::Input(error) => PlaymarkTempoFailure::Input(error),
+            SourceContentDigestFailure::StaleSource => PlaymarkTempoFailure::StaleSource,
+            _ => PlaymarkTempoFailure::Store,
+        };
+        fail(browser, failure);
+        if error == SourceContentDigestFailure::Busy {
+            browser.set_playback_status(
+                "BPM Snap tempo applies to this session. Source audio verification is busy.",
+            );
+        } else if error == SourceContentDigestFailure::Input(SourceFeatureInputError::ByteLimit) {
+            browser.set_playback_status("BPM Snap tempo applies to this session. Source audio exceeds the verification limit.");
+        }
+        cx.notify();
     }
 }
 
@@ -290,7 +427,9 @@ pub(super) fn apply_catalog_event(
         }
         (_, result) => *result,
     };
-    if let Err(error) = result {
+    if let Err(error) = result
+        && !(read && error == PENDING_DIGEST)
+    {
         fail(browser, error);
     } else {
         let state = &mut browser.bpm_snap_entry.persistence;
@@ -298,8 +437,11 @@ pub(super) fn apply_catalog_event(
             binding.prior = Some(result);
             binding.writing = None;
         }
-        if read && !state.local {
-            browser.bpm_snap_entry.tempo = result.ok().flatten();
+        if read
+            && !state.local
+            && let Ok(tempo) = result
+        {
+            browser.bpm_snap_entry.tempo = tempo;
         }
         save_if_ready(browser, cx);
     }
