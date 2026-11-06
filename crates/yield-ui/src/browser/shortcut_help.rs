@@ -179,6 +179,18 @@ impl Browser {
         }
     }
 
+    /// Replace Shortcut Help with the existing authenticated feedback prompt.
+    pub(super) fn report_issue_from_shortcut_help(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.shortcut_help.open && self.feedback_entry_available() {
+            self.close_shortcut_help(window, cx);
+            self.toggle_feedback_issue(None, window, cx);
+        }
+    }
+
     fn close_shortcut_help(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !self.shortcut_help.open {
             return;
@@ -206,7 +218,7 @@ impl Render for ShortcutHelpTooltip {
             .border_color(color(theme.colors.border_emphasis))
             .text_size(px(theme.typography.small_size))
             .text_color(color(theme.colors.text_primary))
-            .child("Show keyboard shortcuts (Cmd/Ctrl-/)")
+            .child("Show shortcuts and issue reporting (Cmd/Ctrl-/)")
     }
 }
 
@@ -600,6 +612,52 @@ pub(super) fn render(
                 .pb(px(theme.spacing.panel_padding))
                 .overflow_y_scroll()
                 .track_scroll(&browser.shortcut_help.scroll_handle)
+                .when(browser.feedback_entry_available(), |scroll| {
+                    scroll.child(
+                        div()
+                            .id("shortcut-help-report-issue")
+                            .debug_selector(|| "shortcut-help-report-issue".into())
+                            .mt(px(theme.spacing.panel_padding))
+                            .h(px(theme.spacing.control_height))
+                            .px(px(theme.spacing.control_gap))
+                            .flex()
+                            .flex_none()
+                            .items_center()
+                            .gap(px(theme.spacing.control_gap))
+                            .cursor_pointer()
+                            .bg(color(theme.colors.surface_overlay))
+                            .border(px(theme.spacing.border_width))
+                            .border_color(color(theme.colors.border))
+                            .rounded(px(4.0))
+                            .text_size(px(theme.typography.small_size))
+                            .text_color(color(theme.colors.text_primary))
+                            .hover(|style| style.bg(color(theme.colors.selection_hover_fill)))
+                            .active(|style| style.bg(color(theme.interaction.pressed_fill)))
+                            .on_click(cx.listener(|view, _: &ClickEvent, window, cx| {
+                                view.report_issue_from_shortcut_help(window, cx);
+                            }))
+                            .child(
+                                div()
+                                    .size(px(theme.typography.small_size + 4.0))
+                                    .flex()
+                                    .flex_none()
+                                    .items_center()
+                                    .justify_center()
+                                    .rounded_full()
+                                    .border(px(theme.spacing.border_width))
+                                    .border_color(color(theme.colors.text_muted))
+                                    .text_color(color(theme.colors.text_muted))
+                                    .child("!"),
+                            )
+                            .child("Report an issue")
+                            .child(div().flex_1())
+                            .child(
+                                div()
+                                    .text_color(color(theme.colors.text_muted))
+                                    .child("Shift-F1"),
+                            ),
+                    )
+                })
                 .child(
                     div()
                         .flex_none()

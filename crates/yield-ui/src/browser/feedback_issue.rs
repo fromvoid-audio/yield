@@ -288,6 +288,11 @@ impl FeedbackIssueState {
 }
 
 impl Browser {
+    /// Whether other settings or context controls allow the report to open.
+    pub(super) fn feedback_entry_available(&self) -> bool {
+        !self.theme_settings_open && !self.audio_settings_open && self.context_menu.is_none()
+    }
+
     /// Toggle the global feedback prompt while preserving focus.
     pub(super) fn toggle_feedback_issue(
         &mut self,
@@ -297,11 +302,7 @@ impl Browser {
     ) {
         if self.feedback_issue.open {
             self.close_feedback_issue(window, cx);
-        } else if !self.shortcut_help.is_open()
-            && !self.theme_settings_open
-            && !self.audio_settings_open
-            && self.context_menu.is_none()
-        {
+        } else if !self.shortcut_help.is_open() && self.feedback_entry_available() {
             self.feedback_issue.previous_focus = window.focused(cx);
             self.cancel_file_drag_with_window(window, cx);
             self.cancel_waveform_gestures(window, cx);
@@ -655,7 +656,11 @@ impl Browser {
             && !mods.control
             && !mods.alt
         {
-            self.toggle_feedback_issue(None, window, cx);
+            if self.shortcut_help.is_open() {
+                self.report_issue_from_shortcut_help(window, cx);
+            } else {
+                self.toggle_feedback_issue(None, window, cx);
+            }
             cx.stop_propagation();
             return true;
         }
