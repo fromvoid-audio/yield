@@ -24,9 +24,18 @@ staging charges or permit issuance to be replayed.
 This installs queue custody only. Qualified staged-object provenance, namespace
 allocation, effect entry, completion and durable settlement remain required by
 OPT-2216/2217/2218 and the tracking parents. Linux tests use genuine original
-read-only targets to prove command bytes cannot mint a grant. Supported macOS
-SDK compilation and execution of the genuine journal-issued positive handoff
-harness remain OPT-2325; Linux and Windows GNU checks do not execute that body.
+read-only targets to prove command bytes cannot mint a grant.
+
+The [macOS handoff check](https://pulse.iocore.dev/#/issues/1695) ran on
+macOS 26.6.2 (25G83), SDK 27.0, and the local APFS Data volume with Rust 1.93.0.
+The integration harness used an isolated writable profile with a registered
+Source, genuine native reserve and the original journal and file workers.
+Dropping the accepted reply retained the original grant. Exact duplicate
+requests returned the same `Unsupported` result, and a queued journal read
+observed the no-effect completion. Shutdown deferred retirement of the
+original receipt and retained its backing and charges. The harness establishes
+queue custody under native conditions. Positive publication and settlement
+remain separate.
 
 ## Original held staging observations (OPT-2340)
 
