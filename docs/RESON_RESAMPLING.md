@@ -118,14 +118,14 @@ filter holds the last in-range sample at that edge while keeping the original
 history available. The caller owns final retirement and may extend an endpoint
 before retirement without rebuilding the converter.
 
-The app uses this converter when prepared-tempo audition needs a different
-device rate. That path starts a new source for each prepared span and already
-requires a new audition for live edits. Prepared-tempo progress follows
-complete frames delivered to the device mixer and ignores the filter's
-read-ahead. Ordinary lazy playback also uses the converter for supported
-rate pairs. Its loop controller applies the endpoint to complete rendered
-frames, while span retargets use the existing lazy replacement path.
-In-memory live span edits still use the existing rate converter.
+The app uses this converter for prepared-tempo, ordinary lazy, and cached PCM
+audition at supported mismatched rates. The loop controller and progress
+follow complete frames delivered to the device mixer. A Loop-only change
+keeps the same source and filter. A seek or span change uses a new filter and
+the configured anti-click transition. Cached PCM restarts use the resolved
+audible source frame, so the prior filter's read-ahead cannot move the new
+start or enter the new filter. Matching-rate cached sources keep in-place
+span control. Ratios above 64:1 keep the existing routing path.
 
 ```sh
 scratch=$(mktemp -d)
