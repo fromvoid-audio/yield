@@ -5,6 +5,10 @@ use std::io::{self, Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpStream};
 use std::time::{Duration, Instant};
 
+mod observer;
+
+pub use observer::{LinkObservation, LinkObserver};
+
 const PORT: u16 = 17_000;
 const CONNECT_TIMEOUT: Duration = Duration::from_millis(200);
 const IO_TIMEOUT: Duration = Duration::from_millis(100);
