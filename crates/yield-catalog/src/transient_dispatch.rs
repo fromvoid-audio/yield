@@ -1,15 +1,12 @@
 //! One bounded transient request on the retained Catalog background worker.
 
+use super::source_content_digest::{MAX_PATH_BYTES, MAX_SOURCE_BYTES};
 use super::*;
 use yield_analysis::transients::{MAX_TRANSIENT_MARKERS, TransientPreset};
 use yield_library::sample_sources::readiness::{
     PendingSourceContentInput, PreparedSourceContentDigest, SourceFeatureInputError,
 };
 
-const MAX_SOURCE_BYTES: usize = 256;
-const MAX_PATH_BYTES: usize = 1024;
-const DIGEST_EVENT_BYTES: usize =
-    MAX_SOURCE_BYTES + 2 * MAX_PATH_BYTES + 512 + 64 + std::mem::size_of::<CatalogEvent>();
 pub(super) const MAX_RESULT_BYTES: usize = MAX_SOURCE_BYTES
     + MAX_PATH_BYTES
     + MAX_TRANSIENT_MARKERS * std::mem::size_of::<u32>()
@@ -92,6 +89,14 @@ impl SourceTransientRequest {
         self.relative_path.as_path()
     }
 
+    /// Check whether an enrichment belongs to this request's exact audited input.
+    pub fn matches_digest_scope(&self, scope: &SourceContentDigestScope) -> bool {
+        self.source_id == scope.source_id
+            && self.lifecycle_generation == scope.lifecycle_generation
+            && self.revision == scope.previous_revision
+            && self.relative_path == scope.relative_path
+    }
+
     /// Detector preset captured by the request.
     pub fn preset(&self) -> TransientPreset {
         self.preset
@@ -108,7 +113,8 @@ impl SourceTransientRequest {
     }
 
     pub(super) fn result_bytes(&self) -> usize {
-        MAX_RESULT_BYTES + usize::from(self.allow_pending_digest) * DIGEST_EVENT_BYTES
+        MAX_RESULT_BYTES
+            + usize::from(self.allow_pending_digest) * source_content_digest::EVENT_BYTES
     }
 }
 
@@ -456,43 +462,21 @@ fn commit_digest_and_retry(
     admission: &Arc<Mutex<AdmissionState>>,
 ) -> Result<PreparedTransientJob, TransientRequestFailure> {
     let request = &submission.request;
-    let snapshot = source
-        .snapshot
-        .as_mut()
-        .filter(|snapshot| {
-            snapshot.committed_revision == request.revision()
-                && snapshot.lifecycle_generation == request.lifecycle_generation()
-        })
-        .ok_or(TransientRequestFailure::StaleSource)?;
-    let index = snapshot
-        .manifest
-        .binary_search_by(|entry| entry.relative_path.as_path().cmp(request.relative_path()))
-        .map_err(|_| TransientRequestFailure::StaleSource)?;
-    let (revision, entry) = source
-        .database
-        .writer
-        .commit_pending_content_digest(digest, submission.cancellation.flag())
-        .map_err(TransientJobError::from)?;
-    snapshot.manifest[index] = entry.clone();
-    snapshot.committed_revision = revision.revision();
-    let mut digest_event = submission.reservation.split_read_event(DIGEST_EVENT_BYTES);
-    let published = publish_source_if_current(
-        admission,
-        &mut digest_event,
-        request.source_id(),
-        request.lifecycle_generation(),
-        None,
-        source,
-        CatalogEvent::SourceContentDigestCommitted {
-            request: request.clone(),
-            committed_revision: revision.revision(),
-            entry,
+    let revision = source_content_digest::commit(
+        SourceContentDigestScope {
+            source_id: request.source_id.clone(),
+            lifecycle_generation: request.lifecycle_generation,
+            previous_revision: request.revision,
+            relative_path: request.relative_path.clone(),
         },
-    );
-    digest_event.finish();
-    if !published {
-        return Err(TransientRequestFailure::StaleSource);
-    }
+        Some(request.request_id),
+        digest,
+        submission.cancellation.flag(),
+        source,
+        &mut submission.reservation,
+        admission,
+    )
+    .map_err(TransientJobError::from)?;
     Ok(prepare_transient_job(
         &source.database.writer,
         &revision,

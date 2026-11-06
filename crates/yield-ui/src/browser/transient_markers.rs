@@ -10,8 +10,9 @@ use yield_core::WaveformViewport;
 use yield_library::sample_sources::SourcePublicationFence;
 use yield_media::WaveformFileRevision;
 use yield_session::{
-    CatalogCommand, CatalogEvent, FeatureAnalysisCancellation, SourceTransientRequest,
-    TransientCacheUse, TransientMarkers, TransientPreset, TransientRequestFailure,
+    CatalogCommand, CatalogEvent, FeatureAnalysisCancellation, SourceContentDigestScope,
+    SourceTransientRequest, TransientCacheUse, TransientMarkers, TransientPreset,
+    TransientRequestFailure,
 };
 
 use super::{Browser, catalog};
@@ -228,12 +229,14 @@ pub(super) fn schedule(browser: &mut Browser, cx: &mut Context<Browser>) {
 
 pub(super) fn accept_digest_revision(
     browser: &mut Browser,
-    request: &SourceTransientRequest,
+    scope: &SourceContentDigestScope,
+    request_id: Option<u64>,
     revision: u64,
     cx: &mut Context<Browser>,
 ) {
     if let Some(active) = browser.transient_markers.active.as_mut()
-        && active.request == *request
+        && request_id == Some(active.request.request_id())
+        && active.request.matches_digest_scope(scope)
         && matches!(active.result, ResultState::Pending)
     {
         active.revision = revision;

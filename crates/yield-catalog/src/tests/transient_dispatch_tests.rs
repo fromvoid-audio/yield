@@ -269,7 +269,8 @@ mod fixtures {
             })
             .unwrap();
         let CatalogEvent::SourceContentDigestCommitted {
-            request: observed,
+            scope,
+            transient_request_id,
             committed_revision,
             entry,
         } = receive_until(&service, |event| {
@@ -278,7 +279,8 @@ mod fixtures {
         else {
             unreachable!()
         };
-        assert_eq!(observed, request);
+        assert!(request.matches_digest_scope(&scope));
+        assert_eq!(transient_request_id, Some(request.request_id()));
         assert_eq!(committed_revision, before.committed_revision + 1);
         assert_eq!(entry.relative_path, Path::new("attacks.wav"));
         assert!(entry.content_hash.is_some());
