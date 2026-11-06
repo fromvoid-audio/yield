@@ -37,19 +37,6 @@ fn resize_key(
     }
 }
 
-fn frames(region: WaveformPlayRegion, total: usize) -> Option<(usize, usize)> {
-    if total == 0 || !region.is_valid() {
-        return None;
-    }
-    let start = (region.start * total as f64)
-        .round()
-        .clamp(0.0, (total - 1) as f64) as usize;
-    let end = (region.end * total as f64)
-        .round()
-        .clamp((start + 1) as f64, total as f64) as usize;
-    Some((start, end))
-}
-
 fn resized(
     region: WaveformPlayRegion,
     total: usize,
@@ -57,7 +44,7 @@ fn resized(
     resize: Resize,
     anchor: Option<ResizeAnchor>,
 ) -> Option<(WaveformPlayRegion, ResizeAnchor)> {
-    let current = frames(region, total)?;
+    let current = region.frame_bounds(total)?;
     let width = current.1 - current.0;
     let requested = match resize {
         // An odd frame cannot be divided exactly; round down, bounded at one.
@@ -166,12 +153,12 @@ mod tests {
     fn frame_resize_preserves_midpoint_round_trip_and_shifts_at_boundaries() {
         let original = WaveformPlayRegion::new(0.4, 0.46).unwrap();
         let (half, anchor) = resized(original, 100, 1, Resize::Half, None).unwrap();
-        assert_eq!(frames(half, 100), Some((41, 44)));
+        assert_eq!(half.frame_bounds(100), Some((41, 44)));
         let (restored, _) = resized(half, 100, 1, Resize::Double, Some(anchor)).unwrap();
         assert_eq!(restored, original);
         // A different waveform generation must not reuse a half-frame anchor.
         let (fresh, _) = resized(half, 100, 2, Resize::Double, Some(anchor)).unwrap();
-        assert_eq!(frames(fresh, 100), Some((39, 45)));
+        assert_eq!(fresh.frame_bounds(100), Some((39, 45)));
         for (bounds, expected) in [
             ((0.0, 0.2), (0, 40)),
             ((0.8, 1.0), (60, 100)),
@@ -185,7 +172,7 @@ mod tests {
                 None,
             )
             .unwrap();
-            assert_eq!(frames(result, 100), Some(expected));
+            assert_eq!(result.frame_bounds(100), Some(expected));
         }
         let mut region = original;
         let mut anchor = None;
@@ -193,7 +180,7 @@ mod tests {
             region = next;
             anchor = Some(next_anchor);
         }
-        let (start, end) = frames(region, 100).unwrap();
+        let (start, end) = region.frame_bounds(100).unwrap();
         assert_eq!(end - start, 1);
         assert!(resized(region, 0, 1, Resize::Double, anchor).is_none());
     }
@@ -222,13 +209,13 @@ mod tests {
                 window.focus(&view.waveform_focus_handle);
                 view.handle_key_down(&event, window, cx);
                 assert_eq!(
-                    frames(view.waveform_play_region.unwrap(), 100),
+                    view.waveform_play_region.unwrap().frame_bounds(100),
                     Some((30, 50))
                 );
                 window.focus(&view.search_input.read(cx).focus_handle());
                 view.handle_key_down(&event, window, cx);
                 assert_eq!(
-                    frames(view.waveform_play_region.unwrap(), 100),
+                    view.waveform_play_region.unwrap().frame_bounds(100),
                     Some((30, 50))
                 );
                 window.focus(&view.waveform_focus_handle);
@@ -238,7 +225,7 @@ mod tests {
                 };
                 view.handle_key_down(&plain, window, cx);
                 assert_eq!(
-                    frames(view.waveform_play_region.unwrap(), 100),
+                    view.waveform_play_region.unwrap().frame_bounds(100),
                     Some((10, 30))
                 );
                 view.set_waveform_play_region(None);
