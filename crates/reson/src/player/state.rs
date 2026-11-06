@@ -195,6 +195,18 @@ impl AudioPlayer {
         }
     }
 
+    pub(super) fn set_prepared_tempo_samples(
+        &mut self,
+        path: PathBuf,
+        prepared: crate::PreparedTempoAudition,
+    ) {
+        let output_frames = prepared.frames.output_frames();
+        let duration = crate::timebase::frames_to_seconds(output_frames, prepared.sample_rate);
+        self.set_audio_file_with_metadata(path, duration, prepared.sample_rate, prepared.channels);
+        self.track_total_frames = Some(output_frames);
+        self.playback_samples = Some(prepared.samples);
+    }
+
     /// Probe a WAV file and store it as a lazy file-backed playback source.
     ///
     /// Playback runtime callers execute this method on the dedicated runtime

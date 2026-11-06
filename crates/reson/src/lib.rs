@@ -71,8 +71,8 @@ pub use player::{
     PlaybackRuntimeMode, PlaybackRuntimeProgress, PlaybackRuntimeReplacePolicy,
     PlaybackRuntimeRequest, PlaybackRuntimeSource, PlaybackRuntimeSpanUpdate,
     PlaybackRuntimeStarted, PlaybackRuntimeStreamPolicy, PlaybackRuntimeSubmitError,
-    PlaybackSeekBehavior, PlaybackSourceIdentity, PlaybackSourceKind, PlaybackSpanPlan,
-    PlaybackSpanPlanError, PlaybackSpanRequest,
+    PlaybackRuntimeTempoSpan, PlaybackSeekBehavior, PlaybackSourceIdentity, PlaybackSourceKind,
+    PlaybackSpanPlan, PlaybackSpanPlanError, PlaybackSpanRequest,
 };
 #[cfg(feature = "native-audio")]
 pub use recording::{AudioRecorder, InputMonitor, RecordingOutcome};

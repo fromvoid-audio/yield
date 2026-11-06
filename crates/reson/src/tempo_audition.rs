@@ -81,7 +81,7 @@ fn scale_frame(frame: u64, from: u64, to: u64) -> u64 {
 }
 
 /// Immutable interleaved PCM ready for playback at the original sample rate and channel layout.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct PreparedTempoAudition {
     /// Prepared samples in source channel order.
     pub samples: Arc<[f32]>,

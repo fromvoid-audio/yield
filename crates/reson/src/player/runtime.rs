@@ -20,6 +20,10 @@ use super::metronome::MetronomeMixOverride;
 use super::{AudioPlayer, EditFadeRange, PlaybackMetronomeConfig, PlaybackMetronomeMix};
 use crate::output::ResolvedOutput;
 
+mod tempo;
+pub use tempo::PlaybackRuntimeTempoSpan;
+use tempo::TempoPlaybackTimeline;
+
 #[cfg(all(test, target_os = "macos", feature = "native-audio"))]
 #[path = "../output/native_test_fixture.rs"]
 mod native_test_fixture;
@@ -125,6 +129,11 @@ pub enum PlaybackRuntimeSource {
         sample_rate: u32,
         channels: usize,
     },
+    /// Tempo-adjusted PCM with exact original-file coordinates.
+    ///
+    /// The request's mode selects one-shot or looped playback. Span and loop offset come from
+    /// this payload. Edit previews and source-anchored metronomes require the ordinary source.
+    PreparedTempo(PlaybackRuntimeTempoSpan),
     /// Raw little-endian interleaved f32 file with caller-provided timing metadata.
     InterleavedF32File {
         path: PathBuf,
@@ -181,6 +190,10 @@ impl PlaybackRuntimeSource {
                     sample_rate,
                     channels,
                 );
+                Ok(())
+            }
+            Self::PreparedTempo(tempo) => {
+                player.set_prepared_tempo_samples(tempo.original_path, tempo.prepared);
                 Ok(())
             }
             Self::InterleavedF32File {
@@ -628,6 +641,7 @@ impl PlaybackRuntime {
             AudioPlayerPlaybackExecutor {
                 player,
                 configured_metronome_beat_count: None,
+                tempo: None,
             },
             config,
             metronome_mix,
@@ -1177,6 +1191,7 @@ struct AudioPlayerPlaybackExecutor {
     // successful control-thread boundary. AudioPlayer's public readback stays
     // focused on live span controls, which lazy sources intentionally lack.
     configured_metronome_beat_count: Option<u16>,
+    tempo: Option<TempoPlaybackTimeline>,
 }
 
 impl PlaybackRuntimeExecutor for AudioPlayerPlaybackExecutor {
@@ -1187,6 +1202,20 @@ impl PlaybackRuntimeExecutor for AudioPlayerPlaybackExecutor {
         // A replacement attempt must not report a metronome configuration from
         // the previous playback lifetime if setup fails.
         self.configured_metronome_beat_count = None;
+        self.tempo = None;
+        let tempo_start = if let PlaybackRuntimeSource::PreparedTempo(tempo) = &request.source {
+            if request.edit_fade.is_some() || request.metronome.is_some() {
+                return Err(String::from(
+                    "Prepared tempo playback requires ordinary playback for edit previews or metronome",
+                ));
+            }
+            let plan = tempo
+                .playback_plan(request.mode)
+                .map_err(|error| error.to_string())?;
+            Some((tempo.timeline(), plan))
+        } else {
+            None
+        };
         let configured_metronome_beat_count = request.metronome.map(|config| config.beat_count());
         self.player
             .set_anti_clip_settings(request.anti_click_enabled, request.anti_click_fade_ms);
@@ -1201,11 +1230,19 @@ impl PlaybackRuntimeExecutor for AudioPlayerPlaybackExecutor {
         let output = self.player.output_details().clone();
         request.source.apply_to_player(&mut self.player)?;
         self.player.set_edit_fade_state(request.edit_fade);
-        let playback_start = request.mode.start_player(
-            &mut self.player,
-            request.replace_policy,
-            request.metronome,
-        )?;
+        let playback_start = if let Some((timeline, plan)) = tempo_start {
+            self.player
+                .play_prepared_tempo_span(plan, request.replace_policy)?;
+            let start = timeline.source_progress(plan.seek_offset_frames());
+            self.tempo = Some(timeline);
+            start
+        } else {
+            request.mode.start_player(
+                &mut self.player,
+                request.replace_policy,
+                request.metronome,
+            )?
+        };
         self.configured_metronome_beat_count = configured_metronome_beat_count;
         Ok(PlaybackRuntimeStartedData {
             output,
@@ -1216,10 +1253,16 @@ impl PlaybackRuntimeExecutor for AudioPlayerPlaybackExecutor {
     fn stop(&mut self) -> Result<(), String> {
         self.player.stop();
         self.configured_metronome_beat_count = None;
+        self.tempo = None;
         Ok(())
     }
 
     fn retarget_span(&mut self, update: PlaybackRuntimeSpanUpdate) -> Result<f32, String> {
+        if self.tempo.is_some() {
+            return Err(String::from(
+                "Prepared tempo playback requires a new span request",
+            ));
+        }
         let configured_metronome_beat_count = update.metronome.map(|config| config.beat_count());
         self.player
             .set_playback_gain(runtime_playback_gain_for_player(
@@ -1264,12 +1307,21 @@ impl PlaybackRuntimeExecutor for AudioPlayerPlaybackExecutor {
         gain: f32,
         normalization: Option<PlaybackRuntimeGainNormalization>,
     ) {
-        self.player
-            .set_playback_gain(runtime_playback_gain_for_player(
-                gain,
-                normalization,
-                &self.player,
-            ));
+        let gain = if let Some(timeline) = &self.tempo {
+            let normalized = normalization
+                .zip(self.player.playback_samples.as_ref())
+                .and_then(|(normalization, samples)| {
+                    timeline.normalized_gain(
+                        samples,
+                        usize::from(self.player.track_channels?),
+                        normalization,
+                    )
+                });
+            sanitize_playback_gain(gain * normalized.unwrap_or(1.0))
+        } else {
+            runtime_playback_gain_for_player(gain, normalization, &self.player)
+        };
+        self.player.set_playback_gain(gain);
     }
 
     fn progress(&mut self) -> PlaybackRuntimeProgress {
@@ -1284,7 +1336,7 @@ impl PlaybackRuntimeExecutor for AudioPlayerPlaybackExecutor {
             self.configured_metronome_beat_count = None;
             (None, None, None)
         };
-        PlaybackRuntimeProgress {
+        let mut progress = PlaybackRuntimeProgress {
             active,
             elapsed: self.player.playback_elapsed(),
             looping: self.player.is_looping(),
@@ -1295,7 +1347,11 @@ impl PlaybackRuntimeExecutor for AudioPlayerPlaybackExecutor {
             configured_span_request_id: None,
             metronome_beat_count,
             playback_request_id: None,
+        };
+        if let Some(timeline) = &self.tempo {
+            timeline.apply_progress(&mut progress, self.player.progress_frame());
         }
+        progress
     }
 }
 
@@ -1891,6 +1947,11 @@ fn normalized_gain_for_runtime_source(
             normalization.start,
             normalization.end,
         ),
+        PlaybackRuntimeSource::PreparedTempo(tempo) => tempo.timeline().normalized_gain(
+            &tempo.prepared.samples,
+            tempo.prepared.channels,
+            normalization,
+        ),
         PlaybackRuntimeSource::InterleavedF32File {
             path,
             sample_count,
@@ -2099,6 +2160,7 @@ mod tests {
         let mut executor = AudioPlayerPlaybackExecutor {
             player,
             configured_metronome_beat_count: None,
+            tempo: None,
         };
 
         let root = tempfile::tempdir().expect("temporary WAV root");
@@ -2443,6 +2505,7 @@ mod tests {
         let mut executor = AudioPlayerPlaybackExecutor {
             player: default_player,
             configured_metronome_beat_count: None,
+            tempo: None,
         };
         let teardown_complete = executor.player.native_stream_teardown_complete();
         guard.track_stream_teardown(Arc::clone(&teardown_complete));
