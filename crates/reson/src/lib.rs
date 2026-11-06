@@ -37,6 +37,8 @@ mod source;
 mod telemetry;
 #[cfg(feature = "native-audio")]
 mod tempo_audition;
+#[cfg(feature = "native-audio")]
+mod tempo_wav;
 #[cfg(test)]
 mod test_support;
 #[cfg(feature = "native-audio")]
@@ -80,6 +82,8 @@ pub use tempo_audition::{
     PreparedTempoAudition, TempoAuditionFrameMap, TempoAuditionSkip, TempoAuditionTarget,
     prepare_tempo_audition,
 };
+#[cfg(feature = "native-audio")]
+pub use tempo_wav::{TempoWavReadError, TempoWavSpan, read_tempo_wav_span};
 #[cfg(feature = "native-audio")]
 pub use time_stretch::{
     MAX_TEMPO_INPUT_SAMPLES, MAX_TEMPO_SPAN_SECONDS, PreparedTempoStretch, StretchPreparationError,
