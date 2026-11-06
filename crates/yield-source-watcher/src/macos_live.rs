@@ -20,8 +20,10 @@ use crate::replay::macos::KNOWN_FLAGS;
 use crate::{SourceWatchSpec, WatchHintEvidence, WatcherSignal, is_ignored_file_name};
 
 mod helper;
+mod process;
 
 pub use helper::{HELPER_POLL, HELPER_READY_V1, decode_helper_hint, serve_live_watcher};
+pub use process::MacosWatcherProcess;
 
 const MAX_CALLBACK_EVENTS: usize = 256;
 const MAX_PATH_BYTES: usize = libc::PATH_MAX as usize;
