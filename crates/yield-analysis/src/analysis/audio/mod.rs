@@ -6,7 +6,7 @@ mod exact_duplicates;
 mod normalize;
 mod resample;
 mod silence;
-mod wav_pcm;
+pub(crate) mod wav_pcm;
 pub use wav_pcm::{WavPcm, decode_wav_pcm};
 
 /// Fixed sample rate used during analysis.
