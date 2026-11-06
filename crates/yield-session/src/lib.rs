@@ -676,15 +676,16 @@ impl SourceRegistryService {
         Self::start_inner_with_initialization_gate(
             app_root_override,
             None,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             false,
         )
     }
 
     /// Start a portable metadata/catalog fixture with real profile/SQLite ownership but no reserve.
-    /// This seam is compiled only in this crate's tests; normal startup remains qualified.
-    #[cfg(test)]
-    fn start_portable_registry_for_test(app_root: PathBuf) -> Result<Self, StartError> {
+    /// Normal app startup still requires the qualified journal owner.
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn start_portable_registry_for_test(app_root: PathBuf) -> Result<Self, StartError> {
         Self::start_inner_with_initialization_gate(Some(app_root), None, true)
     }
 
@@ -700,7 +701,7 @@ impl SourceRegistryService {
     fn start_inner_with_initialization_gate(
         app_root_override: Option<PathBuf>,
         initialization_gate: Option<Arc<std::sync::Barrier>>,
-        #[cfg(test)] portable_registry_fixture: bool,
+        #[cfg(any(test, feature = "test-support"))] portable_registry_fixture: bool,
     ) -> Result<Self, StartError> {
         let (command_tx, command_rx) = mpsc::sync_channel(SESSION_COMMAND_CAPACITY);
         let (event_tx, event_rx) = mpsc::channel();
@@ -723,7 +724,7 @@ impl SourceRegistryService {
                     worker_vocabulary,
                     worker_maintenance_admission,
                     initialization_gate,
-                    #[cfg(test)]
+                    #[cfg(any(test, feature = "test-support"))]
                     portable_registry_fixture,
                 )
             })
@@ -1215,9 +1216,9 @@ impl Persistence {
         catalog_slot: Arc<Mutex<CatalogSlot>>,
         vocabulary_slot: Arc<Mutex<VocabularySlot>>,
         maintenance_admission: Arc<MaintenanceAdmission>,
-        #[cfg(test)] portable_registry_fixture: bool,
+        #[cfg(any(test, feature = "test-support"))] portable_registry_fixture: bool,
     ) -> (Self, Option<AppRootGuard>, PersistenceProfileGuard) {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         let fixture_registry = app_root_override
             .as_ref()
             .filter(|_| !portable_registry_fixture)
@@ -1255,7 +1256,7 @@ impl Persistence {
             },
             None => None,
         };
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         if persistence.unavailable.is_none() {
             if let Some(registry) = fixture_registry.as_ref() {
                 if let Err(error) = std::fs::create_dir_all(registry) {
@@ -1269,7 +1270,7 @@ impl Persistence {
             match WritableProfileGuard::acquire_current() {
                 Ok(writable) => match open_session_journal(&writable) {
                     Ok(journal) => match {
-                        #[cfg(test)]
+                        #[cfg(any(test, feature = "test-support"))]
                         {
                             if portable_registry_fixture {
                                 OperationJournalOwner::start_without_capacity_for_test(journal)
@@ -1284,7 +1285,7 @@ impl Persistence {
                                 }
                             }
                         }
-                        #[cfg(not(test))]
+                        #[cfg(not(any(test, feature = "test-support")))]
                         {
                             OperationJournalOwner::start(journal)
                         }
@@ -1528,7 +1529,7 @@ fn run_worker(
     vocabulary_slot: Arc<Mutex<VocabularySlot>>,
     maintenance_admission: Arc<MaintenanceAdmission>,
     initialization_gate: Option<Arc<std::sync::Barrier>>,
-    #[cfg(test)] portable_registry_fixture: bool,
+    #[cfg(any(test, feature = "test-support"))] portable_registry_fixture: bool,
 ) -> Result<(), SessionError> {
     if let Some(initialization_gate) = initialization_gate {
         initialization_gate.wait();
@@ -1538,7 +1539,7 @@ fn run_worker(
         Arc::clone(&catalog_slot),
         Arc::clone(&vocabulary_slot),
         maintenance_admission,
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         portable_registry_fixture,
     );
     let mut coordinator = Coordinator::new();

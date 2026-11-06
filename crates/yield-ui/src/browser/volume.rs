@@ -59,6 +59,29 @@ fn trace_volume_drag(stage: &str, position: Option<Point<Pixels>>, bounds: Optio
 pub(super) struct VolumeDrag {
     bounds: Bounds<Pixels>,
     initial: f32,
+    target: VolumeTarget,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum VolumeTarget {
+    Audition,
+    Metronome,
+}
+
+impl VolumeTarget {
+    fn value(self, browser: &Browser) -> f32 {
+        match self {
+            Self::Audition => browser.volume,
+            Self::Metronome => browser.metronome_settings.mix.volume,
+        }
+    }
+
+    fn set(self, browser: &mut Browser, value: f32, cx: &mut Context<Browser>) {
+        match self {
+            Self::Audition => browser.set_volume(value, cx),
+            Self::Metronome => browser.set_metronome_volume(value, cx),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -96,7 +119,7 @@ fn volume_for_position(position: Point<Pixels>, bounds: Bounds<Pixels>) -> Optio
     Some(quantize_volume(((x - left) / width).clamp(0.0, 1.0)))
 }
 
-fn keyboard_volume(value: f32, key: &str, precise: bool) -> Option<f32> {
+pub(super) fn keyboard_volume(value: f32, key: &str, precise: bool) -> Option<f32> {
     let value = sanitize_volume(value);
     let step = if precise { 0.01 } else { KEYBOARD_STEP };
     let candidate = match key {
@@ -120,9 +143,43 @@ pub(super) fn render_slider(
     theme: yield_design::Theme,
     cx: &mut Context<Browser>,
 ) -> impl IntoElement {
+    render_volume(VolumeTarget::Audition, browser, theme, cx)
+}
+
+/// Render the same audio-level slider for the independent metronome level.
+pub(super) fn render_metronome_slider(
+    browser: &Browser,
+    theme: yield_design::Theme,
+    cx: &mut Context<Browser>,
+) -> impl IntoElement {
+    render_volume(VolumeTarget::Metronome, browser, theme, cx)
+}
+
+fn render_volume(
+    target: VolumeTarget,
+    browser: &Browser,
+    theme: yield_design::Theme,
+    cx: &mut Context<Browser>,
+) -> impl IntoElement {
     let bounds = Rc::new(RefCell::new(None));
     let editable = browser.preferences_editable();
-    let value = quantize_volume(browser.volume);
+    let value = quantize_volume(target.value(browser));
+    let (id, ax_id, group, label, focus) = match target {
+        VolumeTarget::Audition => (
+            "volume-slider",
+            "transport-volume",
+            "volume-control",
+            "VOL",
+            &browser.volume_focus_handle,
+        ),
+        VolumeTarget::Metronome => (
+            super::metronome_settings::VOLUME,
+            super::metronome_settings::VOLUME,
+            "metronome-volume-control",
+            "Volume",
+            &browser.metronome_settings.volume_focus,
+        ),
+    };
     let track_color = if editable {
         theme.colors.control_disabled_fill
     } else {
@@ -137,15 +194,16 @@ pub(super) fn render_slider(
     let focus_width = theme.interaction.focus_outline_width;
     let slider_bounds = Rc::clone(&bounds);
     let mut slider = div()
-        .id("volume-slider")
-        .when_some(browser.ax_marker("transport-volume"), |element, marker| {
+        .id(id)
+        .debug_selector(move || id.to_owned())
+        .when_some(browser.ax_marker(ax_id), |element, marker| {
             element.child(marker)
         })
         .relative()
         .flex_none()
         .w(px(SLIDER_WIDTH))
         .h(px(SLIDER_HEIGHT))
-        .track_focus(&browser.volume_focus_handle)
+        .track_focus(focus)
         .focus(move |style| style.border(px(focus_width)).border_color(focus_color))
         .child(
             div()
@@ -190,13 +248,16 @@ pub(super) fn render_slider(
                     // transparent toolbar can also start a window move on macOS.
                     window.prevent_default();
                     cx.stop_propagation();
-                    window.focus(&view.volume_focus_handle);
+                    window.focus(match target {
+                        VolumeTarget::Audition => &view.volume_focus_handle,
+                        VolumeTarget::Metronome => &view.metronome_settings.volume_focus,
+                    });
                     let bounds = bounds_for_down.borrow().as_ref().copied();
                     trace_volume_drag("mouse-down", Some(event.position), bounds);
                     let Some(bounds) = bounds else {
                         return;
                     };
-                    view.begin_volume_drag(event.position, bounds, cx);
+                    view.begin_volume_drag(target, event.position, bounds, cx);
                 }),
             )
             .on_drag(VolumeDragToken, |_, _, _, cx| cx.new(|_| VolumeDragGhost))
@@ -220,7 +281,7 @@ pub(super) fn render_slider(
     }
 
     div()
-        .id("volume-control")
+        .id(group)
         .flex()
         .flex_none()
         .items_center()
@@ -232,7 +293,7 @@ pub(super) fn render_slider(
         } else {
             color(theme.colors.text_disabled)
         })
-        .child("VOL")
+        .child(label)
         .child(slider)
 }
 
@@ -256,6 +317,7 @@ impl Browser {
 
     fn begin_volume_drag(
         &mut self,
+        target: VolumeTarget,
         position: Point<Pixels>,
         bounds: Bounds<Pixels>,
         cx: &mut Context<Self>,
@@ -267,7 +329,8 @@ impl Browser {
         }
         self.volume_drag = Some(VolumeDrag {
             bounds,
-            initial: self.volume,
+            initial: target.value(self),
+            target,
         });
         self.update_volume_drag(position, cx);
     }
@@ -280,7 +343,7 @@ impl Browser {
         let Some(value) = volume_for_position(position, drag.bounds) else {
             return;
         };
-        self.set_volume(value, cx);
+        drag.target.set(self, value, cx);
     }
 
     fn finish_volume_drag(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
@@ -289,7 +352,7 @@ impl Browser {
         };
         trace_volume_drag("finish", Some(position), Some(drag.bounds));
         if let Some(value) = volume_for_position(position, drag.bounds) {
-            self.set_volume(value, cx);
+            drag.target.set(self, value, cx);
         }
         cx.notify();
     }
@@ -304,8 +367,8 @@ impl Browser {
         };
         trace_volume_drag("cancel", None, Some(drag.bounds));
         cx.stop_active_drag(window);
-        if (self.volume - drag.initial).abs() > f32::EPSILON {
-            self.set_volume(drag.initial, cx);
+        if (drag.target.value(self) - drag.initial).abs() > f32::EPSILON {
+            drag.target.set(self, drag.initial, cx);
         }
         true
     }

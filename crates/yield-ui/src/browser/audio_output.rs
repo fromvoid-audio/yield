@@ -1000,6 +1000,7 @@ impl Browser {
                     "Audio output ready".to_string()
                 });
                 self.playback = Some(opened.runtime);
+                self.sync_runtime_metronome();
                 self.retry_runtime_volume();
                 if self.audio_output_dirty {
                     let preferences = audio_preferences_from_config(&config);
