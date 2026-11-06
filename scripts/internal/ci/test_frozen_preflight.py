@@ -1,4 +1,4 @@
-"""Contract checks for the single coordinator-owned preflight checkout."""
+"""Contract checks for the coordinator-owned frozen validation checkout."""
 
 import argparse
 from contextlib import contextmanager, redirect_stdout
@@ -95,6 +95,104 @@ class FrozenPreflightTests(unittest.TestCase):
                 self.assertEqual(how, "temporary")
                 self.assertIn("hidden", reason)
             self.assertEqual((cached / "source.txt").read_text(), "hidden change\n")
+
+    def test_native_reuses_only_commits_with_redirected_evidence(self):
+        with self.fixture() as (repo, _):
+            runner = MODULE.native_check_route("prerequisite:startup-production").runner
+            script = repo / runner
+            script.parent.mkdir(parents=True)
+            script.write_text("OUTPUT_DIR=artifacts/legacy\n")
+            self.git("add", runner)
+            self.git("commit", "-m", "Legacy native runner")
+            legacy = self.git("rev-parse", "HEAD")
+            script.write_text('OUTPUT_DIR="${YIELD_NATIVE_VERIFICATION_OUTPUT:-artifacts/legacy}"\n')
+            self.git("commit", "-am", "Redirect native evidence")
+            current = self.git("rev-parse", "HEAD")
+
+            with MODULE.common_coordinator() as state_dir:
+                with MODULE.validation_worktree(current, state_dir, "native", runner) as (path, how, warning):
+                    self.assertEqual((how, warning), ("created", None))
+                    lease = path.parent / "active"
+                    self.assertTrue(lease.is_file())
+                self.assertFalse(lease.exists())
+
+                with self.assertRaisesRegex(RuntimeError, "failed native case"):
+                    with MODULE.validation_worktree(current, state_dir, "native", runner) as reopened:
+                        self.assertEqual(reopened, (path, "reused", None))
+                        self.assertTrue(lease.is_file())
+                        raise RuntimeError("failed native case")
+                self.assertFalse(lease.exists())
+
+                (repo / "source.txt").write_text("new exact source\n")
+                self.git("commit", "-am", "Advance native source")
+                latest = self.git("rev-parse", "HEAD")
+                with MODULE.validation_worktree(latest, state_dir, "native", runner) as advanced:
+                    self.assertEqual(advanced, (path, "updated", None))
+                    self.assertEqual(self.git("rev-parse", "HEAD", cwd=path), latest)
+
+                with MODULE.validation_worktree(legacy, state_dir, "native", runner) as (temporary, how, reason):
+                    self.assertNotEqual(temporary, path)
+                    self.assertEqual(how, "temporary")
+                    self.assertIn("out-of-checkout evidence", reason)
+                    self.assertEqual(self.git("rev-parse", "HEAD", cwd=temporary), legacy)
+                self.assertFalse(temporary.exists())
+                self.assertEqual(self.git("rev-parse", "HEAD", cwd=path), latest)
+
+    def test_reused_native_checkout_keeps_fresh_failure_evidence_outside_the_lease(self):
+        with self.fixture() as (repo, _):
+            case = "prerequisite:startup-production"
+            runner = repo / MODULE.native_check_route(case).runner
+            runner.parent.mkdir(parents=True)
+            runner.write_text('OUTPUT_DIR="${YIELD_NATIVE_VERIFICATION_OUTPUT:-artifacts/legacy}"\n')
+            self.git("add", ".")
+            self.git("commit", "-m", "Redirect native evidence")
+            sha = self.git("rev-parse", "HEAD")
+            args = argparse.Namespace(sha=sha, lane="native", case=case)
+
+            def prepare(_namespace, *, artifact):
+                return (
+                    {"transaction": "native-reuse-fixture", "artifact": artifact},
+                    os.open(os.devnull, os.O_RDWR),
+                    os.open(os.devnull, os.O_RDWR),
+                )
+
+            def run_validator(_command, *, cwd, env, **_kwargs):
+                self.assertTrue((cwd.parent / "active").is_file())
+                evidence = pathlib.Path(env["YIELD_NATIVE_VERIFICATION_OUTPUT"])
+                self.assertFalse(evidence.is_relative_to(cwd))
+                self.assertFalse(evidence.exists())
+                evidence.mkdir()
+                (evidence / "native.log").write_text("fresh fixture evidence\n")
+                return 17
+
+            results = []
+            with (
+                mock.patch.object(MODULE, "require_maintenance_protocol"),
+                mock.patch.object(MODULE, "doctor", return_value={}),
+                mock.patch.object(MODULE, "cargo_env", return_value={}),
+                mock.patch.object(MODULE, "run_managed", side_effect=run_validator),
+                mock.patch.object(MODULE.local_state, "prepare_clean_launch", side_effect=prepare),
+                mock.patch.object(
+                    MODULE.local_state, "convert_clean_handoff_to_validator_lease",
+                    side_effect=lambda _namespace, namespace_fd, _transition_fd: namespace_fd,
+                ),
+                mock.patch.object(MODULE.local_state, "restore", return_value={"restored": True}),
+                mock.patch.dict(MODULE.os.environ, {"YIELD_CONFIG_HOME": "", "YIELD_CONFIG_PROFILE": ""}),
+            ):
+                for _ in range(2):
+                    output = io.StringIO()
+                    with redirect_stdout(output), self.assertRaisesRegex(MODULE.CiError, "native lane failed"):
+                        MODULE.check(args)
+                    results.append(json.loads(output.getvalue()))
+
+            self.assertEqual([r["checkout"]["disposition"] for r in results], ["created", "reused"])
+            self.assertEqual(results[0]["checkout"]["path"], results[1]["checkout"]["path"])
+            self.assertNotEqual(results[0]["evidence_directory"], results[1]["evidence_directory"])
+            for result in results:
+                self.assertEqual(result["status"], "failed")
+                self.assertTrue(result["production_state_restore"]["restored"])
+                self.assertTrue((pathlib.Path(result["evidence_directory"]) / "native.log").is_file())
+            self.assertFalse((pathlib.Path(results[0]["checkout"]["path"]).parent / "active").exists())
 
     def test_unconfirmed_cleanup_preserves_the_lease_and_forces_a_fresh_checkout(self):
         with self.fixture() as (_, sha), MODULE.common_coordinator() as state_dir:

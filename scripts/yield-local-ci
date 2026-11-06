@@ -22,7 +22,7 @@ import sys
 import tempfile
 import time
 import uuid
-from typing import Iterator, Optional, TextIO
+from typing import Iterator, NamedTuple, Optional, TextIO
 
 if sys.version_info < (3, 11):
     for candidate in ("python3.13", "python3.12", "python3.11"):
@@ -81,6 +81,7 @@ COORDINATOR_FD: Optional[int] = None
 FROZEN_PREFLIGHT_BRANCH = "codex/local-ci-frozen-preflight"
 FROZEN_PREFLIGHT_SLOT = "frozen-preflight"
 NATIVE_EVIDENCE_OUTPUT = "YIELD_NATIVE_VERIFICATION_OUTPUT"
+NATIVE_EVIDENCE_REDIRECT_MARKER = "${" + NATIVE_EVIDENCE_OUTPUT + ":-"
 ADMISSION_MARKER = b"YIELD_ADMISSION_PROTOCOL_V1"
 # A full check can contain the runner's 40-second nested-validator cleanup.
 MANAGED_COMMAND_TERMINATION_GRACE_SECONDS = (40.0, 10.0, 5.0)
@@ -516,10 +517,16 @@ def prepare_frozen_preflight(sha: str, state_dir: pathlib.Path) -> tuple[pathlib
 
 @contextlib.contextmanager
 def validation_worktree(
-    sha: str, state_dir: pathlib.Path, lane: str
+    sha: str, state_dir: pathlib.Path, lane: str, native_runner: Optional[str] = None,
 ) -> Iterator[tuple[pathlib.Path, str, Optional[str]]]:
     rejected = None
-    if lane == "preflight":
+    reusable = lane == "preflight"
+    if lane == "native" and native_runner is not None:
+        runner_source = command_output("git", "show", f"{sha}:{native_runner}", required=False)
+        reusable = NATIVE_EVIDENCE_REDIRECT_MARKER in runner_source
+        if not reusable:
+            rejected = "native runner lacks out-of-checkout evidence support at this commit"
+    if reusable:
         try:
             checkout, disposition = prepare_frozen_preflight(sha, state_dir)
             lease = checkout.parent / "active"
@@ -639,6 +646,54 @@ def run_namespace_failure_aggregate(sha: str) -> None:
         )
 
 
+class NativeCheckRoute(NamedTuple):
+    runner: str
+    legacy_evidence: str
+    environment: dict[str, str]
+
+
+def native_check_route(case: str) -> NativeCheckRoute:
+    directory = "scripts/internal/validation"
+    recording_cases = {
+        "operation_journal::owner::recording_binding::tests::recording_custody_native_production_original_slot_currentness_and_drain",
+        "operation_journal::owner::recording_binding::tests::recording_custody_native_production_lost_reply_keeps_original_slot_and_credit",
+        "operation_journal::owner::recording_binding::tests::chunk_issuance_native_production_original_claim_transition_and_retained_backing",
+    }
+    if case in recording_cases:
+        return NativeCheckRoute(
+            f"{directory}/verify_recording_native_custody.sh",
+            "artifacts/recording-native-custody",
+            {"YIELD_NATIVE_CUSTODY_CASE": case},
+        )
+    if case == "catalog-replay":
+        return NativeCheckRoute(
+            f"{directory}/verify_macos_catalog_native_replay.sh", "artifacts/macos-catalog-native-replay", {},
+        )
+    if case == "audition-coreaudio":
+        return NativeCheckRoute(
+            f"{directory}/verify_macos_audition_coreaudio.sh", "artifacts/macos-audition-coreaudio", {},
+        )
+    prefix, _, prerequisite = case.partition(":")
+    if prefix != "prerequisite" or prerequisite not in {
+        "profile-generations",
+        "source-release-policy",
+        "source-registration-generation",
+        "registered-retirement-inventory",
+        "startup-production",
+        "startup-control-failure",
+        "startup-namespace-failure",
+        "startup-namespace-receive-failure",
+        "startup-namespace-poll-failure",
+        "sdk-and-startup-components",
+    }:
+        raise CiError("native case is not in an existing exact-selector or named-runner allowlist")
+    return NativeCheckRoute(
+        f"{directory}/verify_native_prerequisites.sh",
+        f"artifacts/native-prerequisites/macos-{prerequisite}",
+        {"YIELD_NATIVE_PREREQUISITE_CASE": prerequisite},
+    )
+
+
 def _check(args: argparse.Namespace) -> None:
     sha = source_sha(args.sha)
     if args.lane == "native" and not args.case:
@@ -652,9 +707,12 @@ def _check(args: argparse.Namespace) -> None:
                 "audition-coreaudio requires inherited YIELD_TEST_AUDIO_OUTPUT=1; "
                 "opt in explicitly before any clean-state preparation"
             )
+    native_route = native_check_route(args.case) if args.lane == "native" else None
     with (
         common_coordinator() as state_dir,
-        validation_worktree(sha, state_dir, args.lane) as (checkout, disposition, cache_rejection),
+        validation_worktree(
+            sha, state_dir, args.lane, native_route.runner if native_route else None,
+        ) as (checkout, disposition, cache_rejection),
     ):
         cached_identity = (
             frozen_checkout_identity(checkout, sha) if disposition != "temporary" else None
@@ -684,49 +742,17 @@ def _check(args: argparse.Namespace) -> None:
         elif args.lane == "full":
             commands = [["bash", "scripts/agent.sh", "preflight"], ["bash", "scripts/gpui-local-ci.sh", "full"]]
         else:
-            recording_cases = {
-                "operation_journal::owner::recording_binding::tests::recording_custody_native_production_original_slot_currentness_and_drain",
-                "operation_journal::owner::recording_binding::tests::recording_custody_native_production_lost_reply_keeps_original_slot_and_credit",
-                "operation_journal::owner::recording_binding::tests::chunk_issuance_native_production_original_claim_transition_and_retained_backing",
-            }
-            prerequisite_cases = {
-                "profile-generations",
-                "source-release-policy",
-                "source-registration-generation",
-                "registered-retirement-inventory",
-                "startup-production",
-                "startup-control-failure",
-                "startup-namespace-failure",
-                "startup-namespace-receive-failure",
-                "startup-namespace-poll-failure",
-                "sdk-and-startup-components",
-            }
-            if args.case not in recording_cases and args.case not in {"catalog-replay", "audition-coreaudio"}:
-                prefix, separator, name = args.case.partition(":")
-                if prefix != "prerequisite" or not separator or name not in prerequisite_cases:
-                    raise CiError("native case is not in an existing exact-selector or named-runner allowlist")
             if os.environ.get("YIELD_CONFIG_HOME") or os.environ.get("YIELD_CONFIG_PROFILE"):
                 raise CiError("clear YIELD_CONFIG_HOME and YIELD_CONFIG_PROFILE; native production acceptance requires the canonical namespace")
-            if args.case in recording_cases:
-                runner = checkout / "scripts/internal/validation/verify_recording_native_custody.sh"
-                env["YIELD_NATIVE_CUSTODY_CASE"] = args.case
-                evidence_source = checkout / "artifacts/recording-native-custody"
-            elif args.case == "catalog-replay":
-                runner = checkout / "scripts/internal/validation/verify_macos_catalog_native_replay.sh"
-                evidence_source = checkout / "artifacts/macos-catalog-native-replay"
-            elif args.case == "audition-coreaudio":
-                runner = checkout / "scripts/internal/validation/verify_macos_audition_coreaudio.sh"
-                evidence_source = checkout / "artifacts/macos-audition-coreaudio"
-            else:
-                _, _, prerequisite = args.case.partition(":")
-                runner = checkout / "scripts/internal/validation/verify_native_prerequisites.sh"
-                env["YIELD_NATIVE_PREREQUISITE_CASE"] = prerequisite
-                evidence_source = checkout / "artifacts/native-prerequisites" / f"macos-{prerequisite}"
+            assert native_route is not None
+            runner = checkout / native_route.runner
+            evidence_source = checkout / native_route.legacy_evidence
+            env.update(native_route.environment)
             if not runner.is_file():
                 raise CiError(f"frozen source lacks the allowlisted native validation runner: {runner.relative_to(checkout)}")
-            # Older exact commits still write their original in-checkout artifacts.
-            redirect_marker = ("${" + NATIVE_EVIDENCE_OUTPUT + ":-").encode("ascii")
-            redirected_evidence = redirect_marker in runner.read_bytes()
+            redirected_evidence = NATIVE_EVIDENCE_REDIRECT_MARKER.encode("ascii") in runner.read_bytes()
+            if cached_identity is not None and not redirected_evidence:
+                raise CiError("native evidence redirection changed after frozen checkout validation")
             if redirected_evidence:
                 evidence_source = retained_evidence
                 env[NATIVE_EVIDENCE_OUTPUT] = str(retained_evidence)
@@ -810,7 +836,7 @@ def _check(args: argparse.Namespace) -> None:
                     details["status"] = "passed"
                 if cached_identity is not None:
                     if frozen_checkout_identity(checkout, sha) != cached_identity:
-                        raise CiError("frozen checkout filesystem identity changed during preflight")
+                        raise CiError("frozen checkout filesystem identity changed during validation")
                     verify_frozen_checkout(state_dir, checkout, sha)
                 if evidence_source is not None and (
                     redirected_evidence or details.get("status") == "passed" or args.case == "audition-coreaudio"
