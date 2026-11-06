@@ -6,7 +6,9 @@ mod fade;
 mod limit;
 mod output_adapter;
 mod repeat;
+mod resample_kernel;
 mod samples_buffer;
+mod streaming_resampler;
 
 use crate::timebase::duration_to_samples_floor;
 use std::time::Duration;
@@ -14,7 +16,7 @@ use std::time::Duration;
 pub use self::buffered::Buffered;
 pub use self::fade::FadeIn;
 pub use self::limit::{TakeDuration, TakeSamples};
-pub(crate) use self::output_adapter::{OutputAdapter, StereoOutputPair};
+pub(crate) use self::output_adapter::{BandLimitedOutputAdapter, OutputAdapter, StereoOutputPair};
 pub use self::repeat::RepeatInfinite;
 pub use self::samples_buffer::SamplesBuffer;
 

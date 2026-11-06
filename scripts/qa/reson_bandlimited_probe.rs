@@ -97,6 +97,7 @@ fn main() {
             *rendering = start.elapsed().as_secs_f64() * 1_000.0;
             assert_eq!(count, target_rate);
             assert_eq!(stream.next_source_position(), (u64::from(source_rate), 0));
+            assert_eq!(stream.input().len(), 0);
         }
         prep.sort_by(f64::total_cmp);
         cpu.sort_by(f64::total_cmp);
