@@ -1,6 +1,7 @@
 //! Output-format adapter for playback sources.
 
 use super::Source;
+use super::streaming_resampler::StreamingResampler;
 use std::time::Duration;
 
 /// Identifies an interleaved stereo output pair by its zero-based pair index.
@@ -218,6 +219,109 @@ where
 
     fn last_error(&self) -> Option<String> {
         self.inner.last_error()
+    }
+}
+
+/// Route a filtered stereo program to the requested device channels.
+pub(crate) struct BandLimitedOutputAdapter<S> {
+    stream: StreamingResampler<ProgramFrames<S>>,
+    target_rate: u32,
+    target_channels: usize,
+    output_pair: StereoOutputPair,
+    pending: [f32; 2],
+    pending_index: usize,
+}
+
+impl<S: Source> BandLimitedOutputAdapter<S> {
+    pub(crate) fn new(
+        source: S,
+        target_rate: u32,
+        target_channels: u16,
+        output_pair: StereoOutputPair,
+    ) -> Option<Self> {
+        let target_rate = target_rate.max(1);
+        let target_channels = usize::from(target_channels.max(1));
+        let source_rate = source.sample_rate();
+        let frames = ProgramFrames {
+            frame: vec![0.0; usize::from(source.channels().max(1))],
+            source,
+            fold_to_mono: target_channels == 1,
+        };
+        Some(Self {
+            stream: StreamingResampler::new(frames, source_rate, target_rate)?,
+            target_rate,
+            target_channels,
+            output_pair: output_pair.for_output_channels(target_channels),
+            pending: [0.0; 2],
+            pending_index: target_channels,
+        })
+    }
+}
+
+impl<S: Source> Iterator for BandLimitedOutputAdapter<S> {
+    type Item = f32;
+
+    fn next(&mut self) -> Option<f32> {
+        if self.pending_index == self.target_channels {
+            self.pending = self.stream.next()?;
+            self.pending_index = 0;
+        }
+        let channel = self.pending_index;
+        self.pending_index += 1;
+        Some(
+            channel
+                .checked_sub(self.output_pair.first_channel())
+                .and_then(|offset| self.pending.get(offset))
+                .copied()
+                .unwrap_or(0.0),
+        )
+    }
+}
+
+impl<S: Source> Source for BandLimitedOutputAdapter<S> {
+    fn current_frame_len(&self) -> Option<usize> {
+        None
+    }
+
+    fn channels(&self) -> u16 {
+        self.target_channels as u16
+    }
+
+    fn sample_rate(&self) -> u32 {
+        self.target_rate
+    }
+
+    fn total_duration(&self) -> Option<Duration> {
+        self.stream.input().source.total_duration()
+    }
+
+    fn last_error(&self) -> Option<String> {
+        self.stream.input().source.last_error()
+    }
+}
+
+struct ProgramFrames<S> {
+    source: S,
+    frame: Vec<f32>,
+    fold_to_mono: bool,
+}
+
+impl<S: Source> Iterator for ProgramFrames<S> {
+    type Item = [f32; 2];
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if !read_frame_into(&mut self.source, &mut self.frame) {
+            return None;
+        }
+        let left = self.frame[0];
+        if self.fold_to_mono {
+            Some([
+                self.frame.iter().sum::<f32>() / self.frame.len() as f32,
+                0.0,
+            ])
+        } else {
+            Some([left, self.frame.get(1).copied().unwrap_or(left)])
+        }
     }
 }
 

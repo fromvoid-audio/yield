@@ -6,6 +6,7 @@ use crate::telemetry;
 use crate::timebase::{frames_to_seconds, seconds_to_frames_round};
 use crate::{AsyncSource, Source};
 
+use super::helpers::PlaybackRateConversion;
 use super::metronome::{MetronomeMixOverride, MetronomeSource};
 use super::playback_span_handle::plan_anchor_frame;
 use super::{
@@ -148,6 +149,7 @@ impl AudioPlayer {
             None,
             Some(plan),
             plan.seek_offset_frames() != 0,
+            PlaybackRateConversion::BandLimited,
         )
     }
 
@@ -400,6 +402,7 @@ impl AudioPlayer {
             diagnostic,
             PlaybackRuntimeReplacePolicy::FadeOutPrevious,
             diagnostics,
+            PlaybackRateConversion::Linear,
         )?;
         self.finish_span_playback(&plan, Some(plan.seek_offset_frames()));
         self.active_playback_span = None;
@@ -428,6 +431,7 @@ impl AudioPlayer {
             metronome,
             None,
             false,
+            PlaybackRateConversion::Linear,
         )
     }
 
@@ -441,6 +445,7 @@ impl AudioPlayer {
         metronome: Option<PlaybackMetronomeConfig>,
         planned: Option<PlaybackSpanPlan>,
         transition_fade_in: bool,
+        rate_conversion: PlaybackRateConversion,
     ) -> Result<(), String> {
         let total_started_at = playback_stage_started();
         let source_kind = self.current_source_kind();
@@ -580,7 +585,7 @@ impl AudioPlayer {
             looped,
         );
         let (handle, format) =
-            self.build_sink_with_fade(final_source, replace_policy, diagnostics)?;
+            self.build_sink_with_fade(final_source, replace_policy, diagnostics, rate_conversion)?;
         let finish_started_at = playback_stage_started();
         let offset = plan.seek_offset_frames();
         let initial_offset = (!looped || offset != 0).then_some(offset);
@@ -624,6 +629,7 @@ impl AudioPlayer {
             metronome,
             Some(plan),
             true,
+            PlaybackRateConversion::Linear,
         )
     }
 
@@ -740,8 +746,12 @@ impl AudioPlayer {
         };
         log_playback_stage("source_construction", source_started_at, source_kind, true);
 
-        let (handle, format) =
-            self.build_sink_with_fade(diagnostic, replace_policy, diagnostics)?;
+        let (handle, format) = self.build_sink_with_fade(
+            diagnostic,
+            replace_policy,
+            diagnostics,
+            PlaybackRateConversion::Linear,
+        )?;
         let finish_started_at = playback_stage_started();
         self.finish_span_playback(&plan, Some(plan.seek_offset_frames()));
         self.active_playback_span = active_playback_span;

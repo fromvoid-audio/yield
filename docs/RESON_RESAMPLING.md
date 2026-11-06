@@ -109,6 +109,11 @@ reports the next output frame's exact source coordinate independently of
 the read head. Decimation is limited to 64:1 so the render step has a fixed
 upper bound on source reads.
 
+The app uses this converter when prepared-tempo audition needs a different
+device rate. That path starts a new source for each prepared span and already
+requires a new audition for live edits. Ordinary audition continues to use
+its existing rate converter while live transport integration is qualified.
+
 ```sh
 scratch=$(mktemp -d)
 rustc +1.93.0 --edition=2024 -C opt-level=3 -C target-cpu=native --test scripts/qa/reson_bandlimited_probe.rs -o "$scratch/test"

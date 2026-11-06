@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::async_decode::AsyncDecodeDiagnostics;
-use crate::source::StereoOutputPair;
+use crate::source::{BandLimitedOutputAdapter, StereoOutputPair};
 use crate::telemetry;
 use crate::{OutputAdapter, Source};
 use tracing::warn;
@@ -15,6 +15,110 @@ use super::super::fade::{FadeOutHandle, FadeOutOnRequest, fade_frames_for_durati
 use super::{AudioPlaybackSource, AudioPlayer, PlaybackRuntimeReplacePolicy};
 #[cfg(test)]
 use crate::mixer::{decoder_from_bytes, map_seek_error};
+
+pub(super) enum PlaybackRateConversion {
+    Linear,
+    BandLimited,
+}
+
+impl PlaybackRateConversion {
+    fn adapt<S: Source + 'static>(
+        self,
+        source: S,
+        target_rate: u32,
+        target_channels: u16,
+        output_pair: StereoOutputPair,
+    ) -> Result<Box<dyn Source + Send>, String> {
+        let source_rate = source.sample_rate().max(1);
+        if matches!(self, Self::BandLimited) && source_rate != target_rate {
+            let adapter = BandLimitedOutputAdapter::new(
+                source,
+                target_rate,
+                target_channels,
+                output_pair,
+            )
+            .ok_or_else(|| {
+                format!(
+                    "Unsupported audition rate conversion from {source_rate} Hz to {target_rate} Hz"
+                )
+            })?;
+            Ok(Box::new(adapter))
+        } else {
+            Ok(Box::new(OutputAdapter::with_output_pair(
+                source,
+                target_rate,
+                target_channels,
+                output_pair,
+            )))
+        }
+    }
+}
+
+#[cfg(test)]
+mod rate_conversion_tests {
+    use super::*;
+    use crate::SamplesBuffer;
+
+    #[test]
+    fn prepared_rate_route_filters_aliases_and_preserves_output_pair_and_eof() {
+        let input = || {
+            let samples = (0..1024)
+                .flat_map(|frame| {
+                    let sign = if frame % 2 == 0 { 1.0 } else { -1.0 };
+                    [sign, -sign]
+                })
+                .collect::<Vec<_>>();
+            SamplesBuffer::new(2, 96_000, samples)
+        };
+        let pair = StereoOutputPair::new(1);
+        let mut prepared = PlaybackRateConversion::BandLimited
+            .adapt(input(), 48_000, 4, pair)
+            .unwrap();
+        let mut regular = PlaybackRateConversion::Linear
+            .adapt(input(), 48_000, 4, pair)
+            .unwrap();
+        assert_eq!((prepared.sample_rate(), prepared.channels()), (48_000, 4));
+
+        let counts = crate::test_support::count_thread_allocations_and_deallocations(|| {
+            for frame in 0..512 {
+                for stream in [&mut prepared, &mut regular] {
+                    assert_eq!(stream.next(), Some(0.0));
+                    assert_eq!(stream.next(), Some(0.0));
+                }
+                let left = prepared.next().unwrap();
+                assert_eq!(prepared.next(), Some(-left));
+                if (96..416).contains(&frame) {
+                    assert!(left.abs() < 1e-4, "aliased tone at frame {frame}: {left}");
+                }
+                assert_eq!(regular.next(), Some(1.0));
+                assert_eq!(regular.next(), Some(-1.0));
+            }
+            assert_eq!(prepared.next(), None);
+            assert_eq!(regular.next(), None);
+        });
+        assert_eq!(counts, (0, 0));
+    }
+
+    #[test]
+    fn prepared_rate_route_bypasses_matching_rates_and_folds_multichannel_to_mono() {
+        let samples = SamplesBuffer::new(2, 48_000, vec![-0.0, f32::MAX]);
+        let mut exact = PlaybackRateConversion::BandLimited
+            .adapt(samples, 48_000, 4, StereoOutputPair::new(1))
+            .unwrap();
+        for expected in [0.0_f32, 0.0, -0.0, f32::MAX] {
+            assert_eq!(exact.next().map(f32::to_bits), Some(expected.to_bits()));
+        }
+        assert_eq!(exact.next(), None);
+
+        let samples = SamplesBuffer::new(3, 44_100, vec![0.25, 0.5, 0.75]);
+        let mono = PlaybackRateConversion::BandLimited
+            .adapt(samples, 96_000, 1, StereoOutputPair::default())
+            .unwrap()
+            .collect::<Vec<_>>();
+        assert_eq!(mono.len(), 3);
+        assert!(mono.into_iter().all(|value| (value - 0.5).abs() < 1e-6));
+    }
+}
 
 impl AudioPlayer {
     pub(super) fn effective_volume(&self) -> f32 {
@@ -47,6 +151,7 @@ impl AudioPlayer {
         source: S,
         replace_policy: PlaybackRuntimeReplacePolicy,
         diagnostics: Option<Arc<AsyncDecodeDiagnostics>>,
+        rate_conversion: PlaybackRateConversion,
     ) -> Result<(FadeOutHandle, (u32, u16)), String> {
         let started_at = telemetry::playback_telemetry_enabled().then(Instant::now);
         let _volume = self.effective_volume();
@@ -61,12 +166,7 @@ impl AudioPlayer {
         let source: Box<dyn Source + Send> = if !adapted {
             Box::new(source)
         } else {
-            Box::new(OutputAdapter::with_output_pair(
-                source,
-                target_sample_rate,
-                target_channels,
-                output_pair,
-            ))
+            rate_conversion.adapt(source, target_sample_rate, target_channels, output_pair)?
         };
         let format = (source.sample_rate(), source.channels());
         let handle = FadeOutHandle::new();

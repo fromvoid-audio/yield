@@ -57,6 +57,10 @@ where
         (self.next_source_frame, self.phase)
     }
 
+    pub(crate) fn input(&self) -> &I {
+        &self.input
+    }
+
     fn push_history_frame(&mut self, frame: [f32; 2]) {
         let taps = self.history.len() / 2;
         // Duplicate the ring so even a window that wraps is a contiguous slice.
@@ -115,12 +119,11 @@ where
     fn next(&mut self) -> Option<Self::Item> {
         self.prepare_window()?;
         let frames = &self.history[self.window_start..self.window_start + self.history.len() / 2];
-        let result = self.kernel.render(frames, self.phase);
-        let next_phase = u64::from(self.phase) + u64::from(self.source_rate);
+        let (source_frame, phase) = self.next_source_position();
+        let result = self.kernel.render(frames, phase);
+        let next_phase = u64::from(phase) + u64::from(self.source_rate);
         let target_rate = u64::from(self.target_rate);
-        self.next_source_frame = self
-            .next_source_frame
-            .saturating_add(next_phase / target_rate);
+        self.next_source_frame = source_frame.saturating_add(next_phase / target_rate);
         self.phase = (next_phase % target_rate) as u32;
         Some(result)
     }
