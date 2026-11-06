@@ -105,6 +105,8 @@ pub enum TransientRequestFailure {
     Decode(&'static str),
     /// The detector could not produce a result.
     Computation,
+    /// The bounded compute slot and its waiting request are occupied.
+    Busy,
     /// The caller or Source lifecycle cancelled the request.
     Cancelled,
 }
@@ -124,79 +126,232 @@ impl From<TransientJobError> for TransientRequestFailure {
     }
 }
 
-pub(super) fn dispatch(
-    request: SourceTransientRequest,
-    cancellation: FeatureAnalysisCancellation,
-    reservation: &mut EventReservation<'_>,
-    admission: &Arc<Mutex<AdmissionState>>,
-    sources: &HashMap<SourceId, RegisteredSource>,
-) {
-    {
-        let mut state = admission.lock().unwrap_or_else(|error| error.into_inner());
-        if cancellation.is_cancelled()
-            || !publication_is_current_state(
-                &state,
-                request.source_id(),
-                request.lifecycle_generation(),
-                None,
-            )
-        {
+pub(super) struct Submission<'a> {
+    pub(super) request: SourceTransientRequest,
+    pub(super) cancellation: FeatureAnalysisCancellation,
+    pub(super) reservation: EventReservation<'a>,
+}
+
+struct Running<'a> {
+    submission: Submission<'a>,
+    compute: std::thread::JoinHandle<ComputedTransientJob>,
+}
+
+/// One compute thread and one waiting request per original Catalog worker.
+#[derive(Default)]
+pub(super) struct Worker<'a> {
+    running: Option<Running<'a>>,
+    waiting: Option<Submission<'a>>,
+}
+
+impl<'a> Worker<'a> {
+    pub(super) fn submit(
+        &mut self,
+        submission: Submission<'a>,
+        admission: &Arc<Mutex<AdmissionState>>,
+        sources: &HashMap<SourceId, RegisteredSource>,
+        test_gate: Option<&Arc<CatalogTestGate>>,
+    ) {
+        if submission.cancellation.is_cancelled() {
+            submission.reservation.finish();
             return;
         }
-        state.active_transient = Some((request.source_id().clone(), cancellation.clone()));
+        if self.running.is_none() && self.waiting.is_none() {
+            self.start(submission, admission, sources, test_gate);
+            return;
+        }
+        if self
+            .waiting
+            .as_ref()
+            .is_some_and(|pending| pending.cancellation.is_cancelled())
+            && let Some(old) = self.waiting.take()
+        {
+            old.reservation.finish();
+        }
+        if self.waiting.is_none() {
+            self.waiting = Some(submission);
+        } else {
+            submission.complete(Err(TransientRequestFailure::Busy), admission, None);
+        }
     }
 
-    let source = sources.get(request.source_id());
-    let result = source
-        .ok_or(TransientRequestFailure::StaleSource)
-        .and_then(|source| execute(&source.database.writer, &request, &cancellation));
+    pub(super) fn poll(
+        &mut self,
+        admission: &Arc<Mutex<AdmissionState>>,
+        sources: &HashMap<SourceId, RegisteredSource>,
+        test_gate: Option<&Arc<CatalogTestGate>>,
+    ) {
+        if self
+            .running
+            .as_ref()
+            .is_some_and(|running| running.compute.is_finished())
+            && let Some(Running {
+                submission,
+                compute,
+            }) = self.running.take()
+        {
+            let source = sources.get(submission.request.source_id());
+            let result = if submission.cancellation.is_cancelled() {
+                Err(TransientRequestFailure::Cancelled)
+            } else {
+                compute
+                    .join()
+                    .map_err(|_| TransientRequestFailure::Computation)
+                    .and_then(|computed| {
+                        let source = source.ok_or(TransientRequestFailure::StaleSource)?;
+                        computed.finish(&source.database.writer).map_err(Into::into)
+                    })
+            };
+            clear_active(admission);
+            submission.complete(result, admission, source);
+        }
+        if self.running.is_none()
+            && let Some(waiting) = self.waiting.take()
+        {
+            self.start(waiting, admission, sources, test_gate);
+        }
+    }
+
+    fn start(
+        &mut self,
+        submission: Submission<'a>,
+        admission: &Arc<Mutex<AdmissionState>>,
+        sources: &HashMap<SourceId, RegisteredSource>,
+        _test_gate: Option<&Arc<CatalogTestGate>>,
+    ) {
+        {
+            let mut state = admission.lock().unwrap_or_else(|error| error.into_inner());
+            if submission.cancellation.is_cancelled()
+                || !publication_is_current_state(
+                    &state,
+                    submission.request.source_id(),
+                    submission.request.lifecycle_generation(),
+                    None,
+                )
+            {
+                drop(state);
+                submission.reservation.finish();
+                return;
+            }
+            state.active_transient = Some((
+                submission.request.source_id().clone(),
+                submission.cancellation.clone(),
+            ));
+        }
+        let source = sources.get(submission.request.source_id());
+        let prepared = source
+            .ok_or(TransientRequestFailure::StaleSource)
+            .and_then(|source| {
+                prepare(
+                    &source.database.writer,
+                    &submission.request,
+                    &submission.cancellation,
+                )
+            });
+        let compute = prepared.and_then(|job| {
+            #[cfg(test)]
+            let gate = _test_gate.cloned();
+            std::thread::Builder::new()
+                .name("yield-transient-compute".into())
+                .spawn(move || {
+                    #[cfg(test)]
+                    if let Some(gate) = gate {
+                        gate.before_transient_compute();
+                    }
+                    job.compute()
+                })
+                .map_err(|_| TransientRequestFailure::Computation)
+        });
+        match compute {
+            Ok(compute) => {
+                self.running = Some(Running {
+                    submission,
+                    compute,
+                })
+            }
+            Err(error) => {
+                clear_active(admission);
+                submission.complete(Err(error), admission, source);
+            }
+        }
+    }
+}
+
+impl Drop for Worker<'_> {
+    fn drop(&mut self) {
+        // Cancel before releasing the original owner. A worker in an OS read
+        // cannot publish and does not own a writer or wait on Catalog shutdown.
+        if let Some(Running { submission, .. }) = self.running.take() {
+            submission.cancellation.cancel();
+            submission.reservation.finish();
+        }
+        if let Some(submission) = self.waiting.take() {
+            submission.cancellation.cancel();
+            submission.reservation.finish();
+        }
+    }
+}
+
+fn clear_active(admission: &Arc<Mutex<AdmissionState>>) {
     admission
         .lock()
         .unwrap_or_else(|error| error.into_inner())
         .active_transient = None;
-
-    if cancellation.is_cancelled() {
-        return;
-    }
-    let event = |result| CatalogEvent::TransientMarkersCompleted {
-        request: request.clone(),
-        cancellation: cancellation.clone(),
-        result,
-    };
-    let failure = match result {
-        Ok(markers) => {
-            if let Some(source) = source
-                && publish_source_if_current(
-                    admission,
-                    reservation,
-                    request.source_id(),
-                    request.lifecycle_generation(),
-                    None,
-                    source,
-                    event(Ok(markers)),
-                )
-            {
-                return;
-            }
-            TransientRequestFailure::StaleSource
-        }
-        Err(error) => error,
-    };
-    publish_if_current(
-        admission,
-        reservation,
-        request.source_id(),
-        request.lifecycle_generation(),
-        None,
-        event(Err(failure)),
-    );
 }
 
-fn execute(
+impl Submission<'_> {
+    fn complete(
+        mut self,
+        result: Result<TransientJobOutcome, TransientRequestFailure>,
+        admission: &Arc<Mutex<AdmissionState>>,
+        source: Option<&RegisteredSource>,
+    ) {
+        if self.cancellation.is_cancelled() {
+            self.reservation.finish();
+            return;
+        }
+        let event = |result| CatalogEvent::TransientMarkersCompleted {
+            request: self.request.clone(),
+            cancellation: self.cancellation.clone(),
+            result,
+        };
+        let failure = match result {
+            Ok(markers) => {
+                if let Some(source) = source
+                    && publish_source_if_current(
+                        admission,
+                        &mut self.reservation,
+                        self.request.source_id(),
+                        self.request.lifecycle_generation(),
+                        None,
+                        source,
+                        event(Ok(markers)),
+                    )
+                {
+                    self.reservation.finish();
+                    return;
+                }
+                TransientRequestFailure::StaleSource
+            }
+            Err(error) => error,
+        };
+        publish_if_current(
+            admission,
+            &mut self.reservation,
+            self.request.source_id(),
+            self.request.lifecycle_generation(),
+            None,
+            event(Err(failure)),
+        );
+        self.reservation.finish();
+    }
+}
+
+fn prepare(
     writer: &SourceWriter,
     request: &SourceTransientRequest,
     cancellation: &FeatureAnalysisCancellation,
-) -> Result<TransientJobOutcome, TransientRequestFailure> {
+) -> Result<PreparedTransientJob, TransientRequestFailure> {
     let revision = writer
         .current_revision()
         .map_err(|_| TransientRequestFailure::StaleSource)?;
@@ -206,15 +361,11 @@ fn execute(
     {
         return Err(TransientRequestFailure::StaleSource);
     }
-    // Catalog is already a background worker. The bounded compute phase holds
-    // a read capability only and borrows neither the writer nor a SQL transaction.
     Ok(prepare_transient_job(
         writer,
         &revision,
         &request.relative_path,
         request.preset(),
         cancellation.clone(),
-    )?
-    .compute()
-    .finish(writer)?)
+    )?)
 }
