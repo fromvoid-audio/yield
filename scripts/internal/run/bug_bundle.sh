@@ -2,7 +2,8 @@
 
 # Creates a small diagnostic bundle to attach to bug reports.
 #
-# Bundle contents are intentionally limited:
+# Linux bundles contain only allowlisted status fields. Other Bash platforms
+# retain the existing bundle contents:
 # - latest logs (default: 5)
 # - `config.toml` (if present)
 # - tool/runtime versions (`rustc`, `cargo`, `git`)
@@ -12,14 +13,29 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
+invocation_dir="$PWD"
+os_name="$(uname -s | tr '[:upper:]' '[:lower:]')"
 cd "$ROOT_DIR"
 
 MAX_LOGS=5
 OUT_DIR="dist/bug_bundles"
 USE_SANDBOX=0
+if [[ "$os_name" == linux ]]; then
+  OUT_DIR="yield-support"
+fi
 
 usage() {
   local entrypoint="${YIELD_RUN_ENTRYPOINT:-scripts/run.sh}"
+  if [[ "$os_name" == linux ]]; then
+    cat <<EOF
+Usage: ${entrypoint} bug-bundle [--out-dir <dir>] [--logs <1-10>] [--sandbox]
+
+Creates a private support archive under <dir> (default: ./yield-support).
+Reports log count up to the given limit (default: 5), configuration presence,
+and basic host facts. View the newest log locally with the logs command.
+EOF
+    return
+  fi
   cat <<EOF
 Usage: ${entrypoint} bug-bundle [--out-dir <dir>] [--logs <n>] [--sandbox]
 
@@ -38,8 +54,10 @@ EOF
 while (( $# > 0 )); do
   case "$1" in
     --out-dir)
+      if (( $# < 2 )) || [[ -z "$2" ]]; then usage >&2; exit 2; fi
       OUT_DIR="${2:-}"; shift 2 ;;
     --logs)
+      if (( $# < 2 )) || [[ -z "$2" ]]; then usage >&2; exit 2; fi
       MAX_LOGS="${2:-}"; shift 2 ;;
     --sandbox)
       USE_SANDBOX=1; shift ;;
@@ -52,7 +70,6 @@ while (( $# > 0 )); do
   esac
 done
 
-os_name="$(uname -s | tr '[:upper:]' '[:lower:]')"
 sandbox_config_home="${ROOT_DIR}/.sandbox/yield"
 
 default_config_base_dir() {
@@ -134,6 +151,56 @@ logs_dir="${app_root}/logs"
 config_path="${app_root}/config.toml"
 
 timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
+
+if [[ "$os_name" == linux ]]; then
+  if [[ ! "$MAX_LOGS" =~ ^([1-9]|10)$ ]]; then
+    echo "[bug_bundle][error] --logs expects an integer from 1 to 10." >&2
+    exit 2
+  fi
+  if [[ "$OUT_DIR" != /* ]]; then
+    OUT_DIR="${invocation_dir}/${OUT_DIR}"
+  fi
+  umask 077
+  mkdir -p "$OUT_DIR"
+  bundle_dir="$(mktemp -d "${OUT_DIR}/yield-bug-bundle-${timestamp}-XXXXXXXX")"
+  trap 'rm -rf -- "$bundle_dir"' EXIT
+
+  architecture="$(uname -m)"
+  case "$architecture" in
+    x86_64|aarch64) ;;
+    *) architecture=unknown ;;
+  esac
+  config_present=false
+  if [[ -f "$config_path" ]]; then config_present=true; fi
+  log_count=0
+  for log_file in "$logs_dir"/yield_*.log; do
+    [[ -f "$log_file" && ! -L "$log_file" ]] || continue
+    name="${log_file##*/}"
+    [[ "$name" =~ ^yield_[[:xdigit:]]{16}_[[:xdigit:]]{8}_[[:xdigit:]]{8}_[[:xdigit:]]{8}\.log$ ]] || continue
+    log_count=$((log_count + 1))
+    (( log_count >= MAX_LOGS )) && break
+  done
+  {
+    printf 'timestamp_utc=%s\n' "$timestamp"
+    printf 'os=linux\narchitecture=%s\n' "$architecture"
+    printf 'config_present=%s\n' "$config_present"
+    printf 'log_count_capped=%s\nlog_count_limit=%s\n' "$log_count" "$MAX_LOGS"
+  } > "${bundle_dir}/info.txt"
+
+  if command -v zip >/dev/null 2>&1; then
+    archive="${bundle_dir}/support.zip"
+    (unset ZIPOPT; zip -qjX "$archive" "${bundle_dir}/info.txt")
+  else
+    archive="${bundle_dir}/support.tar.gz"
+    (unset TAR_OPTIONS GZIP; tar --format=ustar --owner=0 --group=0 --numeric-owner \
+      -czf "$archive" -C "$bundle_dir" info.txt)
+  fi
+  rm -- "${bundle_dir}/info.txt"
+  trap - EXIT
+  echo "[bug_bundle] wrote ${archive}"
+  exit 0
+fi
+
 bundle_root="$(mktemp -d)"
 trap 'rm -rf "$bundle_root"' EXIT
 
