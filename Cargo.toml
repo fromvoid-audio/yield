@@ -12,6 +12,7 @@ members = [
     "crates/yield-source-watcher",
     "crates/yield-platform",
     "crates/yield-issue-gateway",
+    "crates/yield-link",
     "crates/yield-catalog",
     "crates/yield-session",
     "crates/yield-scan",
@@ -45,6 +46,7 @@ yield-core = { path = "crates/yield-core" }
 yield-media = { path = "crates/yield-media" }
 yield-design = { path = "crates/yield-design" }
 yield-ui = { path = "crates/yield-ui" }
+yield-link = { path = "crates/yield-link" }
 yield-session = { path = "crates/yield-session" }
 yield-source-watcher = { path = "crates/yield-source-watcher" }
 yield-platform = { path = "crates/yield-platform" }
