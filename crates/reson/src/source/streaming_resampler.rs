@@ -108,6 +108,30 @@ where
         }
         Some(())
     }
+    /// Render only while the center is inside an exclusive source endpoint.
+    /// Keep read-ahead intact so the caller can extend the endpoint before it
+    /// retires the source. Each call observes one endpoint for the whole frame.
+    pub(crate) fn next_before(&mut self, source_end: u64) -> Option<[f32; 2]> {
+        let (source_frame, phase) = self.next_source_position();
+        if source_frame >= source_end {
+            return None;
+        }
+        self.prepare_window()?;
+        let frames = &self.history[self.window_start..self.window_start + self.history.len() / 2];
+        let future_frames = source_end - source_frame - 1;
+        let radius = self.kernel.radius();
+        let result = if future_frames < radius as u64 {
+            self.kernel
+                .render_at_right_edge(frames, radius + future_frames as usize, phase)
+        } else {
+            self.kernel.render(frames, phase)
+        };
+        let next_phase = u64::from(phase) + u64::from(self.source_rate);
+        let target_rate = u64::from(self.target_rate);
+        self.next_source_frame = source_frame.saturating_add(next_phase / target_rate);
+        self.phase = (next_phase % target_rate) as u32;
+        Some(result)
+    }
 }
 
 impl<I> Iterator for StreamingResampler<I>
@@ -117,14 +141,6 @@ where
     type Item = [f32; 2];
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.prepare_window()?;
-        let frames = &self.history[self.window_start..self.window_start + self.history.len() / 2];
-        let (source_frame, phase) = self.next_source_position();
-        let result = self.kernel.render(frames, phase);
-        let next_phase = u64::from(phase) + u64::from(self.source_rate);
-        let target_rate = u64::from(self.target_rate);
-        self.next_source_frame = source_frame.saturating_add(next_phase / target_rate);
-        self.phase = (next_phase % target_rate) as u32;
-        Some(result)
+        self.next_before(u64::MAX)
     }
 }
