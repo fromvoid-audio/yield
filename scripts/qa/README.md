@@ -42,3 +42,23 @@ Run portable schema/redaction/failure regressions with:
 ```sh
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts/qa -p test_finder_evidence.py
 ```
+
+## macOS live watcher start probe
+
+This probe submits a disposable source and parent in one native registration,
+checks both configured paths and records monotonic start and teardown time.
+It creates its own directories under `/private/tmp` and removes them on a
+normal return. Use a watchdog. If the watchdog fires, record the timeout and
+retain any probe-owned temporary directories for inspection.
+
+```sh
+probe_dir="$(mktemp -d)"
+xcrun --sdk macosx clang -Wall -Wextra -Werror -framework CoreServices \
+  scripts/qa/macos_watcher_start_probe.c -o "$probe_dir/dual-path"
+python3 scripts/internal/ci/managed_exec.py --timeout-seconds 2 "$probe_dir/dual-path"
+```
+
+Keep the Git SHA, macOS build, SDK, filesystem, and individual run output with
+the report. The probe measures the native registration call. Event delivery,
+bounded behavior during a daemon stall, and production catalog ownership
+require separate evidence.
