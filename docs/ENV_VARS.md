@@ -637,6 +637,12 @@ diagnostics so remaining missed plays can be tied to a specific stage.
 Enables only Reson playback-engine hot-path logs, including decoder setup,
 seeking, async-source prefill, and output-stream append. `YIELD_HOTPATH_TELEMETRY`
 also enables these Reson logs. Accepted values: `1`, `true`, `on`, `yes`.
+When an admitted source retires after decoder starvation, look for the
+`perf::audio_start` event with `stage=decode_underrun`. It reports consecutive
+silence episodes, inserted source frames, the last ring fill at starvation,
+initial prefill, and the source and device formats. The count is measured
+before output resampling and includes adapter preparation. The event omits
+media paths and covers decoder starvation only.
 
 - `YIELD_BROWSER_SEARCH_OFFLOAD_THRESHOLD`
 Wav-entry threshold used by browser search to switch from synchronous layout

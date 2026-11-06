@@ -162,6 +162,8 @@ fn controlled_stereo_ring() -> (ringbuf::HeapProd<f32>, AsyncSource<TestSource>)
         last_error: Arc::new(Mutex::new(None)),
         output_remaining: 0,
         output_silence: false,
+        underruns: UnderrunCounts::default(),
+        diagnostics: None,
         _marker: PhantomData,
     };
     (producer, source)
@@ -170,15 +172,64 @@ fn controlled_stereo_ring() -> (ringbuf::HeapProd<f32>, AsyncSource<TestSource>)
 #[test]
 fn async_source_recovers_a_partial_stereo_frame_in_channel_order() {
     let (mut producer, mut source) = controlled_stereo_ring();
+    let output = ResolvedOutput {
+        sample_rate: 96_000,
+        ..Default::default()
+    };
+    let diagnostics = source.attach_diagnostics("test_file", 0, &output).unwrap();
     let allocation_counts = crate::test_support::count_thread_allocations_and_deallocations(|| {
+        for _ in 0..2 {
+            assert_eq!(source.next(), Some(0.0));
+        }
         producer.try_push(0.25).unwrap();
         assert_eq!(source.next(), Some(0.0));
         producer.try_push(-0.25).unwrap();
         assert_eq!(source.next(), Some(0.0));
         assert_eq!(source.next(), Some(0.25));
         assert_eq!(source.next(), Some(-0.25));
+        producer.try_push(0.5).unwrap();
+        assert_eq!(source.next(), Some(0.0));
+        source.done.store(true, Ordering::Release);
+        assert_eq!(source.next(), Some(0.0));
+        assert_eq!(source.next(), Some(0.5));
+        assert_eq!(source.next(), None);
     });
     assert_eq!(allocation_counts, (0, 0));
+    drop(source);
+    assert!(diagnostics.reportable_counts().is_none());
+    // An admitted source can retire before its submitting thread resumes.
+    diagnostics.mark_admitted();
+    assert_eq!(
+        diagnostics.reportable_counts(),
+        Some(&UnderrunCounts {
+            episodes: 2,
+            inserted_frames: 3,
+            last_queued_samples: 1,
+        })
+    );
+    assert_eq!(diagnostics.source_kind, "test_file");
+    assert_eq!(diagnostics.source_rate, 48_000);
+    assert_eq!(diagnostics.source_channels, 2);
+    assert_eq!(diagnostics.ring_capacity_samples, 4);
+    assert_eq!(diagnostics.output, output);
+}
+
+#[test]
+fn async_source_diagnostics_skip_clean_retirement() {
+    let (mut producer, mut source) = controlled_stereo_ring();
+    producer.try_push(0.25).unwrap();
+    producer.try_push(-0.25).unwrap();
+    source.done.store(true, Ordering::Release);
+    let diagnostics = source
+        .attach_diagnostics("test_file", 2, &ResolvedOutput::default())
+        .unwrap();
+    diagnostics.mark_admitted();
+    assert_eq!(source.next(), Some(0.25));
+    assert_eq!(source.next(), Some(-0.25));
+    assert_eq!(source.next(), None);
+    drop(source);
+    assert!(diagnostics.reportable_counts().is_none());
+    assert_eq!(diagnostics.prefilled_samples, 2);
 }
 
 #[test]

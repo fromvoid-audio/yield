@@ -1,5 +1,7 @@
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::async_decode::AsyncDecodeDiagnostics;
 use crate::source::StereoOutputPair;
 use crate::telemetry;
 use crate::{OutputAdapter, Source};
@@ -13,8 +15,6 @@ use super::super::fade::{FadeOutHandle, FadeOutOnRequest, fade_frames_for_durati
 use super::{AudioPlaybackSource, AudioPlayer, PlaybackRuntimeReplacePolicy};
 #[cfg(test)]
 use crate::mixer::{decoder_from_bytes, map_seek_error};
-#[cfg(test)]
-use std::sync::Arc;
 
 impl AudioPlayer {
     pub(super) fn effective_volume(&self) -> f32 {
@@ -46,6 +46,7 @@ impl AudioPlayer {
         &mut self,
         source: S,
         replace_policy: PlaybackRuntimeReplacePolicy,
+        diagnostics: Option<Arc<AsyncDecodeDiagnostics>>,
     ) -> Result<(FadeOutHandle, (u32, u16)), String> {
         let started_at = telemetry::playback_telemetry_enabled().then(Instant::now);
         let _volume = self.effective_volume();
@@ -86,6 +87,9 @@ impl AudioPlayer {
             warn!("Failed to append audio source: {err}");
             err
         })?;
+        if let Some(diagnostics) = diagnostics {
+            diagnostics.mark_admitted();
+        }
         if let Some(append_started_at) = append_started_at {
             tracing::info!(
                 target: "perf::audio_start",

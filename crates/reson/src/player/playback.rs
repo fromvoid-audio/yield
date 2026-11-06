@@ -1,4 +1,7 @@
+use std::sync::Arc;
+
 use crate::SamplesBuffer;
+use crate::async_decode::AsyncDecodeDiagnostics;
 use crate::telemetry;
 use crate::timebase::{frames_to_seconds, seconds_to_frames_round};
 use crate::{AsyncSource, Source};
@@ -367,38 +370,37 @@ impl AudioPlayer {
             true,
             PlaybackSeekBehavior::FrameOffset(offset_frame),
         )?;
-        let diagnostic: Box<dyn Source<Item = f32> + Send> = if let Some(samples) =
-            self.playback_samples.as_ref().cloned()
-        {
-            let source = SamplesBuffer::from_arc_span_at(
-                channels,
-                sample_rate,
-                samples,
-                0,
-                plan.sample_count() as usize,
-                plan.seek_sample(),
-            )
-            .repeat_infinite();
-            Box::new(crate::loop_diagnostic::LoopDiagnostic::new(
-                source,
-                plan.sample_count(),
-            ))
-        } else {
-            let loop_source = repeating_source_for_audio_source(self.audio_source()?, &plan)?;
-            let mut async_source =
-                AsyncSource::with_buffer_seconds(loop_source, self.stream_policy.buffer_seconds);
-            async_source.prefill_for_duration(
-                self.stream_policy.prefill_duration,
-                self.stream_policy.prefill_timeout,
-            );
-            Box::new(crate::loop_diagnostic::LoopDiagnostic::new(
-                async_source,
-                plan.sample_count(),
-            ))
-        };
+        let mut diagnostics = None;
+        let diagnostic: Box<dyn Source<Item = f32> + Send> =
+            if let Some(samples) = self.playback_samples.as_ref().cloned() {
+                let source = SamplesBuffer::from_arc_span_at(
+                    channels,
+                    sample_rate,
+                    samples,
+                    0,
+                    plan.sample_count() as usize,
+                    plan.seek_sample(),
+                )
+                .repeat_infinite();
+                Box::new(crate::loop_diagnostic::LoopDiagnostic::new(
+                    source,
+                    plan.sample_count(),
+                ))
+            } else {
+                let loop_source = repeating_source_for_audio_source(self.audio_source()?, &plan)?;
+                let async_source;
+                (async_source, diagnostics) = self.prepare_async_source(loop_source);
+                Box::new(crate::loop_diagnostic::LoopDiagnostic::new(
+                    async_source,
+                    plan.sample_count(),
+                ))
+            };
 
-        let (handle, format) =
-            self.build_sink_with_fade(diagnostic, PlaybackRuntimeReplacePolicy::FadeOutPrevious)?;
+        let (handle, format) = self.build_sink_with_fade(
+            diagnostic,
+            PlaybackRuntimeReplacePolicy::FadeOutPrevious,
+            diagnostics,
+        )?;
         self.finish_span_playback(&plan, Some(plan.seek_offset_frames()));
         self.active_playback_span = None;
         self.active_loop_mode = None;
@@ -463,6 +465,7 @@ impl AudioPlayer {
 
         let source_started_at = playback_stage_started();
         let mut active_playback_span = None;
+        let mut diagnostics = None;
         let mode = LoopModeHandle::new(looped, plan.frame_count(), plan.seek_offset_frames());
         let final_source: Box<dyn Source<Item = f32> + Send> = if looped {
             let diagnostic: Box<dyn Source<Item = f32> + Send> = if let Some(samples) =
@@ -486,14 +489,8 @@ impl AudioPlayer {
                 ))
             } else {
                 let loop_source = repeating_source_for_audio_source(self.audio_source()?, &plan)?;
-                let mut async_source = AsyncSource::with_buffer_seconds(
-                    loop_source,
-                    self.stream_policy.buffer_seconds,
-                );
-                async_source.prefill_for_duration(
-                    self.stream_policy.prefill_duration,
-                    self.stream_policy.prefill_timeout,
-                );
+                let async_source;
+                (async_source, diagnostics) = self.prepare_async_source(loop_source);
                 let faded =
                     StaticSpanEdgeFadeSource::new(async_source, &plan, self.anti_clip_fade());
                 Box::new(crate::loop_diagnostic::LoopDiagnostic::new(
@@ -528,14 +525,8 @@ impl AudioPlayer {
                 Box::new(source)
             } else {
                 let lazy_source = repeating_source_for_audio_source(self.audio_source()?, &plan)?;
-                let mut async_source = AsyncSource::with_buffer_seconds(
-                    lazy_source,
-                    self.stream_policy.buffer_seconds,
-                );
-                async_source.prefill_for_duration(
-                    self.stream_policy.prefill_duration,
-                    self.stream_policy.prefill_timeout,
-                );
+                let async_source;
+                (async_source, diagnostics) = self.prepare_async_source(lazy_source);
                 Box::new(StaticSpanEdgeFadeSource::new(
                     async_source,
                     &plan,
@@ -588,7 +579,8 @@ impl AudioPlayer {
             source_kind,
             looped,
         );
-        let (handle, format) = self.build_sink_with_fade(final_source, replace_policy)?;
+        let (handle, format) =
+            self.build_sink_with_fade(final_source, replace_policy, diagnostics)?;
         let finish_started_at = playback_stage_started();
         let offset = plan.seek_offset_frames();
         let initial_offset = (!looped || offset != 0).then_some(offset);
@@ -689,6 +681,7 @@ impl AudioPlayer {
 
         let source_started_at = playback_stage_started();
         let mut active_playback_span = None;
+        let mut diagnostics = None;
         let mode = LoopModeHandle::new(true, plan.frame_count(), plan.seek_offset_frames());
         let diagnostic: Box<dyn Source<Item = f32> + Send> = if let Some(samples) =
             self.playback_samples.as_ref().cloned()
@@ -718,12 +711,8 @@ impl AudioPlayer {
             ))
         } else {
             let loop_source = repeating_source_for_audio_source(self.audio_source()?, &plan)?;
-            let mut async_source =
-                AsyncSource::with_buffer_seconds(loop_source, self.stream_policy.buffer_seconds);
-            async_source.prefill_for_duration(
-                self.stream_policy.prefill_duration,
-                self.stream_policy.prefill_timeout,
-            );
+            let async_source;
+            (async_source, diagnostics) = self.prepare_async_source(loop_source);
             let faded = StaticSpanEdgeFadeSource::new(async_source, &plan, self.anti_clip_fade());
             let editable = EditFadeSource::new_looped(
                 faded,
@@ -751,7 +740,8 @@ impl AudioPlayer {
         };
         log_playback_stage("source_construction", source_started_at, source_kind, true);
 
-        let (handle, format) = self.build_sink_with_fade(diagnostic, replace_policy)?;
+        let (handle, format) =
+            self.build_sink_with_fade(diagnostic, replace_policy, diagnostics)?;
         let finish_started_at = playback_stage_started();
         self.finish_span_playback(&plan, Some(plan.seek_offset_frames()));
         self.active_playback_span = active_playback_span;
@@ -816,6 +806,24 @@ impl AudioPlayer {
             .as_ref()
             .map(AudioPlaybackSource::kind)
             .unwrap_or("none")
+    }
+
+    fn prepare_async_source<S: Source + 'static>(
+        &self,
+        source: S,
+    ) -> (AsyncSource<S>, Option<Arc<AsyncDecodeDiagnostics>>) {
+        let mut source =
+            AsyncSource::with_buffer_seconds(source, self.stream_policy.buffer_seconds);
+        let prefilled_samples = source.prefill_for_duration(
+            self.stream_policy.prefill_duration,
+            self.stream_policy.prefill_timeout,
+        );
+        let diagnostics = if telemetry::playback_telemetry_enabled() {
+            source.attach_diagnostics(self.current_source_kind(), prefilled_samples, &self.output)
+        } else {
+            None
+        };
+        (source, diagnostics)
     }
 }
 

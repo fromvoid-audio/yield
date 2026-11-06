@@ -490,7 +490,7 @@ impl AudioPlayer {
             step: 220.0 * 2.0 * std::f32::consts::PI / 44100.0,
         };
         player
-            .build_sink_with_fade(source, PlaybackRuntimeReplacePolicy::FadeOutPrevious)
+            .build_sink_with_fade(source, PlaybackRuntimeReplacePolicy::FadeOutPrevious, None)
             .ok()?;
         player.started_at = Some(Instant::now());
         Some(player)
