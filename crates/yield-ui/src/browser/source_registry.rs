@@ -472,6 +472,7 @@ impl Browser {
         for event in events {
             changed |= self.apply_source_registry_event(event, cx);
         }
+        self.advance_external_source_drop(cx);
         let mut catalog_deliveries = Vec::new();
         // Keep the next revision's bounded delivery on the catalog while its preceding
         // projection is still being built. Automatic replay then retains its original
@@ -637,6 +638,7 @@ impl Browser {
                 self.source_registry_loaded = true;
                 self.source_registry_revision = revision;
                 self.source_reorder_drag = None;
+                self.stop_external_source_drop(cx);
                 self.fail_pending_registry_mutations(error.to_string());
                 tracing::error!(
                     target: "yield::session",
@@ -650,6 +652,7 @@ impl Browser {
             RegistryEvent::Closed => {
                 self.source_registry_loaded = true;
                 self.source_reorder_drag = None;
+                self.stop_external_source_drop(cx);
                 self.fail_pending_registry_mutations("Source registry closed".to_string());
                 self.set_source_registry_status("Source registry closed".to_string());
                 true
