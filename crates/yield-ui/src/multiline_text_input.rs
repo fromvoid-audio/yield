@@ -87,6 +87,7 @@ pub(crate) struct MultilineTextInput {
     lines: Vec<LineLayout>,
     bounds: Option<Bounds<Pixels>>,
     scroll: ScrollHandle,
+    height: Pixels,
     reveal_caret_after_layout: bool,
     selecting: bool,
     preferred_x: Option<Pixels>,
@@ -107,10 +108,16 @@ impl MultilineTextInput {
             lines: Vec::new(),
             bounds: None,
             scroll: ScrollHandle::new(),
+            height: px(176.0),
             reveal_caret_after_layout: true,
             selecting: false,
             preferred_x: None,
         }
+    }
+
+    pub(crate) fn with_height(mut self, height: Pixels) -> Self {
+        self.height = height;
+        self
     }
 
     /// Current report text.
@@ -762,7 +769,7 @@ impl Render for MultilineTextInput {
             .overflow_scroll()
             .track_scroll(&self.scroll)
             .w_full()
-            .h(px(176.0))
+            .h(self.height)
             .p(px(theme.spacing.control_gap))
             .bg(color(theme.colors.surface_overlay))
             .text_size(px(theme.typography.body_size))
