@@ -68,8 +68,11 @@ impl Default for PlaybackRuntimeConfig {
 /// Decoder buffering policy for lazy/file-backed playback sources.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct PlaybackRuntimeStreamPolicy {
+    /// Maximum ring capacity in seconds of source audio.
     pub buffer_seconds: f32,
+    /// Startup and post-starvation refill threshold, rounded to whole source frames.
     pub prefill_duration: Duration,
+    /// Maximum initial wait for prefill on the runtime owner thread.
     pub prefill_timeout: Duration,
 }
 
@@ -83,6 +86,7 @@ impl PlaybackRuntimeStreamPolicy {
     }
 
     pub const fn transient_navigation() -> Self {
+        // Rapid replacement needs a shorter startup wait and a smaller decode cushion.
         Self {
             buffer_seconds: 0.12,
             prefill_duration: Duration::from_millis(3),

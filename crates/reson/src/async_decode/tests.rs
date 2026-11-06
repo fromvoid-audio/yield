@@ -149,17 +149,21 @@ fn async_source_returns_silence_on_underrun() {
     assert_eq!(second, 0.5);
 }
 
-fn controlled_stereo_ring() -> (ringbuf::HeapProd<f32>, AsyncSource<TestSource>) {
-    let (producer, consumer) = HeapRb::<f32>::new(4).split();
+fn controlled_stereo_ring(
+    sample_rate: u32,
+    capacity: usize,
+) -> (ringbuf::HeapProd<f32>, AsyncSource<TestSource>) {
+    let (producer, consumer) = HeapRb::<f32>::new(capacity).split();
     let source = AsyncSource {
         consumer: Some(consumer),
-        sample_rate: 48_000,
+        sample_rate,
         channels: 2,
         total_duration: None,
         worker: None,
         done: Arc::new(AtomicBool::new(false)),
         stop: Arc::new(AtomicBool::new(false)),
         last_error: Arc::new(Mutex::new(None)),
+        refill_samples: 0,
         output_remaining: 0,
         output_silence: false,
         underruns: UnderrunCounts::default(),
@@ -171,7 +175,7 @@ fn controlled_stereo_ring() -> (ringbuf::HeapProd<f32>, AsyncSource<TestSource>)
 
 #[test]
 fn async_source_recovers_a_partial_stereo_frame_in_channel_order() {
-    let (mut producer, mut source) = controlled_stereo_ring();
+    let (mut producer, mut source) = controlled_stereo_ring(48_000, 4);
     let output = ResolvedOutput {
         sample_rate: 96_000,
         ..Default::default()
@@ -216,7 +220,7 @@ fn async_source_recovers_a_partial_stereo_frame_in_channel_order() {
 
 #[test]
 fn async_source_diagnostics_skip_clean_retirement() {
-    let (mut producer, mut source) = controlled_stereo_ring();
+    let (mut producer, mut source) = controlled_stereo_ring(48_000, 4);
     producer.try_push(0.25).unwrap();
     producer.try_push(-0.25).unwrap();
     source.done.store(true, Ordering::Release);
@@ -234,7 +238,12 @@ fn async_source_diagnostics_skip_clean_retirement() {
 
 #[test]
 fn async_source_finishes_silence_then_drains_final_frames_and_partial_tail() {
-    let (mut producer, mut source) = controlled_stereo_ring();
+    let (mut producer, mut source) = controlled_stereo_ring(48_000, 4);
+    assert_eq!(
+        source.prefill_for_duration(Duration::from_secs(1), Duration::ZERO),
+        0
+    );
+    assert_eq!(source.refill_samples, 4);
     assert_eq!(source.next(), Some(0.0));
     for sample in [0.25, -0.25, 0.5] {
         producer.try_push(sample).unwrap();
@@ -248,6 +257,51 @@ fn async_source_finishes_silence_then_drains_final_frames_and_partial_tail() {
     assert_eq!(source.next(), Some(0.5));
     assert_eq!(source.current_frame_len(), Some(0));
     assert_eq!(source.next(), None);
+}
+
+#[test]
+fn async_source_rebuilds_the_startup_watermark_after_bursty_starvation() {
+    use crate::player::PlaybackRuntimeStreamPolicy;
+
+    let full = PlaybackRuntimeStreamPolicy::full();
+    let transient = PlaybackRuntimeStreamPolicy::transient_navigation();
+    for (sample_rate, policy, frames) in [
+        (44_100, full, 221),
+        (48_000, full, 240),
+        (96_000, full, 480),
+        (44_100, transient, 133),
+        (48_000, transient, 144),
+        (96_000, transient, 288),
+    ] {
+        // The final slot cannot hold a complete frame.
+        let (mut producer, mut source) = controlled_stereo_ring(sample_rate, 4 * frames + 1);
+        assert_eq!(
+            source.prefill_for_duration(policy.prefill_duration, Duration::ZERO),
+            0
+        );
+        assert_eq!(source.refill_samples, 2 * frames);
+
+        assert_eq!(source.next(), Some(0.0));
+        assert_eq!(source.next(), Some(0.0));
+        for frame in 1..frames {
+            producer.try_push(frame as f32).unwrap();
+            producer.try_push(-(frame as f32)).unwrap();
+            assert_eq!(source.next(), Some(0.0));
+            assert_eq!(source.next(), Some(0.0));
+        }
+        producer.try_push(frames as f32).unwrap();
+        assert_eq!(source.next(), Some(0.0));
+        producer.try_push(-(frames as f32)).unwrap();
+        assert_eq!(source.next(), Some(0.0));
+
+        for frame in 1..=frames {
+            assert_eq!(source.next(), Some(frame as f32));
+            assert_eq!(source.next(), Some(-(frame as f32)));
+        }
+        assert_eq!(source.underruns.episodes, 1);
+        assert_eq!(source.underruns.inserted_frames, (frames + 1) as u64);
+        assert_eq!(source.underruns.last_queued_samples, 2 * frames - 1);
+    }
 }
 
 #[test]
