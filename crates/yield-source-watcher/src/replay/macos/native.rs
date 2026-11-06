@@ -805,6 +805,18 @@ mod tests {
     use yield_library::sample_sources::SourceId;
     use yield_library::sample_sources::reconciliation::WatcherGeneration;
 
+    fn history_start_cursor(spec: &SourceWatchSpec) -> u64 {
+        let timeout = Duration::from_secs(5);
+        let capture =
+            BootstrapCapture::start(spec.clone(), timeout).expect("device-local seed stream");
+        // The worker records the device-local cursor before reporting readiness. It is
+        // available even when no live callback has been delivered during this interval.
+        capture
+            .finish(timeout)
+            .expect("seed capture")
+            .started_after()
+    }
+
     #[test]
     fn captures_native_history_for_a_disposable_source() {
         let _capture_guard = capture_test_guard();
@@ -818,11 +830,7 @@ mod tests {
             root,
             Some(identity),
         );
-        let seed = BootstrapCapture::start(spec.clone(), Duration::from_secs(5))
-            .expect("device-local seed stream");
-        fs::write(temp.path().join("seed.wav"), b"seed").expect("seed event");
-        let seed = seed.finish(Duration::from_secs(5)).expect("seed capture");
-        let since = seed.last_seen().expect("device-local event cursor");
+        let since = history_start_cursor(&spec);
         fs::write(temp.path().join("kick.wav"), b"sample").expect("changed sample");
         // FSEvents can publish a just-written file after an initial HistoryDone callback.
         // A later capture must still replay it from the exact device-local cursor.
@@ -872,11 +880,7 @@ mod tests {
             Some(identity),
         );
 
-        let seed = BootstrapCapture::start(spec.clone(), Duration::from_secs(5))
-            .expect("device-local seed stream");
-        fs::write(temp.path().join("seed.wav"), b"seed").expect("seed event");
-        let seed = seed.finish(Duration::from_secs(5)).expect("seed capture");
-        let since = seed.last_seen().expect("device-local event cursor");
+        let since = history_start_cursor(&spec);
 
         for index in 0..=(MAX_REPLAY_EVENTS * 2) {
             let path = temp.path().join(format!("overflow-{index:04}.wav"));
