@@ -175,8 +175,22 @@ fn legacy_mode_restart_keeps_requested_offset_while_live_update_rebases_progress
         decision.restart_offset_frames(&plan),
         plan.seek_offset_frames()
     );
+    assert_eq!(decision.replacement_offset_frames(&plan, false), 40);
+    assert_eq!(decision.replacement_offset_frames(&plan, true), 325);
 
     let (_, seek_frame, live_offset) = resolve_retarget_plan(&plan, decision);
     assert_eq!(seek_frame, None);
     assert_eq!(live_offset, 325);
+}
+
+#[test]
+fn converted_cached_replacement_preserves_guarded_and_explicit_seek_offsets() {
+    let plan = span_plan(40);
+    let current = plan.start_frame() + 325;
+    let guarded = resolve_retarget_seek(&plan, false, true, Some(current));
+    let requested = resolve_retarget_seek(&plan, true, true, Some(current));
+    let outside = resolve_retarget_seek(&plan, false, true, Some(plan.end_frame()));
+    assert_eq!(guarded.replacement_offset_frames(&plan, true), 325);
+    assert_eq!(requested.replacement_offset_frames(&plan, true), 40);
+    assert_eq!(outside.replacement_offset_frames(&plan, true), 0);
 }

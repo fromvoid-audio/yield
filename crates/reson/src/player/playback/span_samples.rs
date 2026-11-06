@@ -57,6 +57,17 @@ impl SpanSamplesSource {
         self
     }
 
+    pub(super) fn with_transport_loop_mode(mut self, mode: LoopModeHandle, rendered: bool) -> Self {
+        if rendered {
+            // The output adapter owns loop completion. Let it read wrapped
+            // input while it independently clamps the audible filter edge.
+            self.mode = SpanSamplesMode::Looped;
+            self
+        } else {
+            self.with_live_loop_mode(mode)
+        }
+    }
+
     fn mode(&self) -> SpanSamplesMode {
         match self.live_loop_mode.as_ref() {
             Some(mode) if mode.looped() => SpanSamplesMode::Looped,
@@ -196,6 +207,23 @@ mod tests {
         PlaybackChannelLayout, PlaybackMetronomeConfig, PlaybackSeekBehavior,
         PlaybackSourceIdentity, PlaybackSourceKind, PlaybackSpanPlan, PlaybackSpanRequest,
     };
+
+    #[test]
+    fn cached_read_ahead_leaves_one_shot_completion_to_the_output_transport() {
+        let samples = Arc::from([1.0, 2.0, 3.0, 4.0]);
+        let span = PlaybackSpanHandle::from_plan(&span_plan(0, 4, 0));
+        let mode = LoopModeHandle::new(false, 4, 0);
+        let mut source =
+            SpanSamplesSource::new(1, 1_000, samples, span, SpanSamplesMode::OneShot, 0)
+                .with_transport_loop_mode(mode.clone(), true);
+
+        assert_eq!(
+            source.by_ref().take(6).collect::<Vec<_>>(),
+            [1.0, 2.0, 3.0, 4.0, 1.0, 2.0]
+        );
+        assert_eq!(mode.frames_consumed(), 0);
+        assert!(mode.set_looped(true));
+    }
 
     #[test]
     fn live_mode_change_keeps_the_current_sample_position() {

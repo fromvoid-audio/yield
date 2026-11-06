@@ -150,7 +150,6 @@ impl AudioPlayer {
             None,
             Some(plan),
             plan.seek_offset_frames() != 0,
-            PlaybackRateConversion::BandLimited,
         )
     }
 
@@ -271,68 +270,70 @@ impl AudioPlayer {
             current_frame,
         );
 
-        if self.looping != looped {
-            // A mode-only change keeps the same decoded stream and audible
-            // frame. The outer source stops at the next cycle end when the
-            // loop is disabled; no second decoder or sink is started.
-            if !seek_to_offset
-                && self.play_span_frames
-                    == Some((requested_plan.start_frame(), requested_plan.end_frame()))
-                && self.is_playing()
-                && self.active_metronome == metronome
-                && let Some(mode) = self.active_loop_mode.as_ref()
-                && mode.set_looped(looped)
-            {
-                if let Some(span) = self.active_playback_span.as_ref() {
-                    span.update_from_plan(&requested_plan, None, metronome);
-                }
-                if self.active_playback_span.is_some()
-                    && let Some(frame) = current_frame
-                {
+        let rendered_transport =
+            self.rendered_source_position.is_some() && self.active_loop_mode.is_some();
+        let cached_transport = rendered_transport && self.active_playback_span.is_some();
+        let same_span_controls = !seek_to_offset
+            && self.play_span_frames
+                == Some((requested_plan.start_frame(), requested_plan.end_frame()))
+            && self.active_metronome == metronome
+            && self.is_playing();
+        // A mode-only change keeps the same source. A resampled source owns
+        // its audible position and needs no span update or clock rebase here.
+        if self.looping != looped
+            && same_span_controls
+            && let Some(mode) = self.active_loop_mode.as_ref()
+            && mode.set_looped(looped)
+        {
+            if !rendered_transport && let Some(span) = self.active_playback_span.as_ref() {
+                span.update_from_plan(&requested_plan, None, metronome);
+                if let Some(frame) = current_frame {
                     self.started_at = Some(std::time::Instant::now());
                     let offset = frame.saturating_sub(requested_plan.start_frame());
                     self.loop_offset_frames = Some(offset);
                     self.loop_offset = Some(frames_to_seconds(offset, sample_rate));
                 }
-                self.looping = looped;
-                return Ok(());
             }
-            return if looped {
-                self.start_with_looped_span_offset_frames(
-                    bounded_start,
-                    bounded_end,
-                    duration,
-                    decision.restart_offset_frames(&requested_plan),
-                    PlaybackRuntimeReplacePolicy::FadeOutPrevious,
-                    metronome,
-                )
-            } else {
-                self.start_with_span_offset_frames(
-                    bounded_start,
-                    bounded_end,
-                    duration,
-                    decision.restart_offset_frames(&requested_plan),
-                    metronome,
-                )
-            };
+            self.looping = looped;
+            return Ok(());
+        }
+        if cached_transport
+            && same_span_controls
+            && self.looping == looped
+            && decision != RetargetSeekDecision::RestartAtStart
+            && current_frame.is_some_and(|frame| {
+                (requested_plan.start_frame()..requested_plan.end_frame()).contains(&frame)
+            })
+        {
+            return Ok(());
         }
 
-        let Some(playback_span) = self.active_playback_span.clone() else {
+        let in_place_span = self
+            .active_playback_span
+            .as_ref()
+            .filter(|_| self.looping == looped && !rendered_transport)
+            .cloned();
+        let Some(playback_span) = in_place_span else {
+            // A new cached span owns new filter history. Use the exact audible
+            // frame for non-seeking updates just as the in-place path does.
+            let offset_frames =
+                decision.replacement_offset_frames(&requested_plan, cached_transport);
             return if looped {
                 self.start_with_looped_span_offset_frames(
                     bounded_start,
                     bounded_end,
                     duration,
-                    decision.restart_offset_frames(&requested_plan),
+                    offset_frames,
                     PlaybackRuntimeReplacePolicy::FadeOutPrevious,
                     metronome,
+                    cached_transport,
                 )
             } else {
                 self.start_with_span_offset_frames(
                     bounded_start,
                     bounded_end,
                     duration,
-                    decision.restart_offset_frames(&requested_plan),
+                    offset_frames,
                     metronome,
                 )
             };
@@ -399,11 +400,17 @@ impl AudioPlayer {
                 ))
             };
 
+        let rate_conversion =
+            if supports_band_limited_rate_conversion(sample_rate, self.output.sample_rate) {
+                PlaybackRateConversion::BandLimited
+            } else {
+                PlaybackRateConversion::Linear
+            };
         let (handle, format) = self.build_sink_with_fade(
             diagnostic,
             PlaybackRuntimeReplacePolicy::FadeOutPrevious,
             diagnostics,
-            PlaybackRateConversion::Linear,
+            rate_conversion,
         )?;
         self.finish_span_playback(&plan, Some(plan.seek_offset_frames()));
         self.active_playback_span = None;
@@ -432,7 +439,6 @@ impl AudioPlayer {
             metronome,
             None,
             false,
-            PlaybackRateConversion::Linear,
         )
     }
 
@@ -446,7 +452,6 @@ impl AudioPlayer {
         metronome: Option<PlaybackMetronomeConfig>,
         planned: Option<PlaybackSpanPlan>,
         transition_fade_in: bool,
-        rate_conversion: PlaybackRateConversion,
     ) -> Result<(), String> {
         let total_started_at = playback_stage_started();
         let source_kind = self.current_source_kind();
@@ -473,10 +478,11 @@ impl AudioPlayer {
         let mut active_playback_span = None;
         let mut diagnostics = None;
         let mode = LoopModeHandle::new(looped, plan.frame_count(), plan.seek_offset_frames());
-        let rate_conversion = match rate_conversion {
-            PlaybackRateConversion::Linear => self.lazy_rate_conversion(sample_rate, &mode),
-            conversion => conversion,
-        };
+        let rate_conversion = self.ordinary_rate_conversion(sample_rate, &mode);
+        let rendered_transport = matches!(
+            rate_conversion,
+            PlaybackRateConversion::BandLimitedTransport(_)
+        );
         let final_source: Box<dyn Source<Item = f32> + Send> = if looped {
             let diagnostic: Box<dyn Source<Item = f32> + Send> = if let Some(samples) =
                 self.playback_samples.as_ref().cloned()
@@ -491,7 +497,7 @@ impl AudioPlayer {
                     plan.seek_sample(),
                 )
                 .with_edge_fade(self.anti_clip_fade())
-                .with_live_loop_mode(mode.clone());
+                .with_transport_loop_mode(mode.clone(), rendered_transport);
                 active_playback_span = Some(playback_span);
                 Box::new(crate::loop_diagnostic::LoopDiagnostic::new(
                     source,
@@ -530,7 +536,7 @@ impl AudioPlayer {
                     plan.seek_sample(),
                 )
                 .with_edge_fade(self.anti_clip_fade())
-                .with_live_loop_mode(mode.clone());
+                .with_transport_loop_mode(mode.clone(), rendered_transport);
                 active_playback_span = Some(playback_span);
                 Box::new(source)
             } else {
@@ -636,7 +642,6 @@ impl AudioPlayer {
             metronome,
             Some(plan),
             true,
-            PlaybackRateConversion::Linear,
         )
     }
 
@@ -658,6 +663,7 @@ impl AudioPlayer {
             offset_frames,
             replace_policy,
             metronome,
+            false,
         )
     }
 
@@ -669,6 +675,7 @@ impl AudioPlayer {
         offset_frames: u64,
         replace_policy: PlaybackRuntimeReplacePolicy,
         metronome: Option<PlaybackMetronomeConfig>,
+        transition_fade_in: bool,
     ) -> Result<(), String> {
         let total_started_at = playback_stage_started();
         let source_kind = self.current_source_kind();
@@ -696,7 +703,11 @@ impl AudioPlayer {
         let mut active_playback_span = None;
         let mut diagnostics = None;
         let mode = LoopModeHandle::new(true, plan.frame_count(), plan.seek_offset_frames());
-        let rate_conversion = self.lazy_rate_conversion(sample_rate, &mode);
+        let rate_conversion = self.ordinary_rate_conversion(sample_rate, &mode);
+        let rendered_transport = matches!(
+            rate_conversion,
+            PlaybackRateConversion::BandLimitedTransport(_)
+        );
         let diagnostic: Box<dyn Source<Item = f32> + Send> = if let Some(samples) =
             self.playback_samples.as_ref().cloned()
         {
@@ -710,7 +721,7 @@ impl AudioPlayer {
                 plan.seek_sample(),
             )
             .with_edge_fade(self.anti_clip_fade())
-            .with_live_loop_mode(mode.clone());
+            .with_transport_loop_mode(mode.clone(), rendered_transport);
             let editable = EditFadeSource::new_looped(
                 source,
                 self.edit_fade_handle.clone(),
@@ -751,6 +762,11 @@ impl AudioPlayer {
             && matches!(rate_conversion, PlaybackRateConversion::Linear)
         {
             Box::new(LiveLoopModeSource::new(diagnostic, mode.clone()))
+        } else {
+            diagnostic
+        };
+        let diagnostic: Box<dyn Source<Item = f32> + Send> = if transition_fade_in {
+            Box::new(diagnostic.fade_in(self.anti_clip_fade()))
         } else {
             diagnostic
         };
@@ -824,14 +840,13 @@ impl AudioPlayer {
             .unwrap_or("none")
     }
 
-    fn lazy_rate_conversion(
+    fn ordinary_rate_conversion(
         &self,
         source_rate: u32,
         mode: &LoopModeHandle,
     ) -> PlaybackRateConversion {
         let target_rate = self.output.sample_rate.max(1);
-        if self.playback_samples.is_none()
-            && source_rate != target_rate
+        if source_rate != target_rate
             && supports_band_limited_rate_conversion(source_rate, target_rate)
         {
             PlaybackRateConversion::BandLimitedTransport(mode.clone())
@@ -872,6 +887,17 @@ enum RetargetSeekDecision {
 }
 
 impl RetargetSeekDecision {
+    fn replacement_offset_frames(
+        self,
+        plan: &PlaybackSpanPlan,
+        preserve_cached_position: bool,
+    ) -> u64 {
+        if preserve_cached_position && let Self::Legacy { offset_frames } = self {
+            return offset_frames.min(plan.frame_count().saturating_sub(1));
+        }
+        self.restart_offset_frames(plan)
+    }
+
     fn restart_offset_frames(self, plan: &PlaybackSpanPlan) -> u64 {
         match self {
             Self::Requested { offset_frames } | Self::Preserve { offset_frames } => {

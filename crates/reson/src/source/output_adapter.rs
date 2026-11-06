@@ -580,9 +580,14 @@ mod tests {
             BandLimitedOutputAdapter::new(source(), 48_000, 4, StereoOutputPair::default())
                 .unwrap();
         let position = current.rendered_position();
-        let replacement =
-            BandLimitedOutputAdapter::new(source(), 48_000, 4, StereoOutputPair::default())
-                .unwrap();
+        let replacement_source = FrameSource::new(2, 44_100, vec![-0.75; 882]);
+        let mut replacement = BandLimitedOutputAdapter::new(
+            replacement_source,
+            48_000,
+            4,
+            StereoOutputPair::default(),
+        )
+        .unwrap();
         let replacement_position = replacement.rendered_position();
 
         let counts = crate::test_support::count_thread_allocations_and_deallocations(|| {
@@ -601,6 +606,9 @@ mod tests {
             }
             assert_eq!(position.source_frame(), 147);
             assert_eq!(replacement_position.source_frame(), 0);
+            let first_replacement = replacement.next().unwrap();
+            assert!((first_replacement + 0.75).abs() < 1e-6);
+            assert_eq!(position.source_frame(), 147);
         });
         assert_eq!(counts, (0, 0));
     }
