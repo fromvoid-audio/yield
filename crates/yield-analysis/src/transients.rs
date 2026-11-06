@@ -5,7 +5,8 @@ use crate::{Complex32, FftPlan, WavPcm, fft_radix2_inplace_with_plan, hann_windo
 const BAND_COUNT: usize = 24;
 const FLUX_HISTORY: usize = 5;
 const MAX_WINDOWS: usize = 32_000;
-const MAX_MARKERS: usize = 2_048;
+/// Maximum number of frame indices returned for one analyzed source.
+pub const MAX_TRANSIENT_MARKERS: usize = 2_048;
 
 /// Version of the detector and its preset thresholds for persisted result identity.
 pub const DETECTOR_VERSION: &str = "native-spectral-flux-v1";
@@ -98,7 +99,7 @@ pub fn detect_transients(
     let threshold = preset.threshold(*baseline);
     let min_gap = (pcm.sample_rate() as usize * 35)
         .div_ceil(1_000)
-        .max(frame_count.div_ceil(MAX_MARKERS));
+        .max(frame_count.div_ceil(MAX_TRANSIENT_MARKERS));
     let mut frames = Vec::new();
     for (index, &score) in novelty.iter().enumerate() {
         if index % 256 == 0 {
@@ -361,15 +362,15 @@ mod tests {
 
     #[test]
     fn dense_long_input_keeps_native_positions_bounded() {
-        let mut samples = vec![0.0; 256 * (MAX_MARKERS + 32)];
+        let mut samples = vec![0.0; 256 * (MAX_TRANSIENT_MARKERS + 32)];
         for sample in samples.iter_mut().skip(65).step_by(256) {
             *sample = 0.8;
         }
         let pcm = decode(1, 1000, &samples);
         let markers =
             detect_transients(&pcm, TransientPreset::High, &AtomicBool::new(false)).unwrap();
-        assert!(markers.frames().len() <= MAX_MARKERS);
-        assert!(markers.frames().len() > MAX_MARKERS / 2);
+        assert!(markers.frames().len() <= MAX_TRANSIENT_MARKERS);
+        assert!(markers.frames().len() > MAX_TRANSIENT_MARKERS / 2);
         assert!(markers.frames().windows(2).all(|pair| pair[0] < pair[1]));
         assert!(markers.frames().iter().all(|&frame| frame % 256 == 65));
     }
