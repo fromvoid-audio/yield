@@ -133,6 +133,9 @@ pub enum GatewayError {
     /// GitHub rejected the issue content.
     #[error("GitHub rejected the issue content")]
     Rejected,
+    /// The gateway refused the request before attempting an issue POST.
+    #[error("Too many feedback requests. Try again in a minute.")]
+    RateLimited,
     /// The POST may have succeeded; check before retrying.
     #[error("Submission outcome unknown; check the feedback repository before retrying")]
     UnknownOutcome,
@@ -225,6 +228,7 @@ impl GatewayClient {
             Ok(response) => response,
             Err(ureq::Error::Status(202, _)) => return Ok(None),
             Err(ureq::Error::Status(401 | 403, _)) => return Err(GatewayError::Unauthorized),
+            Err(ureq::Error::Status(429, _)) => return Err(GatewayError::RateLimited),
             Err(_) => return Err(GatewayError::Unavailable),
         };
         let parsed: PollResponse = read_json(response).map_err(|_| GatewayError::Unavailable)?;
@@ -262,6 +266,7 @@ impl GatewayClient {
             Ok(response) => response,
             Err(ureq::Error::Status(401 | 403, _)) => return Err(GatewayError::Unauthorized),
             Err(ureq::Error::Status(400 | 422, _)) => return Err(GatewayError::Rejected),
+            Err(ureq::Error::Status(429, _)) => return Err(GatewayError::RateLimited),
             Err(_) => return Err(GatewayError::UnknownOutcome),
         };
         let parsed: CreateResponse =
@@ -436,6 +441,22 @@ mod tests {
         let request = server.join().expect("one server request");
         assert!(request.starts_with("POST /issue HTTP/1.1"));
         assert!(!format!("{result:?}").contains("secret-token"));
+    }
+
+    #[test]
+    fn rate_limit_is_a_known_rejection_for_poll_and_post() {
+        let (address, server) = serve_once("429 Too Many Requests", "{}");
+        let client = GatewayClient::new(&address).unwrap();
+        let result = client.poll(&AuthRequestId::new());
+        assert!(matches!(result, Err(GatewayError::RateLimited)));
+        assert!(server.join().unwrap().starts_with("GET /auth/poll?"));
+
+        let (address, server) = serve_once("429 Too Many Requests", "{}");
+        let client = GatewayClient::new(&address).unwrap();
+        let token = SecretToken::new("s".repeat(43)).unwrap();
+        let result = client.create_issue(&token, "Bug: sample", "Details");
+        assert!(matches!(result, Err(GatewayError::RateLimited)));
+        assert!(server.join().unwrap().starts_with("POST /issue HTTP/1.1"));
     }
 
     #[test]

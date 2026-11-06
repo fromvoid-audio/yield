@@ -6,6 +6,10 @@ export interface SessionStore {
   delete(key: string): Promise<void>;
 }
 
+export interface RateLimiter {
+  limit(options: { key: string }): Promise<{ success: boolean }>;
+}
+
 export interface GatewayEnv {
   GITHUB_CLIENT_ID: string;
   GITHUB_CLIENT_SECRET: string;
@@ -13,6 +17,8 @@ export interface GatewayEnv {
   GITHUB_REPO: string;
   GITHUB_OAUTH_SCOPE: 'public_repo' | 'repo';
   SESSIONS: SessionStore;
+  EDGE_RATE_LIMIT: RateLimiter;
+  ISSUE_SESSION_RATE_LIMIT: RateLimiter;
 }
 
 type Fetcher = typeof fetch;
@@ -28,6 +34,7 @@ const MAX_REQUEST_BYTES = 128 * 1024;
 const REQUEST_ID = /^[A-Za-z0-9_-]{32,128}$/;
 const SESSION_ID = /^[A-Za-z0-9_-]{32,128}$/;
 const UTF8 = new TextEncoder();
+const AUTH_PATHS = new Set(['/auth/start', '/auth/callback', '/auth/poll']);
 
 function json(value: object, status = 200): Response {
   return new Response(JSON.stringify(value), {
@@ -52,7 +59,9 @@ function configured(env: GatewayEnv): boolean {
     env.GITHUB_OWNER === APPROVED_OWNER &&
     env.GITHUB_REPO === APPROVED_REPO &&
     env.GITHUB_OAUTH_SCOPE === 'repo' &&
-    env.SESSIONS,
+    env.SESSIONS &&
+    typeof env.EDGE_RATE_LIMIT?.limit === 'function' &&
+    typeof env.ISSUE_SESSION_RATE_LIMIT?.limit === 'function',
   );
 }
 
@@ -100,11 +109,38 @@ function bearer(request: Request): string | null {
   return match?.[1] ?? null;
 }
 
+function edgeBucket(request: Request, path: string): string {
+  // Cloudflare's edge header is the only IP input. Unknown values share a bucket.
+  const ip = request.headers.get('cf-connecting-ip') ?? '';
+  return `${path}:${/^[0-9a-f:.]{1,64}$/i.test(ip) ? ip : 'unknown'}`;
+}
+
+async function sessionBucket(sessionId: string): Promise<string> {
+  const digest = await crypto.subtle.digest('SHA-256', UTF8.encode(sessionId));
+  return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, '0')).join('');
+}
+
+async function enforceRate(limiter: RateLimiter, key: string | Promise<string>): Promise<Response | null> {
+  try {
+    if ((await limiter.limit({ key: await key })).success) return null;
+  } catch {
+    return json({ error: 'Gateway unavailable' }, 503);
+  }
+  const response = json({ error: 'Too many feedback requests. Try again in a minute.' }, 429);
+  response.headers.set('Retry-After', '60');
+  return response;
+}
+
 export function createWorker(fetcher: Fetcher) {
   return {
     async fetch(request: Request, env: GatewayEnv): Promise<Response> {
       if (!configured(env)) return json({ error: 'Gateway unavailable' }, 503);
       const url = new URL(request.url);
+      const issueRequest = request.method === 'POST' && url.pathname === '/issue';
+      if (issueRequest || (request.method === 'GET' && AUTH_PATHS.has(url.pathname))) {
+        const rejection = await enforceRate(env.EDGE_RATE_LIMIT, edgeBucket(request, url.pathname));
+        if (rejection) return rejection;
+      }
 
       if (request.method === 'GET' && url.pathname === '/auth/start') {
         const requestId = url.searchParams.get('requestId') ?? '';
@@ -173,7 +209,7 @@ export function createWorker(fetcher: Fetcher) {
         return json({ ok: true, sessionId });
       }
 
-      if (request.method === 'POST' && url.pathname === '/issue') {
+      if (issueRequest) {
         const sessionId = bearer(request);
         if (!sessionId) return json({ error: 'Connect GitHub first' }, 401);
         const githubToken = await env.SESSIONS.get(`sess:${sessionId}`);
@@ -186,6 +222,8 @@ export function createWorker(fetcher: Fetcher) {
         }
         const draft = issuePayload(payload);
         if (!draft) return json({ error: 'Invalid issue title or body' }, 400);
+        const rejection = await enforceRate(env.ISSUE_SESSION_RATE_LIMIT, sessionBucket(sessionId));
+        if (rejection) return rejection;
         const issueUrl = `https://api.github.com/repos/${APPROVED_OWNER}/${APPROVED_REPO}/issues`;
         let response: Response;
         try {
