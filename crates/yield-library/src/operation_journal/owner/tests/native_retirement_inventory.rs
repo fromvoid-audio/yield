@@ -410,6 +410,7 @@ fn native_retirement_inventory_genuine_registered_original_consumer() {
             .unwrap(),
         0
     );
+    drop(outside);
     handle.abort();
     loop {
         match handle.status() {
@@ -425,9 +426,8 @@ fn native_retirement_inventory_genuine_registered_original_consumer() {
     stop.store(true, Ordering::Release);
     worker.join().unwrap();
     assert!(global.shutdown());
-    // Registered-source lifecycle can conservatively deny full clean handoff; memory
-    // release after the genuine worker join does not waive that refusal or settle it.
-    let _clean_handoff = journal.shutdown();
+    // Require the worker join. Registered-source clean volume handoff is a separate decision.
+    assert!(journal.shutdown());
     inventory.inventory().validate_record(&record).unwrap();
     inventory
         .inventory()
@@ -446,10 +446,21 @@ fn native_retirement_inventory_genuine_registered_original_consumer() {
     native_concurrent_drop(inventory, alias);
     assert_eq!(budget.used(), 0);
     drop(budget);
+    // The still-live shared owner prepays the pool and gate allocations. All operation
+    // credits must return to that exact baseline, and no detached holder may retain it.
     assert_eq!(
         *journal.shared.input_bytes.lock().unwrap(),
-        InputBudget::new()
+        InputBudget::shared_initial()
     );
+    assert_eq!(Arc::strong_count(&journal.shared), 1);
+    assert_eq!(Arc::strong_count(&journal.shared.input_bytes), 1);
+    assert_eq!(Arc::strong_count(&journal.shared.lifecycle), 1);
+    assert_eq!(Arc::strong_count(&journal.shared.resource_admission), 1);
+    println!(
+        "retirement inventory restored all operation credits; permanent live pool backing {} bytes",
+        startup_credit::POOL_BYTES,
+    );
+    drop(journal);
 }
 fn native_concurrent_drop<T: Send + 'static>(a: T, b: T) {
     let barrier = Arc::new(std::sync::Barrier::new(2));
