@@ -16,6 +16,7 @@ development-state = [
 ]
 
 [dependencies]
+async-channel = "=2.5.0"
 rand = "=0.9.5"
 semver = "1.0.27"
 gpui.workspace = true
@@ -45,7 +46,6 @@ yield-catalog = { path = "../yield-catalog", features = ["test-support"] }
 tempfile.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
-async-channel = "=2.5.0"
 naga = { version = "=25.0.1", features = ["wgsl-in"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
