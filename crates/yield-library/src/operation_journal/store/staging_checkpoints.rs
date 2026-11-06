@@ -14,6 +14,7 @@ use crate::file_operation_owner::{
 use crate::operation_journal::model::OperationId;
 use crate::operation_journal::owner::InputPermit;
 use crate::operation_journal::participants::{ParticipantId, ParticipantKind};
+use crate::operation_journal::writer_acquisition_telemetry::{self, JournalWriterCall};
 
 #[cfg(test)]
 use super::{InsertTestBoundary, InsertTestDirective};
@@ -498,7 +499,11 @@ impl OperationJournalStore {
     ) -> Result<StagingCheckpointReceipt, OperationJournalStoreError> {
         let encoded = record.encode().map_err(checkpoint_error)?;
         self.validate_namespace_with_input(input, false)?;
-        self.connection.execute_batch("BEGIN EXCLUSIVE")?;
+        writer_acquisition_telemetry::observe(JournalWriterCall::StagingCheckpoint, || {
+            self.connection
+                .execute_batch("BEGIN EXCLUSIVE")
+                .map_err(Into::into)
+        })?;
         let outcome = (|| {
             let operation = self
                 .read_row(record.operation_id())?
@@ -678,7 +683,11 @@ impl OperationJournalStore {
         input: Option<&InputPermit>,
     ) -> Result<(), OperationJournalStoreError> {
         self.validate_namespace_with_input(input, false)?;
-        self.connection.execute_batch("BEGIN EXCLUSIVE")?;
+        writer_acquisition_telemetry::observe(JournalWriterCall::PublicationReservation, || {
+            self.connection
+                .execute_batch("BEGIN EXCLUSIVE")
+                .map_err(Into::into)
+        })?;
         let transition = (|| {
             let operation = self
                 .read_row(record.operation_id())?

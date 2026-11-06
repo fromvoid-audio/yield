@@ -1,9 +1,10 @@
 # Original journal writer acquisition observations (OPT-2446)
 
 `operation_journal::writer_acquisition_telemetry::journal_writer_telemetry_snapshot()`
-exposes fixed process-lifetime saturating counts for four original Store call
-sites: intent insertion, cancellation request, retry-pending persistence and
-ordinary-claim release. Each selected exclusive acquisition returns Acquired,
+exposes fixed process-lifetime saturating counts for intent insertion,
+cancellation request, retry-pending persistence, ordinary-claim release,
+validated staging checkpoint and publication reservation. Each selected
+exclusive acquisition returns Acquired,
 Busy, Locked or OtherError. Extended SQLite BUSY and LOCKED codes retain their
 base category. Counters retain no diagnostic, identity, SQL or payload.
 
@@ -13,9 +14,9 @@ can refuse during preparation before SQLite starts a transaction; such a
 refusal is OtherError, never Acquired. Validation, encoding, transaction body,
 commit, readback and telemetry bookkeeping are outside the measured interval.
 Five inclusive buckets are <=1, <=10, <=100, <=1000 and >1000 milliseconds.
-Elapsed buckets aggregate all four selected sites.
+Elapsed buckets aggregate all six selected sites.
 
-The 168-byte static collector uses relaxed atomic counters, without a queue,
+The 232-byte static collector uses relaxed atomic counters, without a queue,
 heap allocation, lock, reset or callback in production. Concurrent snapshots
 are approximate across fields. Original SQL, timeout, retry policy, result
 ownership and transaction lifetime are preserved. Acquired means the original
@@ -25,9 +26,9 @@ nothing. This supplies observations, never durability or effect authority.
 
 Actual Store fixtures verify insert/duplicate/reopen, cancellation persistence,
 claim-release replay/conflict, pre-BEGIN refusal and post-BEGIN rollback.
-The existing genuine competing SQLite reservation fixture verifies Busy,
-unchanged journal/claim bytes and successful acquisition after the blocker
-releases. Fixed-storage tests cover all counters, saturation, exact bucket
+Competing SQLite connections exercise Busy for both staging acquisition sites
+and confirm that release of the blocker permits exact replay and reservation.
+Fixed-storage tests cover all counters, saturation, exact bucket
 edges, extended contention codes, unchanged owned diagnostics and a real nested
 SQLite transaction refusal that preserves the original transaction.
 
