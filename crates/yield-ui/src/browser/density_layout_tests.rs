@@ -87,6 +87,19 @@ fn compact_browser_geometry_keeps_work_surfaces_reachable(cx: &mut TestAppContex
                 f32::from(status.size.height),
             );
             assert!(complete_rows >= 1.0, "{width}×{height} at {text_scale}%");
+            if width == 960.0 && height == 560.0 {
+                if text_scale == 100 {
+                    assert!(
+                        complete_rows >= 11.0,
+                        "minimum window shows {complete_rows} rows"
+                    );
+                } else {
+                    assert!(
+                        waveform.size.height >= px(40.0),
+                        "enlarged waveform lost its drawing area: {waveform:?}",
+                    );
+                }
+            }
             assert!(waveform.size.height > px(0.0), "{waveform:?}");
             assert!(
                 toolbar.bottom() <= waveform.top(),
