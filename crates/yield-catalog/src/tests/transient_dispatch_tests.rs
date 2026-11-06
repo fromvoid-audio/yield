@@ -244,6 +244,57 @@ mod fixtures {
     }
 
     #[test]
+    fn pending_source_digest_captures_all_bytes_and_rejects_retired_custody() {
+        use yield_library::sample_sources::readiness::{
+            FEATURE_INPUT_MAX_BYTES, SourceFeatureInputError,
+        };
+        let frames = (FEATURE_INPUT_MAX_BYTES / 2) as u32 + 1024;
+        let (fixture, service, source, _) = setup_attacks(frames, [32_767, 3_500_073]);
+        service.shutdown();
+        let database = SourceDatabase::open_for_catalog_with_profile_guard(
+            fixture.root.path(),
+            &fixture.guard,
+            catalog_profile_child(&source),
+        )
+        .unwrap();
+        let writer = SourceWriter::new(database, source.clone(), 2).unwrap();
+        let revision = writer.current_revision().unwrap();
+        let path = RootRelativePath::try_from_path("attacks.wav".into()).unwrap();
+        let media = fixture.root.path().join(path.as_path());
+        let cancelled = writer
+            .prepare_pending_content_digest(&revision, &path)
+            .unwrap();
+        assert!(matches!(
+            cancelled.compute(&AtomicBool::new(true)),
+            Err(SourceFeatureInputError::Cancelled)
+        ));
+
+        let input = writer
+            .prepare_pending_content_digest(&revision, &path)
+            .unwrap();
+        let proof = thread::spawn(move || input.compute(&AtomicBool::new(false)))
+            .join()
+            .unwrap()
+            .unwrap();
+        assert_eq!(proof.relative_path(), &path);
+        assert_eq!(
+            proof.digest(),
+            blake3::hash(&fs::read(&media).unwrap()).to_hex().as_str()
+        );
+        writer.validate_pending_content_digest(&proof).unwrap();
+
+        let displaced = media.with_extension("old");
+        fs::rename(&media, &displaced).unwrap();
+        fs::copy(&displaced, &media).unwrap();
+        assert!(writer.validate_pending_content_digest(&proof).is_err());
+        let replacement = SourceWriter::new(writer.into_catalog_database(), source, 3).unwrap();
+        assert!(matches!(
+            replacement.validate_pending_content_digest(&proof),
+            Err(SourceWriterError::StaleFence)
+        ));
+    }
+
+    #[test]
     fn transient_stream_falls_back_when_small_encoded_input_exceeds_the_pcm_limit() {
         let attacks = [32_768, 1_950_073];
         let (_fixture, service, source, revision) = setup_attacks(2_000_200, attacks);

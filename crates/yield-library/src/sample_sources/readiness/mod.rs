@@ -16,7 +16,8 @@ pub use feature_artifact::{
 };
 pub(crate) use feature_input::InputPermit;
 pub use feature_input::{
-    FEATURE_INPUT_MAX_BYTES, SourceAudioStreamError, SourceFeatureInput, SourceFeatureInputError,
+    FEATURE_INPUT_MAX_BYTES, PendingSourceContentInput, PreparedSourceContentDigest,
+    SourceAudioStreamError, SourceFeatureInput, SourceFeatureInputError,
     TRANSIENT_STREAM_MAX_BYTES,
 };
 pub use model::{
