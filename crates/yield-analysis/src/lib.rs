@@ -10,7 +10,6 @@ mod app_dirs;
 pub mod transients;
 
 pub use analysis::LIGHT_DSP_VECTOR_LEN;
-pub use analysis::aiff::{AiffPcmReader, is_aiff_path};
 pub use analysis::{
     ExactSimilarityArtifactRequest, ExactSimilarityManifestEntry, ExactSimilarityPublication,
     FEATURE_VECTOR_LEN_V1, FEATURE_VERSION_V1, compute_feature_vector_v1_for_decoded_audio,

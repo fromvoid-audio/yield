@@ -1,6 +1,6 @@
 //! Background analysis helpers (decoding, normalization, feature extraction).
 
-pub(crate) mod aiff;
+mod aiff;
 /// Approximate nearest neighbor index helpers for similarity search.
 pub mod ann_index;
 /// Aspect descriptor helpers for similarity feedback.
