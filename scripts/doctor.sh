@@ -1,12 +1,11 @@
 #!/usr/bin/env bash
 
-# Environment sanity checks for local development and agent runs.
-# Prints common pitfalls called out in README and developer diagnostic log paths.
-# Linux/WSL paths are contributor/agent tooling hints, not shipped app support.
+# Environment sanity checks for local development and installed Linux profiles.
 
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+invocation_dir="$PWD"
 cd "$ROOT_DIR"
 
 failures=0
@@ -23,6 +22,27 @@ bootstrap_hint() {
 }
 
 os_name="$(uname -s | tr '[:upper:]' '[:lower:]')"
+if [[ "$os_name" == linux && ( "${1:-}" == --installed || ! -f "$ROOT_DIR/Cargo.toml" ) ]]; then
+  if [[ "${1:-}" == --installed ]]; then shift; fi
+  sandbox=0
+  if [[ "${1:-}" == --sandbox ]]; then sandbox=1; shift; fi
+  if (( $# != 0 )); then
+    err "Usage: scripts/doctor.sh --installed [--sandbox]"
+    exit 2
+  fi
+  source "$ROOT_DIR/scripts/internal/run/linux_diagnostics_paths.sh"
+  resolve_linux_diagnostics_paths "$invocation_dir" "$ROOT_DIR/.sandbox/yield" "$sandbox"
+  info "OS: linux"
+  info "Config base: $config_base_dir"
+  info "Persistence profile: $resolved_profile"
+  info "Application root: $app_root"
+  info "Logs directory: $logs_dir"
+  if [[ ! -d "$logs_dir" ]]; then
+    warn "Logs directory is absent. Start Yield to create it."
+  fi
+  exit 0
+fi
+
 is_wsl=0
 if [[ -r /proc/version ]] && grep -qi "microsoft" /proc/version 2>/dev/null; then
   is_wsl=1
@@ -137,7 +157,7 @@ info "Expected developer diagnostic log locations:"
 info "  Supported app installs:"
 info "    macOS:   \$HOME/Library/Application Support/.yield/logs"
 info "    Windows: %APPDATA%\\.yield\\logs"
-info "  Developer/agent tooling only; Linux is not a shipped app install target:"
+info "  Linux installed profile (run with --installed to resolve overrides):"
 info "    Linux:   \$HOME/.config/.yield/logs"
 if (( is_wsl == 1 )); then
   info "    WSL hint: /mnt/c/Users/<you>/AppData/Roaming/.yield/logs"
