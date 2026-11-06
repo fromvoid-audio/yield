@@ -31,7 +31,7 @@ const MAX_TITLE_BYTES = 200;
 const MAX_BODY_BYTES = 60_000;
 // Allow the native JSON encoder to escape quotes, backslashes, tabs and newlines.
 const MAX_REQUEST_BYTES = 128 * 1024;
-const REQUEST_ID = /^[A-Za-z0-9_-]{32,128}$/;
+const REQUEST_ID = /^[0-9a-f]{64}$/;
 const SESSION_ID = /^[A-Za-z0-9_-]{32,128}$/;
 const UTF8 = new TextEncoder();
 const AUTH_PATHS = new Set(['/auth/start', '/auth/callback', '/auth/poll']);
@@ -115,8 +115,8 @@ function edgeBucket(request: Request, path: string): string {
   return `${path}:${/^[0-9a-f:.]{1,64}$/i.test(ip) ? ip : 'unknown'}`;
 }
 
-async function sessionBucket(sessionId: string): Promise<string> {
-  const digest = await crypto.subtle.digest('SHA-256', UTF8.encode(sessionId));
+async function sha256Hex(value: string): Promise<string> {
+  const digest = await crypto.subtle.digest('SHA-256', UTF8.encode(value));
   return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, '0')).join('');
 }
 
@@ -201,6 +201,9 @@ export function createWorker(fetcher: Fetcher) {
       if (request.method === 'GET' && url.pathname === '/auth/poll') {
         const requestId = url.searchParams.get('requestId') ?? '';
         if (!REQUEST_ID.test(requestId)) return json({ error: 'Invalid request ID' }, 400);
+        const proof = bearer(request);
+        if (!proof || !REQUEST_ID.test(proof) || await sha256Hex(proof) !== requestId)
+          return json({ error: 'Feedback request proof is missing or invalid' }, 401);
         const sessionId = await env.SESSIONS.get(`poll:${requestId}`);
         if (!sessionId) return json({ ok: false }, 202);
         await env.SESSIONS.delete(`poll:${requestId}`);
@@ -222,7 +225,7 @@ export function createWorker(fetcher: Fetcher) {
         }
         const draft = issuePayload(payload);
         if (!draft) return json({ error: 'Invalid issue title or body' }, 400);
-        const rejection = await enforceRate(env.ISSUE_SESSION_RATE_LIMIT, sessionBucket(sessionId));
+        const rejection = await enforceRate(env.ISSUE_SESSION_RATE_LIMIT, sha256Hex(sessionId));
         if (rejection) return rejection;
         const issueUrl = `https://api.github.com/repos/${APPROVED_OWNER}/${APPROVED_REPO}/issues`;
         let response: Response;
