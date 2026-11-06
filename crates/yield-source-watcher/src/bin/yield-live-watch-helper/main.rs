@@ -3,6 +3,9 @@
 use std::process::ExitCode;
 
 #[cfg(target_os = "macos")]
+mod parent_lifetime;
+
+#[cfg(target_os = "macos")]
 fn main() -> ExitCode {
     use std::{env, io, path::PathBuf};
     use yield_library::sample_sources::SourceId;
@@ -18,6 +21,13 @@ fn main() -> ExitCode {
         eprintln!("Invalid private watcher protocol version or source root");
         return ExitCode::from(64);
     }
+    let _parent = match parent_lifetime::ParentLifetime::bind() {
+        Ok(parent) => parent,
+        Err(error) => {
+            eprintln!("Cannot monitor the live watcher parent: {error}");
+            return ExitCode::from(70);
+        }
+    };
     // The parent owns the real source binding. The child supplies only scheduling evidence.
     let spec = SourceWatchSpec::new(SourceId::from_string("live-watch-helper"), 1, root, None);
     match serve_live_watcher(spec, io::stdin().lock(), io::stdout().lock()) {
