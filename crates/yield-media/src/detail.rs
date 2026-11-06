@@ -246,7 +246,7 @@ pub(super) struct OpenWav {
     pub(super) observation: FileObservation,
 }
 
-fn open_wav_source(path: &Path) -> std::io::Result<File> {
+pub(super) fn open_waveform_source(path: &Path) -> std::io::Result<File> {
     #[cfg(windows)]
     {
         use std::os::windows::fs::OpenOptionsExt;
@@ -270,7 +270,7 @@ pub(super) fn open_wav(path: &Path, cancellation: Option<&AtomicBool>) -> Result
         return Err(String::from("waveform preview canceled"));
     }
     #[allow(unused_mut)]
-    let mut file = open_wav_source(path)
+    let mut file = open_waveform_source(path)
         .map_err(|error| format!("WAV preview failed for {}: {error}", path.display()))?;
     #[allow(unused_mut)]
     let mut observation = observe_file(path, &file)?;
@@ -314,8 +314,12 @@ pub(super) fn open_wav(path: &Path, cancellation: Option<&AtomicBool>) -> Result
 }
 
 pub(super) fn observe_file(path: &Path, file: &File) -> Result<FileObservation, String> {
-    let metadata = fs::metadata(path)
-        .map_err(|error| format!("failed to inspect WAV {}: {error}", path.display()))?;
+    let metadata = fs::metadata(path).map_err(|error| {
+        format!(
+            "failed to inspect waveform source {}: {error}",
+            path.display()
+        )
+    })?;
     let open_identity = stable_filesystem_identity_from_open_file(file);
     let path_identity = stable_filesystem_identity(path, &metadata);
     if let (Some(open_identity), Some(path_identity)) = (&open_identity, &path_identity)
@@ -346,7 +350,7 @@ pub(super) fn recheck_wav(
         return Err(String::from("waveform preview canceled"));
     }
     let retained_observation = observe_file(path, &opened.file)?;
-    let file = open_wav_source(path)
+    let file = open_waveform_source(path)
         .map_err(|error| format!("failed to revalidate WAV {}: {error}", path.display()))?;
     let observation = observe_file(path, &file)?;
     let (actual_spec, actual_total_frames) = read_wav_header(path, &file)?;

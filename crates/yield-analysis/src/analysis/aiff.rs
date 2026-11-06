@@ -1,6 +1,6 @@
 use std::fs::File;
 use std::io::{self, BufReader, Read, Seek, SeekFrom};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use aifc::{AifcError, AifcReader, FileFormat, Sample};
 
@@ -9,7 +9,8 @@ use super::audio_decode::{AnalysisDecodeError, DecodedAudio};
 
 const MAX_HEADER_READ_BYTES: usize = 64 * 1024;
 
-pub(super) fn is_aiff_path(path: &Path) -> bool {
+/// Match the two supported AIFF filename extensions, ignoring ASCII case.
+pub fn is_aiff_path(path: &Path) -> bool {
     path.extension()
         .and_then(|extension| extension.to_str())
         .is_some_and(|extension| {
@@ -17,17 +18,26 @@ pub(super) fn is_aiff_path(path: &Path) -> bool {
         })
 }
 
-struct PcmAiff {
+/// Validated, seekable reader for uncompressed AIFF PCM.
+pub struct AiffPcmReader {
     reader: AifcReader<HeaderBudget>,
+    path: PathBuf,
     sample_rate: u32,
     channels: u16,
     bits_per_sample: u32,
     frames: u64,
 }
 
-impl PcmAiff {
+impl AiffPcmReader {
     fn open(path: &Path) -> Result<Self, AnalysisDecodeError> {
         let file = File::open(path).map_err(|error| io_error(path, error))?;
+        Self::from_file(file, path)
+    }
+
+    /// Validate an already opened source descriptor positioned at the start of the AIFF file.
+    ///
+    /// The path is used for diagnostics. This method only reads from the supplied file.
+    pub fn from_file(file: File, path: &Path) -> Result<Self, AnalysisDecodeError> {
         let file_len = file
             .metadata()
             .map_err(|error| io_error(path, error))?
@@ -76,11 +86,56 @@ impl PcmAiff {
 
         Ok(Self {
             reader,
+            path: path.to_path_buf(),
             sample_rate: info.sample_rate as u32,
             channels,
             bits_per_sample,
             frames,
         })
+    }
+
+    /// Return the integer sample rate in Hz.
+    pub fn sample_rate(&self) -> u32 {
+        self.sample_rate
+    }
+
+    /// Return the number of interleaved channels.
+    pub fn channels(&self) -> u16 {
+        self.channels
+    }
+
+    /// Return the number of complete frames in the sound chunk.
+    pub fn frames(&self) -> u64 {
+        self.frames
+    }
+
+    /// Seek back to the first sample.
+    pub fn rewind(&mut self) -> Result<(), AnalysisDecodeError> {
+        self.reader
+            .seek(0)
+            .map_err(|error| read_error(&self.path, error))
+    }
+
+    /// Read the next normalized, interleaved sample.
+    pub fn read_sample(&mut self) -> Result<Option<f32>, AnalysisDecodeError> {
+        let sample = self
+            .reader
+            .read_sample()
+            .map_err(|error| read_error(&self.path, error))?;
+        let value = match sample {
+            Some(Sample::I8(value)) => f32::from(value) / 128.0,
+            Some(Sample::I16(value)) => f32::from(value) / 32_768.0,
+            Some(Sample::I24(value)) => value as f32 / 8_388_608.0,
+            Some(Sample::I32(value)) => value as f32 / 2_147_483_648.0,
+            None => return Ok(None),
+            _ => {
+                return Err(AnalysisDecodeError::Corrupt(format!(
+                    "{} contains unexpected AIFF sample data",
+                    self.path.display()
+                )));
+            }
+        };
+        Ok(Some(value))
     }
 }
 
@@ -116,7 +171,7 @@ impl Seek for HeaderBudget {
 }
 
 pub(super) fn probe(path: &Path) -> Result<AudioProbe, AnalysisDecodeError> {
-    let audio = PcmAiff::open(path)?;
+    let audio = AiffPcmReader::open(path)?;
     Ok(AudioProbe {
         duration_seconds: Some((audio.frames as f64 / f64::from(audio.sample_rate)) as f32),
         sample_rate: Some(audio.sample_rate),
@@ -129,7 +184,7 @@ pub(super) fn decode(
     path: &Path,
     max_seconds: Option<f32>,
 ) -> Result<DecodedAudio, AnalysisDecodeError> {
-    let mut audio = PcmAiff::open(path)?;
+    let mut audio = AiffPcmReader::open(path)?;
     let frames = max_seconds
         .filter(|limit| *limit > 0.0)
         .map(|limit| {
@@ -139,22 +194,9 @@ pub(super) fn decode(
         .unwrap_or(audio.frames);
     let mut samples = Vec::new();
     for _ in 0..frames * u64::from(audio.channels) {
-        let sample = audio
-            .reader
-            .read_sample()
-            .map_err(|error| read_error(path, error))?;
-        let value = match sample {
-            Some(Sample::I8(value)) => f32::from(value) / 128.0,
-            Some(Sample::I16(value)) => f32::from(value) / 32_768.0,
-            Some(Sample::I24(value)) => value as f32 / 8_388_608.0,
-            Some(Sample::I32(value)) => value as f32 / 2_147_483_648.0,
-            _ => {
-                return Err(AnalysisDecodeError::Corrupt(format!(
-                    "{} contains unexpected AIFF sample data",
-                    path.display()
-                )));
-            }
-        };
+        let value = audio.read_sample()?.ok_or_else(|| {
+            AnalysisDecodeError::Corrupt(format!("{} ended during AIFF decode", path.display()))
+        })?;
         samples.push(value);
     }
     Ok(DecodedAudio {
@@ -195,7 +237,10 @@ mod tests {
     use crate::analysis::{audio::probe_metadata, audio_decode::decode_audio_typed};
 
     // Two stereo frames with signed 16-bit big-endian PCM at 48 kHz.
-    const FIXTURE: &[u8] = b"FORM\0\0\0\x36AIFFCOMM\0\0\0\x12\0\x02\0\0\0\x02\0\x10\x40\x0e\xbb\x80\0\0\0\0\0\0SSND\0\0\0\x10\0\0\0\0\0\0\0\0\x80\0\x40\0\0\0\xc0\0";
+    const FIXTURE: &[u8] = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../test-fixtures/stereo-pcm16.aiff"
+    ));
 
     #[test]
     fn aiff_metadata_and_decode_preserve_big_endian_stereo_frames() {
