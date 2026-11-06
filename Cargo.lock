@@ -8980,6 +8980,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "yield-link"
+version = "0.1.0"
+
+[[package]]
 name = "yield-media"
 version = "0.1.0"
 dependencies = [
