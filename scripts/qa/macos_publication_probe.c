@@ -105,9 +105,26 @@ int main(void) {
     expect_entry(root, "preserved-stage", "owned");
     puts("unlinkat: cleanup-name substitution deleted unrelated entry");
 
+    // Exclusive create returns the owned fd but exposes the final name before completion.
+    const int create_flags = O_CREAT | O_EXCL | O_WRONLY | O_NOFOLLOW | O_CLOEXEC;
+    int output = openat(root, "direct-output", create_flags, 0600);
+    check(output, "openat exclusive final create");
+    expect_entry(root, "direct-output", "");
+    assert(write(output, "part", 4) == 4);
+    expect_entry(root, "direct-output", "part");
+    assert(openat(root, "direct-output", create_flags, 0600) == -1 && errno == EEXIST);
+    check(renameat(root, "direct-output", root, "original-output"), "substitute direct output");
+    write_entry(root, "direct-output", "unrelated");
+    assert(write(output, "ial", 3) == 3);
+    check(close(output), "close direct output");
+    expect_entry(root, "direct-output", "unrelated");
+    expect_entry(root, "original-output", "partial");
+    puts("openat: exclusive create held its own file but exposed empty and partial final data");
+
     const char *entries[] = {
         "anchor", "held-stage", "final", "collision-stage", "collision-final",
-        "original-clone", "clone-final", "preserved-stage", "stage"
+        "original-clone", "clone-final", "preserved-stage", "stage",
+        "direct-output", "original-output"
     };
     for (size_t i = 0; i < sizeof(entries) / sizeof(entries[0]); ++i) {
         if (unlinkat(root, entries[i], 0) == -1 && errno != ENOENT) {

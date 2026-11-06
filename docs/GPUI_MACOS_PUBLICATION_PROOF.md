@@ -39,6 +39,7 @@ process-local lock does not remove this adversary from the contract.
 | `fclonefileat` | Held source fd, destination directory fd, absent destination, and an expected atomic clone on supporting same-volume filesystems. | Success returns an integer status, no destination fd or identity token. A later reopen by name can see a substituted entry; source and final are distinct objects, and successful clone leaves staging needing independently safe cleanup. Its availability is filesystem dependent. |
 | `unlinkat` | Held parent directory fd and relative entry name; no-follow options can reject traversal through links. | Target is still the current name entry. There is no expected file identity operand; a same-user substitution between check and unlink can delete an unrelated object. `AT_UNIQUE` limits hard links, and `AT_NODELETEBUSY` rejects open files; neither binds deletion to the held staged fd. |
 | Path-based `rename`, `unlink`, `FileManager` replace | Common macOS save operations. | They do not provide the required held source identity and no-replace/cleanup authority under this threat boundary. |
+| `openat` with `O_CREAT` and `O_EXCL` | Claims an absent leaf and returns the exact new file descriptor. Later writes stay on that object even if the name is replaced. | The final name is visible before the first byte is written. Writing through the descriptor cannot install a complete staged file at the final name or safely remove that name after a failure. |
 
 Apple documents the signatures and scope in the macOS
 [`rename(2)`](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/man/man2/rename.2),
@@ -72,6 +73,10 @@ fixture. On this host it observed:
   unrelated replacement. The syscall gives no resulting handle to disambiguate.
 - Replacing the cleanup name after opening the owned file made `unlinkat`
   remove the unrelated replacement while preserving the held owned object.
+- An exclusive final create refused a collision and returned the owned
+  descriptor. A second open observed the empty file and then its partial
+  contents. After name substitution, writes through the held descriptor reached
+  the original object, and the final name held unrelated bytes.
 
 These are deterministic, orchestrated substitution fixtures; they show API
 operand semantics on this host. They are not a scheduler race stress test, a
@@ -96,3 +101,42 @@ and substitution tests, sync/crash replay, and production admission be split
 into separate tasks. If those primitives are unavailable, the macOS release
 scope requires an explicit contract/product decision; this proof does not
 silently weaken invariants 19–22.
+
+## Managed destination option
+
+The [follow-up review](https://pulse.iocore.dev/#/issues/6022) found no
+supported descriptor operation that both atomically publishes a complete
+output and supplies the final identity in an arbitrary same-user writable
+directory. Darwin's file descriptor guards govern use of an fd. The
+experimental vnode guard declarations are private. The public exclusive create
+guarantee and the probe above establish ownership at creation and expose the
+visibility gap. [Apple's open manual](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/man/man2/open.2)
+and [XNU guard definitions](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/sys/guarded.h)
+describe those interfaces.
+
+A narrower product scope could publish on a qualified local APFS volume into
+a dedicated managed output source. A separately authorized service under a
+different identity would have exclusive namespace write authority over both
+the staging and final directories. Yield and other processes of the interactive
+user could read published media. Both directories and their protected ancestors
+would need live no-follow verification. A private single writer would have to
+exclude competing name mutations throughout each effect. A same-user process,
+an ordinary 0700 directory, or a helper that accepts arbitrary client paths
+would leave the substitution problem intact. Apple provides an approval path
+for a bundled helper through [Service Management](https://developer.apple.com/documentation/servicemanagement/smappservice).
+
+With that boundary established, a candidate can keep the validated staged
+descriptor through the same-volume exclusive rename and compare the reopened
+final identity before registering the output. The journal would persist
+`CopyValidated` before the claim. The service would need a qualified allocation
+bound, reserve, and file and directory synchronization evidence. Recovery
+would rebind the protected roots and verify identities before advancing. Cleanup
+would require its own grant and verify the expected owned object and subsequent
+absence within the protected namespace. A collision, unknown outcome, stale
+root or unproved absence retains the applicable files, charge and journal
+evidence. This candidate has no native helper or qualification evidence yet.
+
+The release decision is whether to allow that restricted managed destination
+and its separate service, or keep macOS extraction unavailable while retaining
+arbitrary destinations as a requirement. The existing macOS writer remains
+unsupported under the current scope.
