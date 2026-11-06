@@ -305,7 +305,7 @@ impl Browser {
             cx.notify();
             return;
         };
-        self.waveform_region_drag = None;
+        self.abandon_waveform_region_drag(cx);
         self.waveform_pan_drag = None;
         self.waveform_scrollbar_drag = None;
         self.waveform_fade_hover = None;

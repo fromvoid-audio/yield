@@ -1960,7 +1960,7 @@ impl Render for Browser {
                     cx,
                 );
                 let region_changed =
-                    view.update_waveform_region_drag(event.position, event.pressed_button);
+                    view.update_waveform_region_drag(event.position, event.pressed_button, cx);
                 if region_changed
                     && view
                         .waveform_region_drag

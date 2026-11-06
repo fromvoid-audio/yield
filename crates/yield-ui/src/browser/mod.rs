@@ -430,6 +430,7 @@ pub(crate) struct Browser {
     waveform_edit_settings: WaveformEditSettings,
     waveform_fade_hover: Option<waveform_fades::WaveformEditFadeHit>,
     waveform_region_drag: Option<waveform::WaveformRegionDrag>,
+    playmark_tempo_audition: Option<transport::PlaymarkTempoAudition>,
     waveform_pan_drag: Option<waveform::WaveformPanDrag>,
     waveform_scrollbar_drag: Option<waveform_scrollbar::WaveformScrollbarDrag>,
     played_ranges: played_ranges::PlayedRanges,
@@ -800,6 +801,7 @@ impl Browser {
             waveform_edit_settings: waveform::default_edit_settings(),
             waveform_fade_hover: None,
             waveform_region_drag: None,
+            playmark_tempo_audition: None,
             waveform_pan_drag: None,
             waveform_scrollbar_drag: None,
             played_ranges: played_ranges::PlayedRanges::default(),
@@ -3188,7 +3190,7 @@ impl Browser {
                         .waveform_viewport
                         .is_effectively_equal(WaveformViewport::full())
                 {
-                    if self.reset_waveform_viewport() {
+                    if self.reset_waveform_viewport(cx) {
                         cx.notify();
                     }
                 } else {
@@ -3229,7 +3231,7 @@ impl Browser {
                 return;
             }
             if !shift && !alt && key.eq_ignore_ascii_case("z") {
-                if self.zoom_waveform_to_selection() {
+                if self.zoom_waveform_to_selection(cx) {
                     cx.notify();
                 }
                 return;
