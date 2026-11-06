@@ -16,6 +16,10 @@ use yield_platform::accessibility::{
     AxAction, AxChild, AxEvent, AxFrame, AxRegistry, AxRole, AxSlider,
 };
 
+use super::metronome_settings::{
+    BEATS as METRONOME_BEATS, OFFBEATS as METRONOME_OFFBEATS, SOUND as METRONOME_SOUND,
+    SOUNDS as METRONOME_SOUNDS, VOLUME as METRONOME_VOLUME,
+};
 use super::{Browser, tag_library};
 
 pub(super) const ADD_SOURCE: &str = "browser-add-source";
@@ -101,6 +105,14 @@ const SETTINGS_ORDER: &[&str] = &[
     ANTI_CLICK,
     ANTI_CLICK_FADE_DECREASE,
     ANTI_CLICK_FADE_INCREASE,
+    METRONOME_VOLUME,
+    METRONOME_BEATS,
+    METRONOME_OFFBEATS,
+    METRONOME_SOUND,
+    METRONOME_SOUNDS[0].0,
+    METRONOME_SOUNDS[1].0,
+    METRONOME_SOUNDS[2].0,
+    METRONOME_SOUNDS[3].0,
     HELP_TIPS,
     VISUAL_EFFECT_PRESET,
     VISUAL_EFFECT_TOGGLE,
@@ -250,6 +262,7 @@ pub(super) struct BrowserAccessibility {
     registry: Rc<RefCell<AxRegistry>>,
     last_controls: RefCell<Vec<AxChild>>,
     last_volume: Cell<Option<f32>>,
+    last_metronome_volume: Cell<Option<f32>>,
     visible_sources: Vec<PathBuf>,
     visible_folders: Vec<PathBuf>,
     visible_samples: Vec<PathBuf>,
@@ -268,6 +281,7 @@ impl BrowserAccessibility {
         window: &mut Window,
         cx: &mut Context<Browser>,
         job_details_focus: FocusHandle,
+        metronome_focus: [(&'static str, FocusHandle); 4],
     ) -> Option<Self> {
         let handle = match window.window_handle() {
             Ok(handle) => handle,
@@ -324,6 +338,7 @@ impl BrowserAccessibility {
         for id in SETTINGS_ORDER.iter().copied().chain([SETTINGS_OPEN]) {
             control_focus.insert(id.to_owned(), cx.focus_handle());
         }
+        control_focus.extend(metronome_focus.map(|(id, focus)| (id.to_owned(), focus)));
         for column in [
             SortColumn::Name,
             SortColumn::Rating,
@@ -357,6 +372,7 @@ impl BrowserAccessibility {
             registry: Rc::new(RefCell::new(registry)),
             last_controls: RefCell::new(Vec::new()),
             last_volume: Cell::new(None),
+            last_metronome_volume: Cell::new(None),
             visible_sources: Vec::new(),
             visible_folders: Vec::new(),
             visible_samples: Vec::new(),
@@ -659,7 +675,31 @@ impl BrowserAccessibility {
                         {
                             view.mark_folder_keyboard_focus(path.clone());
                         }
-                        if settings_action {
+                        if event.id == METRONOME_VOLUME {
+                            let value = match event.action {
+                                AxAction::SetValue(value) => value
+                                    .parse::<f32>()
+                                    .ok()
+                                    .filter(|value| (0.0..=1.0).contains(value)),
+                                AxAction::Increment | AxAction::Decrement => {
+                                    let key = if event.action == AxAction::Increment {
+                                        "right"
+                                    } else {
+                                        "left"
+                                    };
+                                    super::volume::keyboard_volume(
+                                        view.metronome_settings.mix.volume,
+                                        key,
+                                        false,
+                                    )
+                                }
+                                AxAction::Focus => None,
+                                AxAction::Press => return,
+                            };
+                            if let Some(value) = value {
+                                view.set_metronome_volume(value, cx);
+                            }
+                        } else if settings_action {
                             match event.action {
                                 AxAction::Focus => {}
                                 AxAction::Press => {
@@ -934,6 +974,10 @@ impl Browser {
             .try_global::<crate::theme::DebugPostEffectOverride>()
             .is_some_and(|state| state.enabled);
         match id {
+            METRONOME_VOLUME | METRONOME_BEATS | METRONOME_OFFBEATS | METRONOME_SOUND => editable,
+            id if METRONOME_SOUNDS.iter().any(|(option, _, _)| *option == id) => {
+                editable && self.metronome_settings.menu_open()
+            }
             SETTINGS_CLOSE | THEME_RESET => true,
             THEME_CHOOSE | MOTION | TEXT_SCALE | AUTOPLAY | ANTI_CLICK | HELP_TIPS => editable,
             ANTI_CLICK_FADE_DECREASE => editable && self.preferences.anti_click_settings().1 > 0.0,
@@ -1029,6 +1073,9 @@ impl Browser {
             ANTI_CLICK => self.toggle_anti_click(cx),
             ANTI_CLICK_FADE_DECREASE => self.change_anti_click_fade(-1.0, cx),
             ANTI_CLICK_FADE_INCREASE => self.change_anti_click_fade(1.0, cx),
+            METRONOME_BEATS => self.toggle_metronome_layer(false, cx),
+            METRONOME_OFFBEATS => self.toggle_metronome_layer(true, cx),
+            METRONOME_SOUND => self.toggle_metronome_sound_menu(window, cx),
             HELP_TIPS => self.toggle_help_tooltips_from_accessibility(cx),
             VISUAL_EFFECT_PRESET => self.cycle_visual_effect_preset(cx),
             VISUAL_EFFECT_TOGGLE => self.toggle_visual_effect_from_accessibility(window, cx),
@@ -1050,7 +1097,13 @@ impl Browser {
             USER_SHADER_CLEAR => self.clear_user_shader(window, cx),
             USER_SHADER_COPY => self.copy_user_shader_source(cx),
             USER_SHADER_TOGGLE => self.toggle_user_shader_from_accessibility(window, cx),
-            _ => {}
+            _ => {
+                if let Some((_, _, sound)) =
+                    METRONOME_SOUNDS.iter().find(|(option, _, _)| *option == id)
+                {
+                    self.select_metronome_sound(*sound, window, cx);
+                }
+            }
         }
     }
 
@@ -1443,6 +1496,7 @@ impl Browser {
                 let weeks_value = Some(format!("{weeks} weeks"));
                 let (anti_click_enabled, anti_click_fade_ms) =
                     self.preferences.anti_click_settings();
+                let metronome = self.metronome_settings.mix;
                 let theme = crate::theme::active(cx);
                 let effect = self.visual_effect_config();
                 let debug_effect_override = cx
@@ -1521,6 +1575,21 @@ impl Browser {
                         "Increase anti-click fade",
                         None,
                         editable && anti_click_fade_ms < yield_session::MAX_ANTI_CLICK_FADE_MS,
+                    ),
+                    AxChild {
+                        id: METRONOME_VOLUME.into(),
+                        role: AxRole::Slider,
+                        label: "Metronome volume".into(),
+                        value: None,
+                        enabled: editable,
+                    },
+                    toggle(METRONOME_BEATS, "Metronome beats", metronome.beats, editable),
+                    toggle(METRONOME_OFFBEATS, "Metronome offbeats", metronome.offbeats, editable),
+                    button(
+                        METRONOME_SOUND,
+                        "Metronome sound",
+                        Some(super::metronome_settings::sound_label(metronome.sound).to_owned()),
+                        editable,
                     ),
                     toggle(HELP_TIPS, "Help tips", self.help_tooltips_enabled, editable),
                     button(
@@ -1662,6 +1731,19 @@ impl Browser {
                         enabled: true,
                     },
                 ]);
+                if editable
+                    && self.metronome_settings.menu_open()
+                    && let Some(index) = controls
+                        .iter()
+                        .position(|control| control.id == METRONOME_SOUND)
+                {
+                    controls.splice(
+                        index + 1..index + 1,
+                        METRONOME_SOUNDS.map(|(id, label, sound)| {
+                            toggle(id, label, sound == metronome.sound, true)
+                        }),
+                    );
+                }
                 controls.push(button(
                     PAYLOAD_DOWNLOAD,
                     "Download and Verify Update",
@@ -2144,23 +2226,34 @@ impl Browser {
             let _ = ax.registry.borrow().set_focused(&id, focused);
         }
         let registry = ax.registry.borrow();
-        let volume = super::volume::quantize_volume(self.volume);
-        if registry.contains(VOLUME) && (controls_changed || ax.last_volume.get() != Some(volume)) {
-            if registry
-                .set_slider(
-                    VOLUME,
-                    AxSlider {
-                        value: f64::from(volume),
-                        min: 0.0,
-                        max: 1.0,
-                    },
-                )
-                .is_ok()
+        for (id, volume, last) in [
+            (
+                VOLUME,
+                super::volume::quantize_volume(self.volume),
+                &ax.last_volume,
+            ),
+            (
+                METRONOME_VOLUME,
+                self.metronome_settings.mix.volume,
+                &ax.last_metronome_volume,
+            ),
+        ] {
+            if !registry.contains(id) {
+                last.set(None);
+            } else if (controls_changed || last.get() != Some(volume))
+                && registry
+                    .set_slider(
+                        id,
+                        AxSlider {
+                            value: f64::from(volume),
+                            min: 0.0,
+                            max: 1.0,
+                        },
+                    )
+                    .is_ok()
             {
-                ax.last_volume.set(Some(volume));
+                last.set(Some(volume));
             }
-        } else if !registry.contains(VOLUME) {
-            ax.last_volume.set(None);
         }
         for (id, focus) in [
             (BEAT_COUNT, self.beat_count_input.read(cx).focus_handle()),

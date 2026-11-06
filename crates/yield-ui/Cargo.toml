@@ -40,6 +40,7 @@ serde_json = "1.0.145"
 toml = "0.8.19"
 yield-platform = { workspace = true, features = ["test-support"] }
 yield-library = { workspace = true, features = ["test-support"] }
+yield-session = { workspace = true, features = ["test-support"] }
 naga = { version = "=25.0.1", features = ["wgsl-in"] }
 gpui = { workspace = true, features = ["test-support"] }
 yield-catalog = { path = "../yield-catalog", features = ["test-support"] }

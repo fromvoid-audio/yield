@@ -622,6 +622,7 @@ impl Browser {
             self.apply_loop_mode_change(self.playback_policy.enabled(), cx);
         }
         self.apply_preference_volume(effective.output_volume);
+        self.apply_metronome_preferences(effective.metronome);
         self.apply_preference_audio_output(
             &effective.audio_output,
             self.preferences.has_pending_reset(),

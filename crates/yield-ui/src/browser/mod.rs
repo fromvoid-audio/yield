@@ -111,6 +111,7 @@ mod history;
 mod job_details;
 mod metadata_panel;
 mod metronome;
+mod metronome_settings;
 mod motion;
 mod normalized_audition;
 mod os_entry;
@@ -538,6 +539,7 @@ pub(crate) struct Browser {
     theme_task: Option<Task<()>>,
     theme_settings_open: bool,
     general_settings: general_settings::GeneralSettings,
+    metronome_settings: metronome_settings::State,
     audio_settings_open: bool,
     shortcut_help: shortcut_help::ShortcutHelpState,
     unsupported_entries: unsupported_entries::UnsupportedEntriesState,
@@ -627,6 +629,7 @@ impl Browser {
                 window,
                 cx,
                 browser.job_details_focus_handle.clone(),
+                browser.metronome_settings.focus_handles(),
             );
             browser
         };
@@ -920,6 +923,7 @@ impl Browser {
             theme_task: None,
             theme_settings_open: false,
             general_settings: general_settings::GeneralSettings::default(),
+            metronome_settings: metronome_settings::State::new(cx),
             audio_settings_open: false,
             shortcut_help: shortcut_help::ShortcutHelpState::new(cx),
             unsupported_entries: unsupported_entries::UnsupportedEntriesState::new(cx),
@@ -3010,6 +3014,14 @@ impl Browser {
             event.is_held,
         ) {
             self.copy_status_log(cx);
+            cx.stop_propagation();
+            return;
+        }
+        if !secondary
+            && !alt
+            && !function
+            && self.handle_metronome_settings_key(key, shift, event.is_held, window, cx)
+        {
             cx.stop_propagation();
             return;
         }
