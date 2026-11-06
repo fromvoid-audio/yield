@@ -244,6 +244,140 @@ mod fixtures {
     }
 
     #[test]
+    fn transient_request_enriches_only_the_selected_pending_file_and_retries() {
+        use yield_library::sample_sources::readiness::FEATURE_INPUT_MAX_BYTES;
+        let frames = (FEATURE_INPUT_MAX_BYTES / 2) as u32 + 1024;
+        let attacks = [32_767, 3_500_073];
+        let fixture = Fixture::new("transient-digest-retry");
+        write_attacks(&fixture.root.path().join("attacks.wav"), frames, attacks);
+        write_attacks(&fixture.root.path().join("other.wav"), frames, attacks);
+        let service = CatalogService::start(&fixture.guard).unwrap();
+        let source = SourceId::from_string("transient-digest-retry");
+        let before = register_and_audit(&service, fixture.root.path(), &source);
+        assert_eq!(before.manifest.len(), 2);
+        assert!(
+            before
+                .manifest
+                .iter()
+                .all(|entry| entry.content_hash.is_none())
+        );
+        let request = request(&source, before.committed_revision, 1).with_pending_digest();
+        service
+            .submit(CatalogCommand::RequestTransientMarkers {
+                request: request.clone(),
+                cancellation: FeatureAnalysisCancellation::new(),
+            })
+            .unwrap();
+        let CatalogEvent::SourceContentDigestCommitted {
+            request: observed,
+            committed_revision,
+            entry,
+        } = receive_until(&service, |event| {
+            matches!(event, CatalogEvent::SourceContentDigestCommitted { .. })
+        })
+        else {
+            unreachable!()
+        };
+        assert_eq!(observed, request);
+        assert_eq!(committed_revision, before.committed_revision + 1);
+        assert_eq!(entry.relative_path, Path::new("attacks.wav"));
+        assert!(entry.content_hash.is_some());
+        let CatalogEvent::TransientMarkersCompleted {
+            request: observed,
+            result,
+            ..
+        } = delivery(&service, 1).into_event_if_live().unwrap()
+        else {
+            unreachable!()
+        };
+        assert_eq!(observed, request);
+        let result = result.unwrap();
+        assert_eq!(result.cache, TransientCacheUse::MissStored);
+        assert_eq!(result.detector_version, STREAM_DETECTOR_VERSION);
+        assert_eq!(result.markers.frames(), attacks);
+
+        service
+            .submit(CatalogCommand::ReadSnapshot {
+                source_id: source.clone(),
+                expected_revision: Some(committed_revision),
+            })
+            .unwrap();
+        let CatalogEvent::SnapshotReady { snapshot: after } = receive_until(&service, |event| {
+            matches!(event, CatalogEvent::SnapshotReady { .. })
+        }) else {
+            unreachable!()
+        };
+        assert_eq!(after.manifest, [entry, before.manifest[1].clone()]);
+        assert_eq!(after.directory_generation, before.directory_generation);
+        assert_eq!(
+            run_request(
+                &service,
+                &source,
+                committed_revision,
+                2,
+                TransientPreset::Normal
+            )
+            .cache,
+            TransientCacheUse::Hit,
+        );
+        wait_for_tag_read_payload(&service, 0);
+        service.shutdown();
+    }
+
+    #[test]
+    fn transient_request_discards_a_deferred_digest_after_the_file_is_replaced() {
+        use yield_library::sample_sources::readiness::{
+            FEATURE_INPUT_MAX_BYTES, SourceFeatureInputError,
+        };
+        let fixture = Fixture::new("transient-digest-replaced");
+        let file = fixture.root.path().join("attacks.wav");
+        let frames = (FEATURE_INPUT_MAX_BYTES / 2) as u32 + 1024;
+        write_attacks(&file, frames, [32_767, 3_500_073]);
+        let (service, gate) = CatalogService::start_with_test_gate(&fixture.guard).unwrap();
+        let source = SourceId::from_string("transient-digest-replaced");
+        let before = register_and_audit(&service, fixture.root.path(), &source);
+        let (entered_send, entered_recv) = mpsc::sync_channel(1);
+        let (release_send, release_recv) = mpsc::sync_channel(1);
+        *gate.transient_compute.lock().unwrap() = Some((entered_send, release_recv));
+        service
+            .submit(CatalogCommand::RequestTransientMarkers {
+                request: request(&source, before.committed_revision, 1).with_pending_digest(),
+                cancellation: FeatureAnalysisCancellation::new(),
+            })
+            .unwrap();
+        entered_recv.recv_timeout(Duration::from_secs(2)).unwrap();
+        fs::rename(&file, file.with_extension("old")).unwrap();
+        write_attacks(&file, frames, [20_000, 3_500_073]);
+        release_send.send(()).unwrap();
+        assert!(matches!(
+            service
+                .recv_delivery_timeout(Duration::from_secs(2))
+                .unwrap()
+                .into_event_if_live(),
+            Some(CatalogEvent::TransientMarkersCompleted {
+                result: Err(TransientRequestFailure::Input(
+                    SourceFeatureInputError::Changed
+                )),
+                ..
+            }),
+        ));
+        service
+            .submit(CatalogCommand::ReadSnapshot {
+                source_id: source,
+                expected_revision: Some(before.committed_revision),
+            })
+            .unwrap();
+        let CatalogEvent::SnapshotReady { snapshot: after } = receive_until(&service, |event| {
+            matches!(event, CatalogEvent::SnapshotReady { .. })
+        }) else {
+            unreachable!()
+        };
+        assert_eq!(after.manifest, before.manifest);
+        wait_for_tag_read_payload(&service, 0);
+        service.shutdown();
+    }
+
+    #[test]
     fn pending_source_digest_captures_all_bytes_and_rejects_retired_custody() {
         use yield_library::sample_sources::readiness::{
             FEATURE_INPUT_MAX_BYTES, SourceFeatureInputError,
