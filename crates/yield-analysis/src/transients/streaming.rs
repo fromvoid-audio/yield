@@ -142,4 +142,37 @@ mod tests {
             "WAV streaming sample limit"
         );
     }
+
+    #[test]
+    fn streaming_transients_stop_reading_when_cancelled_after_the_first_chunk() {
+        struct CancelDuringRead<'a> {
+            remaining: &'a [u8],
+            cancel: &'a AtomicBool,
+            until_cancel: usize,
+        }
+        impl Read for CancelDuringRead<'_> {
+            fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
+                let read = self.remaining.read(output)?;
+                self.until_cancel = self.until_cancel.saturating_sub(read);
+                if self.until_cancel == 0 {
+                    self.cancel
+                        .store(true, std::sync::atomic::Ordering::Release);
+                }
+                Ok(read)
+            }
+        }
+
+        let bytes = stereo_wav(3 * CORE_FRAMES, &[]);
+        let cancel = AtomicBool::new(false);
+        let mut reader = CancelDuringRead {
+            remaining: &bytes,
+            cancel: &cancel,
+            until_cancel: (CORE_FRAMES + CONTEXT_FRAMES + 1024) * 4,
+        };
+        assert_eq!(
+            detect_streaming_transients(&mut reader, TransientPreset::Normal, &cancel).unwrap_err(),
+            "Cancelled",
+        );
+        assert!(reader.remaining.len() > CORE_FRAMES * 4);
+    }
 }
