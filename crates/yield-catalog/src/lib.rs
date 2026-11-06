@@ -1564,6 +1564,15 @@ pub enum CatalogEvent {
         /// Owner-validated existing descriptor result.
         result: Result<SourceSimilarityResult, SimilarityDispatchFailure>,
     },
+    /// One audited manifest entry acquired its previously deferred scanner digest.
+    SourceContentDigestCommitted {
+        /// Source lifecycle and previous revision that admitted the write.
+        request: SourceTransientRequest,
+        /// New authoritative revision. The directory generation is unchanged.
+        committed_revision: u64,
+        /// Exact manifest entry with its digest filled in.
+        entry: SourceManifestEntry,
+    },
     /// Exact owner-validated transient markers or a bounded failure.
     TransientMarkersCompleted {
         /// Original immutable request and caller correlation.
@@ -2640,6 +2649,22 @@ impl EventReservation<'_> {
     }
 }
 
+impl<'a> EventReservation<'a> {
+    fn split_read_event(&mut self, bytes: usize) -> Self {
+        assert!(self.remaining > 0 && self.tag_read_payload_bytes >= bytes);
+        self.remaining -= 1;
+        self.tag_read_payload_bytes -= bytes;
+        Self {
+            hub: self.hub,
+            admission: self.admission,
+            remaining: 1,
+            curation_payload_bytes: 0,
+            curation_update_count: 0,
+            tag_read_payload_bytes: bytes,
+        }
+    }
+}
+
 fn validate_command(command: &CatalogCommand) -> Result<(), CatalogSubmitError> {
     match command {
         CatalogCommand::RequestSimilarity { .. }
@@ -3047,6 +3072,7 @@ fn encoded_path_len(path: &Path) -> usize {
 fn command_event_budget(command: &CatalogCommand) -> usize {
     match command {
         CatalogCommand::RequestFeatureAnalysis { .. } => 6,
+        CatalogCommand::RequestTransientMarkers { request, .. } => request.event_budget(),
         CatalogCommand::ConsumeReplay { .. } => 0,
 
         CatalogCommand::Register { .. } | CatalogCommand::RegisterVerified { .. } => 2,
@@ -3054,7 +3080,6 @@ fn command_event_budget(command: &CatalogCommand) -> usize {
         | CatalogCommand::RequestCollectionHistory { .. }
         | CatalogCommand::RequestCollectionHistoryGroup { .. }
         | CatalogCommand::RequestSimilarity { .. }
-        | CatalogCommand::RequestTransientMarkers { .. }
         | CatalogCommand::RequestWavMetadata { .. }
         | CatalogCommand::RequestIndexPage { .. }
         | CatalogCommand::RequestIndexInspection { .. }
@@ -3203,7 +3228,7 @@ fn command_tag_read_payload_bytes(command: &CatalogCommand) -> Result<usize, Cat
             Ok(request.charged_bytes())
         }
         CatalogCommand::RequestSimilarity { .. } => Ok(similarity_dispatch::MAX_RESULT_BYTES),
-        CatalogCommand::RequestTransientMarkers { .. } => Ok(transient_dispatch::MAX_RESULT_BYTES),
+        CatalogCommand::RequestTransientMarkers { request, .. } => Ok(request.result_bytes()),
         CatalogCommand::RequestIndexPage { .. } | CatalogCommand::RequestIndexInspection { .. } => {
             Ok(MAX_INDEX_PAGE_PAYLOAD_BYTES)
         }
@@ -4191,7 +4216,7 @@ fn run_worker_with_sources(
             preparations.close(&mut sources);
         }
         if !preparations.has_slots() {
-            transients.poll(&admission, &sources, test_gate.as_ref());
+            transients.poll(&admission, &mut sources, test_gate.as_ref());
         }
         // Do not enter journal-facing commands or teardown while its original settlement
         // still owns any native reservation. Keep accepted packets/credits in existing bounds.
