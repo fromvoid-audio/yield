@@ -176,8 +176,8 @@ fn ensure_load(browser: &mut Browser, cx: &mut Context<Browser>) -> bool {
     true
 }
 
-/// Handle the release when the loaded waveform belongs to an audited Source.
-pub(super) fn save_released_tempo(
+/// Save the authored tempo when the loaded waveform belongs to an audited Source.
+pub(super) fn save_authored_tempo(
     browser: &mut Browser,
     tempo: SourcePlaymarkTempo,
     cx: &mut Context<Browser>,

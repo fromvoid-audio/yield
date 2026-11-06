@@ -30,7 +30,9 @@ use yield_library::sample_sources::{SampleSource, SourceId, SourceRole};
 use yield_media::{
     WaveformPreview, enumerate_audio_files_with_cancel, load_waveform_preview_with_cancel,
 };
-use yield_session::{CatalogStatus, PreferencePatch, RegistryRevision, RequestId};
+use yield_session::{
+    CatalogStatus, PreferencePatch, RegistryRevision, RequestId, SourcePlaymarkTempo,
+};
 
 use crate::beat_count_input::{BeatCountChanged, BeatCountInput, DEFAULT_BEAT_COUNT};
 use crate::search_input::{SearchChanged, SearchInput, SearchInputOptions, SearchInputRejected};
@@ -1076,8 +1078,8 @@ impl Browser {
             self.beat_guide_count,
             current,
         );
-        let (start_frame, end_frame) = match parsed {
-            Ok(range) => range,
+        let timing = match parsed {
+            Ok(timing) => timing,
             Err(error) => {
                 if let Some(editor) = self.playmark_timing_editor.as_mut() {
                     editor.error = Some(error.clone());
@@ -1089,8 +1091,9 @@ impl Browser {
                 return;
             }
         };
+        let (start_frame, end_frame) = timing.frame_range;
         if playmark_timing::frame_range_for_region(editor.region, preview.total_frames)
-            == Some((start_frame, end_frame))
+            == Some(timing.frame_range)
         {
             self.cancel_playmark_timing_edit();
             if restore_focus {
@@ -1107,11 +1110,31 @@ impl Browser {
             self.cancel_playmark_timing_edit();
             return;
         };
-        let path = editor.path.clone();
+        let tempo = timing
+            .authored_tempo
+            .then(|| {
+                SourcePlaymarkTempo::new(
+                    start_frame as u64,
+                    end_frame as u64,
+                    preview.total_frames as u64,
+                    preview.sample_rate,
+                    self.beat_guide_count,
+                )
+            })
+            .flatten();
         self.cancel_playmark_timing_edit();
+        if let Some(tempo) = tempo
+            && playmark_tempo::save_authored_tempo(self, tempo, cx)
+        {
+            if restore_focus {
+                window.focus(&self.waveform_focus_handle);
+            }
+            cx.notify();
+            return;
+        }
         self.set_waveform_play_region(Some(region));
         similar_sections::invalidate_if_stale(self);
-        match self.submit_playmark_timing_span(&path, region, cx) {
+        match self.submit_playmark_timing_span(&editor.path, region, cx) {
             Some(Ok(())) => {
                 self.set_playback_status("Playmark timing applying to playback".to_string());
             }

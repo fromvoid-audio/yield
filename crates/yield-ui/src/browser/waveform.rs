@@ -2724,7 +2724,7 @@ impl Browser {
                             capture.sample_rate,
                             capture.beat_count,
                         )
-                        && playmark_tempo::save_released_tempo(self, tempo, cx)
+                        && playmark_tempo::save_authored_tempo(self, tempo, cx)
                     {
                         cx.notify();
                         return;
