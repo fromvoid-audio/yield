@@ -3069,6 +3069,10 @@ impl Render for Browser {
 }
 
 #[cfg(test)]
+#[path = "density_layout_tests.rs"]
+mod density_layout_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::path::{Path, PathBuf};
