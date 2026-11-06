@@ -22,6 +22,27 @@ SPEC.loader.exec_module(PACKAGER)
 
 @unittest.skipUnless(platform.system() == "Darwin", "Yield review bundles are macOS-only")
 class BundlePackagerTests(unittest.TestCase):
+    def test_bundle_build_targets_follow_the_exact_checkout(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            checkout = pathlib.Path(temporary)
+            binary = checkout / "target/release-local/yield"
+            self.assertEqual(PACKAGER.bundle_build_targets(checkout, binary), (["-p", "yield"], None))
+            bin_source = checkout / "crates/yield-source-watcher/src/bin"
+            for source in (
+                bin_source / f"{PACKAGER.WATCHER_HELPER}.rs",
+                bin_source / PACKAGER.WATCHER_HELPER / "main.rs",
+            ):
+                with self.subTest(source=source):
+                    source.parent.mkdir(parents=True, exist_ok=True)
+                    source.touch()
+                    targets, helper = PACKAGER.bundle_build_targets(checkout, binary)
+                    self.assertEqual(
+                        targets,
+                        ["-p", "yield", "-p", "yield-source-watcher", "--bin", "yield", "--bin", PACKAGER.WATCHER_HELPER],
+                    )
+                    self.assertEqual(helper, binary.with_name(PACKAGER.WATCHER_HELPER))
+                    source.unlink()
+
     def test_shared_packager_signs_bundle_after_assembling_resources(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = pathlib.Path(temporary)
@@ -43,6 +64,7 @@ class BundlePackagerTests(unittest.TestCase):
                 license_file,
                 info,
                 cwd=ROOT,
+                watcher_helper=pathlib.Path(sys.executable).resolve(),
             )
             self.assertIn("Signature=adhoc", signature)
             result = subprocess.run(
@@ -61,6 +83,28 @@ class BundlePackagerTests(unittest.TestCase):
                 (app / "Contents/Resources/IoskeleyMono-LICENSE.txt").read_bytes(),
                 license_file.read_bytes(),
             )
+            helper = app / "Contents/MacOS" / PACKAGER.WATCHER_HELPER
+            self.assertTrue(helper.is_file())
+            subprocess.run(["codesign", "--verify", "--strict", str(helper)], check=True)
+
+    def test_invalid_watcher_helper_refuses_before_bundle_creation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            missing = root / "missing-helper"
+            nonexecutable = root / "nonexecutable"
+            nonexecutable.write_text("fixture")
+            symlink = root / "aliased-helper"
+            symlink.symlink_to(sys.executable)
+            app = root / "Yield.app"
+            for invalid in (missing, nonexecutable, symlink):
+                with self.subTest(invalid=invalid), self.assertRaisesRegex(
+                    RuntimeError, "missing or invalid macOS watcher helper"
+                ):
+                    PACKAGER.create_signed_bundle(
+                        pathlib.Path(sys.executable), app, missing, missing, {},
+                        cwd=ROOT, watcher_helper=invalid,
+                    )
+                self.assertFalse(app.exists())
 
 
 if __name__ == "__main__":
