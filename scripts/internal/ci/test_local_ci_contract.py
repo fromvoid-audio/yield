@@ -533,6 +533,9 @@ class NativeCheckCleanupTests(unittest.TestCase):
     def test_registration_generation_case_uses_native_handoff_and_retains_evidence(self) -> None:
         self.run_native_check(0, case="prerequisite:source-registration-generation", redirect_evidence=True)
 
+    def test_retirement_inventory_case_uses_native_handoff_and_retains_evidence(self) -> None:
+        self.run_native_check(0, case="prerequisite:registered-retirement-inventory", redirect_evidence=True)
+
     def test_audition_refuses_before_coordinator_or_clean_state_without_opt_in(self) -> None:
         args = type(
             "Args",

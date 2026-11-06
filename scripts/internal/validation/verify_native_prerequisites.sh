@@ -8,6 +8,10 @@ if [[ "$CASE" == startup-namespace-failure ]]; then
   echo 'Use scripts/yield-local-ci check --sha <full-commit-sha> --lane native --case prerequisite:startup-namespace-failure; it runs both receive and poll variants in separate production reset windows.' >&2
   exit 2
 fi
+if [[ "$CASE" == registered-retirement-inventory && ! "${YIELD_LOCAL_CI_COORDINATOR_FD:-}" =~ ^[0-9]+$ ]]; then
+  echo 'Use scripts/yield-local-ci check --sha <full-commit-sha> --lane native --case prerequisite:registered-retirement-inventory for the reversible production-state window.' >&2
+  exit 2
+fi
 HOST="$(rustc -vV | sed -n 's/^host: //p')"
 NATIVE_OS="$(uname -s)"
 case "$NATIVE_OS:$HOST" in
@@ -107,6 +111,10 @@ case "$CASE" in
     run_tests registration-generation registration_generation 7
     run_tests retained-source-rollback preaudit_denied_rollback_retry_retains_registered_count_and_original_policy 1
     run_tests foreign-owner-decision genuine_foreign_source_registration_cannot_fill_original_decision_slot 1
+    ;;
+  registered-retirement-inventory)
+    [[ "$PLATFORM" == macos ]] || exit 1
+    run_tests retirement-inventory operation_journal::owner::tests::native_retirement_inventory::native_retirement_inventory_genuine_registered_original_consumer 1 --exact --ignored
     ;;
   startup-production)
     [[ "$PLATFORM" == macos ]] || exit 1

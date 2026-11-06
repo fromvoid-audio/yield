@@ -24,6 +24,7 @@ runner output paths and use the legacy evidence collection route.
 | source-release-policy | macOS, Windows/MSVC | Two original Registered policy cases, generic missing-policy compatibility and two separate arithmetic cases |
 | source-release-policy integration | macOS | Three original all-owner graph/missing-policy/foreign-family refusal cases |
 | source-registration-generation | macOS | Seven registration-generation checks plus original Source rollback custody and foreign journal decision refusal |
+| registered-retirement-inventory | macOS | One exact opt-in test of the genuine Registered retirement factory, original custody and teardown |
 | startup-production | macOS | Original production bootstrap and exact descriptor-bound historical rebuild |
 | startup-control-failure | macOS | Original production BEGIN-denial diagnostic, preserved journal and retained credits |
 | startup-namespace-failure | macOS | Original production namespace failure and reply/worker lifetime |
