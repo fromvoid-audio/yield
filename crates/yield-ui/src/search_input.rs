@@ -269,6 +269,10 @@ impl SearchInput {
         self.focus_handle.clone()
     }
 
+    pub(crate) fn enable_tab_stop(&mut self) {
+        self.focus_handle = self.focus_handle.clone().tab_stop(true);
+    }
+
     pub(crate) fn content(&self) -> &str {
         &self.content
     }

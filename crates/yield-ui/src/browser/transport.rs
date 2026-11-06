@@ -9,6 +9,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use super::Browser;
 use super::metronome::{self, PlaybackMetronomeGrid};
 use super::played_ranges;
+use super::tempo_audition::{self, TempoPlaybackLabel};
 use super::waveform::WaveformPlayRegion;
 use gpui::Context;
 use reson::{
@@ -177,6 +178,16 @@ pub(super) struct PlaybackIntent {
     pub(super) origin: PlaybackIntentOrigin,
     /// Last admitted or confirmed configuration, captured by output resume and deferred preparation.
     pub(super) resume_desired: Option<PlaybackDesiredState>,
+}
+
+/// A resolved audition with all settings captured for one transport admission.
+pub(super) struct ResolvedAudition {
+    pub(super) intent: PlaybackIntent,
+    pub(super) request: PlaybackRuntimeRequest,
+    pub(super) start: f64,
+    pub(super) metronome_grid: Option<PlaybackMetronomeGrid>,
+    pub(super) metronome_beat_count: Option<u16>,
+    pub(super) tempo_label: Option<TempoPlaybackLabel>,
 }
 
 impl PlaybackIntent {
@@ -801,6 +812,11 @@ impl Browser {
         cx: &mut Context<Self>,
     ) -> Option<Result<(), String>> {
         let accepted_playback_id = self.latest_playback_request_id?;
+        if self.tempo_audition.is_stretched() {
+            return Some(Err(String::from(
+                "Restart audition to apply this change at the target tempo",
+            )));
+        }
         let path = self.playing_path.clone()?;
         let accepted = self.accepted_playback_intent.as_ref()?;
         if accepted.path != path
@@ -1251,10 +1267,11 @@ impl Browser {
         expected_span: Option<WaveformPlayRegion>,
         cx: &mut Context<Self>,
     ) {
-        let Some(handle) = self.playback.as_ref().map(|runtime| runtime.handle.clone()) else {
+        self.tempo_audition.cancel_pending();
+        if self.playback.is_none() {
             self.clear_playback_cursor();
             return;
-        };
+        }
         if should_cancel_pending_autoplay(self.autoplay_selection, Some(intent.origin)) {
             self.clear_playback_cursor();
             self.set_playback_status("Selection autoplay disabled".to_string());
@@ -1335,6 +1352,37 @@ impl Browser {
             edit_fade: None,
             metronome: metronome::config_for_count(metronome_beat_count, metronome_grid),
         };
+        let audition = ResolvedAudition {
+            intent,
+            request,
+            start,
+            metronome_grid,
+            metronome_beat_count,
+            tempo_label: None,
+        };
+        if let Some(audition) = tempo_audition::route(self, audition, cx) {
+            self.submit_resolved_audition(audition, cx);
+        }
+    }
+
+    /// Submit a fenced completion or the captured raw request to the current playback runtime.
+    pub(super) fn submit_resolved_audition(
+        &mut self,
+        audition: ResolvedAudition,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(handle) = self.playback.as_ref().map(|runtime| runtime.handle.clone()) else {
+            self.clear_playback_cursor();
+            return;
+        };
+        let ResolvedAudition {
+            intent,
+            request,
+            start,
+            metronome_grid,
+            metronome_beat_count,
+            tempo_label,
+        } = audition;
         self.normalized_gain_runtime_pending = None;
         self.playback_epoch = self.playback_epoch.wrapping_add(1);
         self.pending_loop_retarget = None;
@@ -1343,6 +1391,7 @@ impl Browser {
         self.playback_cursor_interpolation = None;
         match handle.try_play(request) {
             Ok(request_id) => {
+                self.tempo_audition.playing = tempo_label;
                 let record_last_played = should_record_last_played(intent.origin);
                 let accepted_path = intent.path.clone();
                 let accepted_at = current_unix_epoch_seconds();
@@ -1371,6 +1420,7 @@ impl Browser {
                 self.ensure_playback_monitor(cx);
             }
             Err(error) => {
+                self.tempo_audition.playing = None;
                 self.pending_loop_retarget = None;
                 self.latest_playback_request_id = None;
                 self.playing_path = None;
@@ -1385,6 +1435,8 @@ impl Browser {
     }
 
     pub(super) fn stop_playback(&mut self) {
+        self.tempo_audition.cancel_pending();
+        self.tempo_audition.playing = None;
         if self.compare_anchor_play_pending {
             self.compare_anchor_generation = self.compare_anchor_generation.wrapping_add(1);
             self.compare_anchor_task.take();
@@ -1441,7 +1493,10 @@ impl Browser {
                     if let Some(pending) = self.pending_loop_retarget.as_ref() {
                         self.set_pending_playback_status(pending.request.target.desired);
                     } else {
-                        self.set_playback_status("Playing".to_string());
+                        self.set_playback_status(tempo_audition::playing_status(
+                            self.tempo_audition.playing,
+                            None,
+                        ));
                     }
                 }
                 PlaybackRuntimeEvent::Progress { id, progress } => {
@@ -1672,11 +1727,11 @@ impl Browser {
     }
 
     fn set_playback_status_from_progress(&mut self, progress: &PlaybackRuntimeProgress) {
-        if let Some(progress) = progress.progress {
-            let percent = progress * 100.0;
-            self.set_playback_status(format!("Playing {percent:.0}%"));
-        } else {
-            self.set_playback_status("Playing".to_string());
+        if !self.tempo_audition.is_preparing() {
+            self.set_playback_status(tempo_audition::playing_status(
+                self.tempo_audition.playing,
+                progress.progress,
+            ));
         }
     }
 
@@ -1688,6 +1743,7 @@ impl Browser {
     }
 
     fn clear_current_playback(&mut self, status: &str) {
+        self.tempo_audition.playing = None;
         self.cancel_normalized_audition();
         self.pending_progress_poll = None;
         self.pending_loop_retarget = None;

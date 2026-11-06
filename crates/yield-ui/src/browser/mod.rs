@@ -143,6 +143,7 @@ mod tag_filter;
 mod tag_library;
 mod tag_pager;
 mod tags;
+mod tempo_audition;
 mod transient_markers;
 mod transport;
 mod unsupported_entries;
@@ -579,6 +580,7 @@ pub(crate) struct Browser {
     playback_monitor_generation: u64,
     playback_monitor_running: bool,
     playback: Option<PlaybackRuntime>,
+    tempo_audition: tempo_audition::State,
     file_drag: file_drag::FileDragState,
     directory_open: directory_open::DirectoryOpenState,
     handoff_task: Option<Task<()>>,
@@ -966,6 +968,7 @@ impl Browser {
             playback_monitor_generation: 0,
             playback_monitor_running: false,
             playback: None,
+            tempo_audition: tempo_audition::State::new(cx),
             file_drag: file_drag::FileDragState::default(),
             directory_open: directory_open::DirectoryOpenState::default(),
             handoff_task: None,
