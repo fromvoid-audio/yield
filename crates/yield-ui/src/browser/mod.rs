@@ -664,7 +664,9 @@ impl Browser {
             &beat_count_input,
             |view, _input, event: &BeatCountChanged, cx| {
                 view.beat_guide_count = event.count;
-                view.apply_metronome_count_change(event.count, cx);
+                if event.committed {
+                    view.apply_metronome_count_change(event.count, cx);
+                }
                 cx.notify();
             },
         );

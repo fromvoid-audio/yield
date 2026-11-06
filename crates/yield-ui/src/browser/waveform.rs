@@ -208,7 +208,7 @@ impl Render for BeatCountTooltip {
             .border_color(crate::theme::color(theme.colors.border_emphasis))
             .text_size(px(theme.typography.small_size))
             .text_color(crate::theme::color(theme.colors.text_primary))
-            .child("Beat guide divisions.")
+            .child("Beat guide divisions. Drag up or down to adjust.")
     }
 }
 
