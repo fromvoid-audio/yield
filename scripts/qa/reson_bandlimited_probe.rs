@@ -157,6 +157,7 @@ mod tests {
                 let expected =
                     (input_frames * u64::from(target_rate)).div_ceil(u64::from(source_rate));
                 assert_eq!(rendered, expected);
+                assert_eq!(stream.input().len(), 0);
                 assert_eq!(counts, (0, 0));
             }
         }
@@ -212,6 +213,62 @@ mod tests {
             for sample in cycle {
                 assert_eq!(stream.next(), Some(sample));
             }
+        });
+        assert_eq!(counts, (0, 0));
+    }
+
+    #[test]
+    fn late_endpoint_masks_prefetch_without_discarding_it() {
+        let (source_rate, target_rate) = (44_100, 48_000);
+        let samples = (0..441)
+            .map(|frame| {
+                let left = if frame < 147 {
+                    frame as f32 / 147.0
+                } else {
+                    -1.0
+                };
+                [left, -left]
+            })
+            .collect::<Vec<_>>();
+        let reads = std::cell::Cell::new(0);
+        let input = samples
+            .iter()
+            .copied()
+            .inspect(|_| reads.set(reads.get() + 1));
+        let mut stream = StreamingResampler::new(input, source_rate, target_rate).unwrap();
+        let mut uninterrupted =
+            StreamingResampler::new(samples.iter().copied(), source_rate, target_rate).unwrap();
+        let mut finite =
+            StreamingResampler::new(samples[..147].iter().copied(), source_rate, target_rate)
+                .unwrap();
+
+        let counts = test_support::count_thread_allocations_and_deallocations(|| {
+            assert_eq!(stream.next_before(0), None);
+            assert_eq!(reads.get(), 0);
+            for _ in 0..96 {
+                assert_eq!(stream.next(), uninterrupted.next());
+                finite.next().unwrap();
+            }
+            assert!(reads.get() > 147);
+            for _ in 96..160 {
+                let output = stream.next_before(147).unwrap();
+                assert_eq!(Some(output), finite.next());
+                uninterrupted.next().unwrap();
+            }
+            let reads_at_stop = reads.get();
+            assert_eq!(stream.next_source_position(), (147, 0));
+            assert_eq!(stream.next_before(147), None);
+            assert_eq!(finite.next(), None);
+            assert_eq!(reads.get(), reads_at_stop);
+
+            for _ in 0..32 {
+                assert_eq!(stream.next(), uninterrupted.next());
+            }
+            assert_eq!(
+                stream.next_source_position(),
+                uninterrupted.next_source_position()
+            );
+            assert!(reads.get() - reads_at_stop <= 32);
         });
         assert_eq!(counts, (0, 0));
     }

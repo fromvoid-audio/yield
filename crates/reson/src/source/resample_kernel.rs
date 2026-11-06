@@ -72,8 +72,28 @@ impl ResampleKernel {
     /// `radius` relative to the integer source position. `phase` is the exact
     /// position remainder over the target rate from the same rate pair.
     pub(crate) fn render(&self, frames: &[[f32; 2]], phase: u32) -> [f32; 2] {
+        debug_assert_eq!(frames.len(), 2 * self.radius);
+        self.render_frames(frames.iter().copied(), phase)
+    }
+
+    /// Hold the final in-range frame across any prefetched frames past the edge.
+    pub(crate) fn render_at_right_edge(
+        &self,
+        frames: &[[f32; 2]],
+        valid: usize,
+        phase: u32,
+    ) -> [f32; 2] {
+        debug_assert_eq!(frames.len(), 2 * self.radius);
+        let edge = frames[valid - 1];
+        let input = frames[..valid]
+            .iter()
+            .copied()
+            .chain(std::iter::repeat_n(edge, frames.len() - valid));
+        self.render_frames(input, phase)
+    }
+
+    fn render_frames(&self, frames: impl Iterator<Item = [f32; 2]>, phase: u32) -> [f32; 2] {
         let taps = 2 * self.radius;
-        debug_assert_eq!(frames.len(), taps);
         debug_assert!(phase < self.target_rate);
         let table_phase = u64::from(phase) * u64::from(self.phase_intervals);
         let target_rate = u64::from(self.target_rate);
@@ -95,9 +115,12 @@ impl ResampleKernel {
     }
 }
 
-fn convolve(frames: &[[f32; 2]], weights: impl Iterator<Item = f32>) -> [f32; 2] {
+fn convolve(
+    frames: impl Iterator<Item = [f32; 2]>,
+    weights: impl Iterator<Item = f32>,
+) -> [f32; 2] {
     let mut stereo = [0.0; 2];
-    for (&[left, right], weight) in frames.iter().zip(weights) {
+    for ([left, right], weight) in frames.zip(weights) {
         stereo[0] += left * weight;
         stereo[1] += right * weight;
     }
