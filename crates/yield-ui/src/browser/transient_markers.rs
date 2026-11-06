@@ -30,6 +30,7 @@ enum ResultState {
 
 struct ActiveRequest {
     request: SourceTransientRequest,
+    revision: u64,
     waveform_generation: u64,
     file_revision: WaveformFileRevision,
     cancellation: FeatureAnalysisCancellation,
@@ -52,7 +53,7 @@ impl ActiveRequest {
             && self.request.relative_path() == entry.relative_path
             && self.request.source_id() == &source.source_id
             && self.request.lifecycle_generation() == source.lifecycle_generation
-            && self.request.revision() == source.revision
+            && self.revision == source.revision
     }
 }
 
@@ -207,7 +208,8 @@ pub(super) fn schedule(browser: &mut Browser, cx: &mut Context<Browser>) {
     let file_revision = detail.file_revision.clone();
     browser.transient_markers.next_request_id = id;
     browser.transient_markers.active = Some(ActiveRequest {
-        request,
+        revision: request.revision(),
+        request: request.with_pending_digest(),
         waveform_generation: browser.waveform_generation,
         file_revision,
         cancellation: FeatureAnalysisCancellation::new(),
@@ -242,6 +244,21 @@ pub(super) fn schedule(browser: &mut Browser, cx: &mut Context<Browser>) {
             });
     }));
     cx.notify();
+}
+
+pub(super) fn accept_digest_revision(
+    browser: &mut Browser,
+    request: &SourceTransientRequest,
+    revision: u64,
+    cx: &mut Context<Browser>,
+) {
+    if let Some(active) = browser.transient_markers.active.as_mut()
+        && active.request == *request
+        && matches!(active.result, ResultState::Pending)
+    {
+        active.revision = revision;
+    }
+    schedule(browser, cx);
 }
 
 pub(super) fn apply_catalog_event(
@@ -427,14 +444,18 @@ mod tests {
     use yield_library::app_dirs::{ConfigBaseGuard, PersistenceProfileGuard, WritableProfileGuard};
 
     fn fixture() -> (tempfile::TempDir, PathBuf, yield_media::WaveformPreview) {
+        fixture_frames(16_000)
+    }
+
+    fn fixture_frames(frames: u32) -> (tempfile::TempDir, PathBuf, yield_media::WaveformPreview) {
+        use std::io::Write;
         let directory = tempfile::tempdir().expect("fixture directory");
         let path = directory
             .path()
             .canonicalize()
             .unwrap()
             .join("transients.wav");
-        let frames = 16_000_u32;
-        let mut bytes = Vec::with_capacity(44 + frames as usize * 4);
+        let mut bytes = Vec::with_capacity(44 + 16_000 * 4);
         bytes.extend_from_slice(b"RIFF");
         bytes.extend_from_slice(&(36 + frames * 4).to_le_bytes());
         bytes.extend_from_slice(b"WAVEfmt ");
@@ -447,7 +468,7 @@ mod tests {
         bytes.extend_from_slice(&32_u16.to_le_bytes());
         bytes.extend_from_slice(b"data");
         bytes.extend_from_slice(&(frames * 4).to_le_bytes());
-        for frame in 0..frames {
+        for frame in 0..frames.min(16_000) {
             let sample: f32 = match frame {
                 2000 => 0.025,
                 7000 => 0.06,
@@ -456,7 +477,10 @@ mod tests {
             };
             bytes.extend_from_slice(&sample.to_le_bytes());
         }
-        fs::write(&path, bytes).expect("fixture WAV");
+        let mut file = fs::File::create(&path).unwrap();
+        file.write_all(&bytes).unwrap();
+        file.set_len(44 + u64::from(frames) * 4).unwrap();
+        drop(file);
         let preview = yield_media::load_waveform_preview(&path).expect("load preview");
         (directory, path, preview)
     }
@@ -552,6 +576,29 @@ mod tests {
 
     fn install_source(view: &mut Browser, root: &Path, snapshot: &yield_catalog::CatalogSnapshot) {
         view.root = Some(root.to_path_buf());
+        let mut session = super::super::SourceSession::new(root.to_path_buf());
+        session.source_id = Some(snapshot.source_id.clone());
+        session.catalog_lifecycle_generation = Some(snapshot.lifecycle_generation);
+        session.catalog_facts = Arc::new(
+            snapshot
+                .manifest
+                .iter()
+                .map(|entry| {
+                    (
+                        entry.relative_path.clone(),
+                        catalog::CatalogFileFacts {
+                            relative_path: entry.relative_path.clone(),
+                            file_size: entry.file_size,
+                            modified_ns: entry.modified_ns,
+                            file_identity: entry.file_identity.clone(),
+                            content_hash: entry.content_hash.clone(),
+                        },
+                    )
+                })
+                .collect(),
+        );
+        view.source_sessions = vec![session];
+        view.active_source = Some(0);
         view.catalog_activation = Some(catalog::CatalogActivation {
             source_id: snapshot.source_id.clone(),
             root: root.to_path_buf(),
@@ -575,9 +622,25 @@ mod tests {
                 revision: snapshot.committed_revision,
                 entry_indices: Arc::new(HashMap::from([(PathBuf::from("transients.wav"), 0)])),
             });
+        view.curation_state.install_projection(
+            super::super::curation::CurationLifecycleKey {
+                source_id: snapshot.source_id.clone(),
+                lifecycle_generation: snapshot.lifecycle_generation,
+            },
+            snapshot.root_identity.clone(),
+            snapshot.directory_generation,
+            snapshot.committed_revision,
+            &view.entries,
+        );
     }
 
     fn next_delivery(cx: &mut gpui::VisualTestContext) -> yield_session::CatalogDelivery {
+        let mut deliveries = next_deliveries(cx);
+        assert_eq!(deliveries.len(), 1);
+        deliveries.pop().unwrap()
+    }
+
+    fn next_deliveries(cx: &mut gpui::VisualTestContext) -> Vec<yield_session::CatalogDelivery> {
         use super::super::source_registry::SourceRegistryGlobal;
         cx.run_until_parked();
         cx.executor().advance_clock(PRESET_DEBOUNCE);
@@ -587,9 +650,73 @@ mod tests {
                 let mut deliveries = Vec::new();
                 app.global::<SourceRegistryGlobal>()
                     .drain_catalog_deliveries(&mut deliveries);
-                deliveries.into_iter().next()
+                (!deliveries.is_empty()).then_some(deliveries)
             })
         })
+    }
+
+    #[gpui::test]
+    fn quick_audited_recording_advances_the_source_without_reloading_the_waveform(
+        cx: &mut TestAppContext,
+    ) {
+        use super::super::source_registry::SourceRegistryGlobal;
+        use yield_library::sample_sources::readiness::FEATURE_INPUT_MAX_BYTES;
+        let frames = (FEATURE_INPUT_MAX_BYTES / 4) as u32 + 256;
+        let (_directory, path, preview) = fixture_frames(frames);
+        let root = path.parent().unwrap();
+        let config = tempfile::tempdir().unwrap();
+        let _base = ConfigBaseGuard::set(config.path().canonicalize().unwrap());
+        let _profile = PersistenceProfileGuard::named("gpui-long-transients");
+        let guard = WritableProfileGuard::acquire_current().unwrap();
+        let (service, snapshot) = audited_owner(&guard, root);
+        assert!(snapshot.manifest[0].content_hash.is_none());
+        cx.set_global(SourceRegistryGlobal::for_catalog_fixture(service));
+        let (browser, cx) = install(cx, &path, preview);
+        browser.update(cx, |view, cx| {
+            install_source(view, root, &snapshot);
+            toggle(view, cx);
+        });
+        for _ in 0..2 {
+            let deliveries = next_deliveries(cx);
+            let ready = browser.update(cx, |view, cx| {
+                for delivery in deliveries {
+                    view.apply_catalog_delivery(delivery, cx);
+                }
+                assert_eq!(view.waveform_generation, 7);
+                assert_eq!(view.selected, Some(0));
+                current_markers(view).is_some()
+            });
+            if ready {
+                break;
+            }
+        }
+        browser.update(cx, |view, _| {
+            assert_eq!(
+                view.catalog_metadata.context_ref().unwrap().revision,
+                snapshot.committed_revision + 1
+            );
+            assert_eq!(view.transient_markers.next_request_id, 1);
+            let markers = current_markers(view).unwrap();
+            assert_eq!(markers.source_frames(), frames);
+            assert!(markers.frames().contains(&12_000));
+            assert!(view.curation_state.authority_matches(
+                &super::super::curation::CurationLifecycleKey {
+                    source_id: snapshot.source_id.clone(),
+                    lifecycle_generation: snapshot.lifecycle_generation,
+                },
+                &snapshot.root_identity,
+                snapshot.directory_generation,
+                snapshot.committed_revision + 1,
+            ));
+            let facts = view.source_sessions[0]
+                .catalog_facts
+                .get(Path::new("transients.wav"))
+                .unwrap();
+            assert!(facts.content_hash.is_some());
+        });
+        cx.update(|_, app| {
+            app.update_global::<SourceRegistryGlobal, _>(|global, _| global.shutdown())
+        });
     }
 
     #[gpui::test]
