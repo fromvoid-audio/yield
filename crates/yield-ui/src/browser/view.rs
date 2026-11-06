@@ -3146,6 +3146,63 @@ mod tests {
         });
     }
 
+    #[gpui::test]
+    fn shortcut_help_report_click_replaces_help_and_feedback_restores_focus(
+        cx: &mut TestAppContext,
+    ) {
+        cx.set_global(crate::theme::ActiveTheme::default());
+        let (browser, cx) = cx.add_window_view(|_, cx| Browser::new(cx));
+        let search_focus = cx.update(|window, app| {
+            browser.update(app, |view, cx| {
+                view.feedback_issue.use_test_service();
+                let focus = view.search_input.read(cx).focus_handle();
+                window.focus(&focus);
+                view.toggle_shortcut_help(window, cx);
+                focus
+            })
+        });
+        cx.refresh().expect("render Shortcut Help");
+        cx.run_until_parked();
+        let button = cx
+            .debug_bounds("shortcut-help-report-issue")
+            .expect("report control");
+        let center = point(
+            button.left() + button.size.width / 2.0,
+            button.top() + button.size.height / 2.0,
+        );
+        cx.simulate_mouse_down(center, MouseButton::Left, Modifiers::none());
+        cx.simulate_mouse_up(center, MouseButton::Left, Modifiers::none());
+
+        cx.update(|window, app| {
+            browser.update(app, |view, cx| {
+                assert!(!view.shortcut_help.is_open());
+                assert!(view.feedback_issue.open);
+                let escape = KeyDownEvent {
+                    keystroke: Keystroke::parse("escape").expect("Escape"),
+                    is_held: false,
+                };
+                assert!(view.handle_feedback_key(&escape, window, cx));
+                assert!(!view.feedback_issue.open);
+                assert!(search_focus.is_focused(window));
+                view.toggle_shortcut_help(window, cx);
+                let shortcut = KeyDownEvent {
+                    keystroke: Keystroke::parse("shift-f1").expect("Shift-F1"),
+                    is_held: false,
+                };
+                assert!(view.handle_feedback_key(&shortcut, window, cx));
+                assert!(!view.shortcut_help.is_open());
+                assert!(view.feedback_issue.open);
+                assert!(view.handle_feedback_key(&escape, window, cx));
+                assert!(search_focus.is_focused(window));
+                view.theme_settings_open = true;
+                view.toggle_shortcut_help(window, cx);
+                assert!(view.handle_feedback_key(&shortcut, window, cx));
+                assert!(view.shortcut_help.is_open());
+                assert!(!view.feedback_issue.open);
+            });
+        });
+    }
+
     fn inert_preview() -> WaveformPreview {
         WaveformPreview {
             peaks: vec![0.5; 8],
