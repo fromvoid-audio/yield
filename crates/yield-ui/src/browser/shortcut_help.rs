@@ -382,6 +382,10 @@ const WAVEFORM_ROWS: &[ShortcutRow] = &[
         description: "Slide the play selection",
     },
     ShortcutRow {
+        keys: "Cmd/Ctrl-Left / Right (waveform)",
+        description: "Halve / double the play selection around its midpoint",
+    },
+    ShortcutRow {
         keys: "Option or Shift + Left / Right",
         description: "Nudge the play selection by one audio frame",
     },
