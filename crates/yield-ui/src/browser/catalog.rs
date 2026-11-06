@@ -1015,11 +1015,15 @@ impl Browser {
         cx: &mut Context<Self>,
     ) {
         let previous = self.catalog_metadata.context();
-        if previous
-            .as_ref()
-            .is_some_and(|context| context.revision >= revision)
-        {
-            return;
+        if let Some(context) = &previous {
+            if context.revision == revision {
+                super::playmark_tempo::adopt_digest_revision(self, scope, revision, cx);
+                return;
+            }
+            if context.revision > revision {
+                super::playmark_tempo::reject_digest_revision(self, scope, cx);
+                return;
+            }
         }
         let key = super::curation::CurationLifecycleKey {
             source_id: scope.source_id.clone(),
@@ -1065,6 +1069,7 @@ impl Browser {
                 true
             });
         let Some(previous) = exact.filter(|_| patched) else {
+            super::playmark_tempo::reject_digest_revision(self, scope, cx);
             self.catalog_pending_command
                 .get_or_insert(CatalogCommandIntent::ReadSnapshot {
                     source_id: key.source_id,
@@ -1115,6 +1120,7 @@ impl Browser {
             revision,
             cx,
         );
+        super::playmark_tempo::adopt_digest_revision(self, scope, revision, cx);
         cx.notify();
     }
 
