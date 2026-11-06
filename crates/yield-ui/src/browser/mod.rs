@@ -3360,7 +3360,7 @@ impl Browser {
                 }
             }
             "escape" => {
-                if self.cancel_playmark_tempo_resize(window, cx) {
+                if self.cancel_tempo_playmark_drag(window, cx) {
                     cx.stop_propagation();
                     return;
                 }

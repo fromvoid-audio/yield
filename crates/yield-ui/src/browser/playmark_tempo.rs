@@ -144,6 +144,15 @@ impl PlaymarkTempoState {
     }
 }
 
+pub(super) fn authored_bpm(browser: &Browser) -> Option<f64> {
+    let load = browser
+        .playmark_tempo
+        .load
+        .as_ref()
+        .filter(|load| load.matches(browser))?;
+    load.result?.ok().flatten().map(SourcePlaymarkTempo::bpm)
+}
+
 pub(super) fn load_for_waveform(browser: &mut Browser, cx: &mut Context<Browser>) -> bool {
     if browser.playmark_tempo.restore_blocked
         || browser.waveform_play_region.is_some()

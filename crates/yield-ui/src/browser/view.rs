@@ -1470,7 +1470,7 @@ impl Render for Browser {
                 Some(
                     cx.on_blur(&self.waveform_focus_handle, window, |view, window, cx| {
                         view.held_playmark_slide = None;
-                        view.cancel_playmark_tempo_resize(window, cx);
+                        view.cancel_tempo_playmark_drag(window, cx);
                     }),
                 );
         }
