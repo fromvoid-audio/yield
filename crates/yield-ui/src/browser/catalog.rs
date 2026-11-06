@@ -8,8 +8,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use gpui::{BorrowAppContext, Context};
 use yield_core::{AudioFile, AudioFileCuration, AudioFileId, FolderTree, PlaybackType};
 use yield_library::sample_sources::{
-    BrowserFileMetadata, SourceId, SourcePlaybackType, SourcePublicationFence,
-    db::SourceManifestEntry, reconciliation::RootIdentity,
+    BrowserFileMetadata, SourceId, SourceManifestEntry, SourcePlaybackType, SourcePublicationFence,
+    reconciliation::RootIdentity,
 };
 use yield_session::{
     CatalogCommand, CatalogDelivery, CatalogEvent, CatalogOperation, CatalogPublicationStatus,
