@@ -2139,7 +2139,7 @@ impl SourceWriter {
             let next_source_revision = request.expected().revision.checked_add(1).ok_or(
                 SourceWriterError::InvalidRequest("source revision would overflow"),
             )?;
-            i64::try_from(next_source_revision).map_err(|_| {
+            let next_revision_sql = i64::try_from(next_source_revision).map_err(|_| {
                 SourceWriterError::InvalidRequest("source revision exceeds SQLite integer range")
             })?;
             let directory_generation = validate_curation_preconditions(
@@ -2148,7 +2148,7 @@ impl SourceWriter {
                 &RootIdentity::from_bytes(request.expected().root_identity.clone()),
                 &normalized_paths,
             )?;
-            apply_curation_updates(&mut batch, &updates)?;
+            apply_curation_updates(&mut batch, &updates, next_revision_sql)?;
             SourceDatabase::bump_revision(batch.curation_transaction())?;
             let committed_source_revision = batch.get_revision()?;
             if committed_source_revision != next_source_revision {
@@ -2156,8 +2156,6 @@ impl SourceWriter {
                     "source revision did not advance exactly once",
                 ));
             }
-            let next_revision_sql = i64::try_from(next_source_revision)
-                .map_err(|_| SourceWriterError::InvalidRequest("source revision exceeds SQLite"))?;
             let expected_revision_sql = i64::try_from(request.expected().revision)
                 .map_err(|_| SourceWriterError::InvalidRequest("source revision exceeds SQLite"))?;
             let changed = batch
