@@ -276,22 +276,25 @@ impl<S: Source> BandLimitedOutputAdapter<S> {
     pub(crate) fn rendered_position(&self) -> RenderedSourcePosition {
         self.position.clone()
     }
-}
 
-impl<S: Source> Iterator for BandLimitedOutputAdapter<S> {
-    type Item = f32;
-
-    fn next(&mut self) -> Option<f32> {
+    /// Consult the endpoint at a new device frame and publish its resulting
+    /// source position only after the last channel has been emitted.
+    pub(crate) fn next_with_endpoint(
+        &mut self,
+        endpoint: impl FnOnce(u64) -> Option<u64>,
+        completed_frame: impl FnOnce(u64),
+    ) -> Option<f32> {
         if self.pending_index == self.target_channels {
-            self.pending = self.stream.next()?;
+            let source_end = endpoint(self.stream.next_source_position().0)?;
+            self.pending = self.stream.next_before(source_end)?;
             self.pending_index = 0;
         }
         let channel = self.pending_index;
         self.pending_index += 1;
         if self.pending_index == self.target_channels {
-            self.position
-                .0
-                .store(self.stream.next_source_position().0, Ordering::Relaxed);
+            let source_frame = self.stream.next_source_position().0;
+            self.position.0.store(source_frame, Ordering::Relaxed);
+            completed_frame(source_frame);
         }
         Some(
             channel
@@ -300,6 +303,14 @@ impl<S: Source> Iterator for BandLimitedOutputAdapter<S> {
                 .copied()
                 .unwrap_or(0.0),
         )
+    }
+}
+
+impl<S: Source> Iterator for BandLimitedOutputAdapter<S> {
+    type Item = f32;
+
+    fn next(&mut self) -> Option<f32> {
+        self.next_with_endpoint(|_| Some(u64::MAX), |_| {})
     }
 }
 

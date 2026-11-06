@@ -122,8 +122,10 @@ The app uses this converter when prepared-tempo audition needs a different
 device rate. That path starts a new source for each prepared span and already
 requires a new audition for live edits. Prepared-tempo progress follows
 complete frames delivered to the device mixer and ignores the filter's
-read-ahead. Ordinary audition continues to use its existing rate converter
-while live transport integration is qualified.
+read-ahead. Ordinary lazy playback also uses the converter for supported
+rate pairs. Its loop controller applies the endpoint to complete rendered
+frames, while span retargets use the existing lazy replacement path.
+In-memory live span edits still use the existing rate converter.
 
 ```sh
 scratch=$(mktemp -d)

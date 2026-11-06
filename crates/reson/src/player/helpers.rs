@@ -12,6 +12,7 @@ use super::super::DEFAULT_ANTI_CLIP_FADE;
 #[cfg(test)]
 use super::super::fade::{EdgeFade, fade_duration};
 use super::super::fade::{FadeOutHandle, FadeOutOnRequest, fade_frames_for_duration};
+use super::playback::{LoopModeHandle, ResampledLoopModeSource};
 use super::{AudioPlaybackSource, AudioPlayer, PlaybackRuntimeReplacePolicy};
 #[cfg(test)]
 use crate::mixer::{decoder_from_bytes, map_seek_error};
@@ -19,6 +20,7 @@ use crate::mixer::{decoder_from_bytes, map_seek_error};
 pub(super) enum PlaybackRateConversion {
     Linear,
     BandLimited,
+    BandLimitedTransport(LoopModeHandle),
 }
 
 type RoutedSource = (Box<dyn Source + Send>, Option<RenderedSourcePosition>);
@@ -32,7 +34,7 @@ impl PlaybackRateConversion {
         output_pair: StereoOutputPair,
     ) -> Result<RoutedSource, String> {
         let source_rate = source.sample_rate().max(1);
-        if matches!(self, Self::BandLimited) && source_rate != target_rate {
+        if !matches!(self, Self::Linear) && source_rate != target_rate {
             let adapter = BandLimitedOutputAdapter::new(
                 source,
                 target_rate,
@@ -45,7 +47,13 @@ impl PlaybackRateConversion {
                 )
             })?;
             let position = adapter.rendered_position();
-            Ok((Box::new(adapter), Some(position)))
+            let source: Box<dyn Source + Send> = match self {
+                Self::BandLimitedTransport(mode) => {
+                    Box::new(ResampledLoopModeSource::new(adapter, mode))
+                }
+                _ => Box::new(adapter),
+            };
+            Ok((source, Some(position)))
         } else {
             Ok((
                 Box::new(OutputAdapter::with_output_pair(

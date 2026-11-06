@@ -5,6 +5,10 @@ use super::resample_kernel::ResampleKernel;
 // Covers even 384 kHz to 8 kHz and bounds input work per rendered frame.
 const MAX_DOWNSAMPLE_RATIO: u64 = 64;
 
+pub(crate) fn supports_band_limited_rate_conversion(source_rate: u32, target_rate: u32) -> bool {
+    u64::from(source_rate.max(1)) <= MAX_DOWNSAMPLE_RATIO * u64::from(target_rate.max(1))
+}
+
 pub(crate) struct StreamingResampler<I> {
     input: I,
     kernel: ResampleKernel,
@@ -29,7 +33,7 @@ where
     pub(crate) fn new(input: I, source_rate: u32, target_rate: u32) -> Option<Self> {
         let source_rate = source_rate.max(1);
         let target_rate = target_rate.max(1);
-        if u64::from(source_rate) > MAX_DOWNSAMPLE_RATIO * u64::from(target_rate) {
+        if !supports_band_limited_rate_conversion(source_rate, target_rate) {
             return None;
         }
         let kernel = ResampleKernel::new(source_rate, target_rate);

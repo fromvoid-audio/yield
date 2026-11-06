@@ -5,6 +5,7 @@ use std::sync::{
 use std::time::Duration;
 
 use crate::Source;
+use crate::source::BandLimitedOutputAdapter;
 
 const LOOP_FOREVER: u64 = u64::MAX;
 const FINISHED: u64 = u64::MAX - 1;
@@ -98,6 +99,25 @@ impl LoopModeHandle {
             self.state.initial_offset.saturating_add(frames) % self.state.frame_count
         }
     }
+
+    fn endpoint_for_frame(&self, frame: u64) -> Option<u64> {
+        let endpoint = self.state.stop_after_frames.load(Ordering::Acquire);
+        if endpoint == FINISHED {
+            return None;
+        }
+        if frame < endpoint {
+            return Some(endpoint);
+        }
+        match self.state.stop_after_frames.compare_exchange(
+            endpoint,
+            FINISHED,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) | Err(FINISHED) => None,
+            Err(latest) => Some(latest), // A newer mode change won the boundary race.
+        }
+    }
 }
 
 /// Turns a repeating source into a one-shot at the end of its current cycle.
@@ -126,22 +146,8 @@ impl<S: Source<Item = f32>> Iterator for LiveLoopModeSource<S> {
 
     fn next(&mut self) -> Option<f32> {
         if self.channel_position == 0 {
-            let frames = self.handle.frames_consumed();
-            let stop_after = self.handle.state.stop_after_frames.load(Ordering::Acquire);
-            if stop_after == FINISHED {
-                return None;
-            }
-            if frames >= stop_after {
-                match self.handle.state.stop_after_frames.compare_exchange(
-                    stop_after,
-                    FINISHED,
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                ) {
-                    Ok(_) | Err(FINISHED) => return None,
-                    Err(_) => {} // A newer mode change won the boundary race.
-                }
-            }
+            self.handle
+                .endpoint_for_frame(self.handle.frames_consumed())?;
         }
         let sample = match self.inner.next() {
             Some(sample) => sample,
@@ -162,9 +168,64 @@ impl<S: Source<Item = f32>> Iterator for LiveLoopModeSource<S> {
     }
 }
 
+/// Keep lazy sources repeating under the filter and apply loop completion to
+/// rendered frames so filter lookahead cannot choose a future loop cycle.
+pub(in crate::player) struct ResampledLoopModeSource<S> {
+    adapter: BandLimitedOutputAdapter<S>,
+    handle: LoopModeHandle,
+}
+
+impl<S> ResampledLoopModeSource<S> {
+    pub(in crate::player) fn new(
+        adapter: BandLimitedOutputAdapter<S>,
+        handle: LoopModeHandle,
+    ) -> Self {
+        Self { adapter, handle }
+    }
+}
+
+impl<S: Source> Iterator for ResampledLoopModeSource<S> {
+    type Item = f32;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let handle = &self.handle;
+        let sample = self.adapter.next_with_endpoint(
+            |frame| handle.endpoint_for_frame(frame),
+            |frame| handle.state.frames_consumed.store(frame, Ordering::Release),
+        );
+        if sample.is_none() {
+            handle.mark_finished();
+        }
+        sample
+    }
+}
+
+impl<S: Source> Source for ResampledLoopModeSource<S> {
+    fn current_frame_len(&self) -> Option<usize> {
+        None
+    }
+
+    fn channels(&self) -> u16 {
+        self.adapter.channels()
+    }
+
+    fn sample_rate(&self) -> u32 {
+        self.adapter.sample_rate()
+    }
+
+    fn total_duration(&self) -> Option<Duration> {
+        None
+    }
+
+    fn last_error(&self) -> Option<String> {
+        self.adapter.last_error()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::source::StereoOutputPair;
     use crate::{AsyncSource, SamplesBuffer};
 
     #[test]
@@ -236,6 +297,75 @@ mod tests {
         assert_eq!(source.next(), None);
         assert!(!handle.set_looped(true));
         assert_eq!(source.next(), None);
+    }
+
+    #[test]
+    fn resampled_loop_off_finishes_the_audible_cycle_after_prefetch_wraps() {
+        let samples = SamplesBuffer::new(
+            1,
+            44_100,
+            (0..147).map(|frame| frame as f32 / 147.0).collect(),
+        );
+        let pair = StereoOutputPair::default();
+        let mut finite = BandLimitedOutputAdapter::new(samples.clone(), 48_000, 4, pair).unwrap();
+        let adapter =
+            BandLimitedOutputAdapter::new(samples.repeat_infinite(), 48_000, 4, pair).unwrap();
+        let handle = LoopModeHandle::new(true, 147, 0);
+        let mut source = ResampledLoopModeSource::new(adapter, handle.clone());
+
+        let counts = crate::test_support::count_thread_allocations_and_deallocations(|| {
+            for _ in 0..310 * 4 {
+                assert!(source.next().is_some());
+            }
+            for _ in 0..150 * 4 {
+                assert!(finite.next().is_some());
+            }
+            assert_eq!(handle.frames_consumed(), 284);
+            assert_eq!(handle.progress_offset(), 137);
+            assert!(handle.set_looped(false));
+            assert_eq!(handle.progress_offset(), 137);
+            for _ in 0..10 * 4 {
+                assert_eq!(source.next(), finite.next());
+            }
+            assert_eq!(handle.frames_consumed(), 294);
+            assert_eq!(handle.progress_offset(), 147);
+            assert_eq!(source.next(), None);
+            assert_eq!(finite.next(), None);
+            assert!(!handle.set_looped(true));
+        });
+        assert_eq!(counts, (0, 0));
+    }
+
+    #[test]
+    fn resampled_one_shot_can_enable_loop_before_its_output_endpoint() {
+        let samples = SamplesBuffer::from_arc_span_at(
+            1,
+            44_100,
+            std::sync::Arc::from([0.5; 147]),
+            0,
+            147,
+            37,
+        );
+        let adapter = BandLimitedOutputAdapter::new(
+            samples.repeat_infinite(),
+            48_000,
+            2,
+            StereoOutputPair::default(),
+        )
+        .unwrap();
+        let handle = LoopModeHandle::new(false, 147, 37);
+        let mut source = ResampledLoopModeSource::new(adapter, handle.clone());
+
+        for _ in 0..119 * 2 + 1 {
+            assert!(source.next().is_some());
+        }
+        assert_eq!(handle.frames_consumed(), 109);
+        assert!(handle.set_looped(true));
+        for _ in 0..1 + 4 * 2 {
+            assert!(source.next().is_some());
+        }
+        assert_eq!(handle.progress_offset(), 3);
+        assert!(handle.looped());
     }
 }
 
