@@ -176,6 +176,8 @@ pub fn run(initial_root: Option<PathBuf>) {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 display_id: qa_display,
                 window_min_size: Some(size(px(960.0), px(560.0))),
+                #[cfg(target_os = "linux")]
+                app_id: Some("org.portalsurfer.yield".into()),
                 ..Default::default()
             },
             move |window, cx| {

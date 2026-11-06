@@ -11,10 +11,18 @@ import zipfile
 
 
 ROOT = Path(__file__).resolve().parents[3]
-SPEC = importlib.util.spec_from_file_location("yield_linux_package", ROOT / "scripts/package-gpui-linux.py")
-assert SPEC is not None and SPEC.loader is not None
-PACKAGER = importlib.util.module_from_spec(SPEC)
-SPEC.loader.exec_module(PACKAGER)
+
+
+def load_script(name):
+    spec = importlib.util.spec_from_file_location(name, ROOT / "scripts" / f"{name}.py")
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+PACKAGER = load_script("package-gpui-linux")
+DESKTOP = load_script("register-linux-desktop")
 
 
 class LinuxPackageTest(unittest.TestCase):
@@ -47,6 +55,7 @@ class LinuxPackageTest(unittest.TestCase):
                     self.assertEqual(archive.getinfo(name).external_attr >> 16, stat.S_IFREG | 0o755)
                 self.assertIn("yield/scripts/internal/run/linux_diagnostics_paths.sh", archive.namelist())
                 self.assertIn("yield/assets/yield-brand-icon.png", archive.namelist())
+                self.assertIn("yield/scripts/register-linux-desktop.py", archive.namelist())
                 for entry in archive.infolist():
                     contents = b"replacement" if entry.filename == "yield/yield" else archive.read(entry)
                     altered.writestr(entry, contents)
@@ -60,6 +69,38 @@ class LinuxPackageTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "expected an x86_64 ELF executable"):
                 PACKAGER.assemble_archive(ROOT, binary, rejected, sha, "0.19.1")
             self.assertFalse(rejected.exists())
+
+    def test_desktop_entry_targets_one_package_and_preserves_a_collision(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            package = root / 'Yield test "$assets"'
+            icon = package / "assets" / "yield-brand-icon.png"
+            icon.parent.mkdir(parents=True)
+            icon.write_bytes(b"fixture icon")
+            binary = package / "yield"
+            binary.write_bytes(b"fixture executable")
+            binary.chmod(0o700)
+            data_home = root / "desktop data"
+            destination = DESKTOP.register_desktop(package, data_home)
+            self.assertEqual(
+                destination, data_home / "applications" / "org.portalsurfer.yield.desktop"
+            )
+            content = destination.read_text(encoding="utf-8")
+            fields = dict(line.split("=", 1) for line in content.splitlines()[1:])
+            expected_exec = f'"{root}/' + r'Yield test \\"\\$assets\\"/yield"'
+            self.assertEqual(fields["Exec"], expected_exec)
+            self.assertEqual(fields["Icon"], str(icon))
+            self.assertEqual(fields["StartupWMClass"], "org.portalsurfer.yield")
+            self.assertEqual(fields["Categories"], "AudioVideo;Audio;")
+            self.assertNotIn("MimeType", fields)
+
+            destination.write_text("existing user registration\n", encoding="utf-8")
+            with self.assertRaises(FileExistsError):
+                DESKTOP.register_desktop(package, data_home)
+            self.assertEqual(destination.read_text(encoding="utf-8"), "existing user registration\n")
+            self.assertEqual(list(destination.parent.iterdir()), [destination])
+            with self.assertRaisesRegex(ValueError, "choose an ASCII install path"):
+                DESKTOP.quoted_exec(root / "path-%f" / "yield")
 
 
 if __name__ == "__main__":
