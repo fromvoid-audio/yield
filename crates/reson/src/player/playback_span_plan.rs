@@ -77,6 +77,7 @@ pub struct PlaybackSpanRequest {
     start_seconds: f32,
     end_seconds: f32,
     track_duration_seconds: f32,
+    exact_track_frames: Option<u64>,
     looped: bool,
     seek: PlaybackSeekBehavior,
 }
@@ -93,9 +94,15 @@ impl PlaybackSpanRequest {
             start_seconds,
             end_seconds,
             track_duration_seconds,
+            exact_track_frames: None,
             looped,
             seek,
         }
+    }
+
+    pub(crate) fn with_exact_track_frames(mut self, frames: u64) -> Self {
+        self.exact_track_frames = Some(frames);
+        self
     }
 }
 
@@ -129,6 +136,7 @@ impl PlaybackSpanPlan {
             request.start_seconds,
             request.end_seconds,
             request.track_duration_seconds,
+            request.exact_track_frames,
             layout.sample_rate(),
         );
         let frame_count = end_frame.saturating_sub(start_frame).max(1);
@@ -240,13 +248,19 @@ fn quantize_span_bounds(
     start_seconds: f32,
     end_seconds: f32,
     track_duration_seconds: f32,
+    exact_track_frames: Option<u64>,
     sample_rate: u32,
 ) -> (u64, u64, u64) {
-    let track_frames = seconds_to_frames_round(track_duration_seconds.max(0.0), sample_rate).max(1);
+    let track_frames = exact_track_frames
+        .unwrap_or_else(|| seconds_to_frames_round(track_duration_seconds.max(0.0), sample_rate))
+        .max(1);
     let mut start_frame =
         seconds_to_frames_round(start_seconds.max(0.0), sample_rate).min(track_frames - 1);
-    let mut end_frame =
-        seconds_to_frames_round(end_seconds.max(0.0), sample_rate).min(track_frames);
+    let mut end_frame = if exact_track_frames.is_some() && end_seconds >= track_duration_seconds {
+        track_frames
+    } else {
+        seconds_to_frames_round(end_seconds.max(0.0), sample_rate).min(track_frames)
+    };
 
     if end_frame <= start_frame {
         end_frame = (start_frame + 1).min(track_frames);
@@ -268,6 +282,28 @@ mod tests {
 
     fn layout() -> PlaybackChannelLayout {
         PlaybackChannelLayout::new(2, 1_000).expect("valid layout")
+    }
+
+    #[test]
+    fn exact_full_file_plan_preserves_frames_beyond_f32_precision() {
+        let frames = 16_777_217;
+        let duration = frames as f32;
+        let plan = PlaybackSpanPlan::new(
+            source(),
+            PlaybackChannelLayout::new(2, 1).unwrap(),
+            PlaybackSpanRequest::new(
+                0.0,
+                duration,
+                duration,
+                false,
+                PlaybackSeekBehavior::SpanStart,
+            )
+            .with_exact_track_frames(frames),
+        )
+        .unwrap();
+        assert_eq!(plan.track_frames(), frames);
+        assert_eq!(plan.end_frame(), frames);
+        assert_eq!(plan.sample_count(), 2 * frames);
     }
 
     #[test]
