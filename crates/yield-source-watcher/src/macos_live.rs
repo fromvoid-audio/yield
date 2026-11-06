@@ -19,6 +19,10 @@ use yield_library::filesystem_identity::stable_filesystem_identity;
 use crate::replay::macos::KNOWN_FLAGS;
 use crate::{SourceWatchSpec, WatchHintEvidence, WatcherSignal, is_ignored_file_name};
 
+mod helper;
+
+pub use helper::{HELPER_POLL, HELPER_READY_V1, serve_live_watcher};
+
 const MAX_CALLBACK_EVENTS: usize = 256;
 const MAX_PATH_BYTES: usize = libc::PATH_MAX as usize;
 const RUN_LOOP_TIMED_OUT: i32 = 3; // kCFRunLoopRunTimedOut in CFRunLoop.h
