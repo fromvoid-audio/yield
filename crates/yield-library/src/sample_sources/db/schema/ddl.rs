@@ -302,6 +302,13 @@ const BASE_SCHEMA_SQL: &str = "CREATE TABLE IF NOT EXISTS metadata (
         beat_count INTEGER NOT NULL CHECK(beat_count BETWEEN 1 AND 255),
         FOREIGN KEY(path) REFERENCES wav_files(path) ON UPDATE CASCADE ON DELETE CASCADE
     ) WITHOUT ROWID;
+    CREATE TABLE IF NOT EXISTS source_playmark_grid_tempo (
+        path TEXT PRIMARY KEY,
+        file_identity TEXT NOT NULL CHECK(length(file_identity) BETWEEN 1 AND 512),
+        content_hash TEXT NOT NULL CHECK(length(content_hash) = 64),
+        milli_bpm INTEGER NOT NULL CHECK(typeof(milli_bpm) = 'integer' AND milli_bpm BETWEEN 1000 AND 1000000),
+        FOREIGN KEY(path) REFERENCES wav_files(path) ON UPDATE CASCADE ON DELETE CASCADE
+    ) WITHOUT ROWID;
     CREATE TABLE IF NOT EXISTS analysis_cache_embeddings (
         content_hash TEXT NOT NULL,
         analysis_version TEXT NOT NULL,

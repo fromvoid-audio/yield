@@ -2,42 +2,6 @@
 
 const BPM_SCALE: u32 = 1_000;
 
-/// A valid user-entered grid tempo stored in thousandths of a BPM.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct PlaymarkGridTempo(u32);
-
-impl PlaymarkGridTempo {
-    /// Parse 1–1000 BPM with up to three decimal places.
-    pub fn parse(text: &str) -> Option<Self> {
-        let text = text.trim();
-        let (whole, fractional) = text.split_once('.').unwrap_or((text, ""));
-        if whole.is_empty()
-            || fractional.len() > 3
-            || !whole
-                .bytes()
-                .chain(fractional.bytes())
-                .all(|byte| byte.is_ascii_digit())
-        {
-            return None;
-        }
-        let whole = whole.parse::<u32>().ok()?.checked_mul(BPM_SCALE)?;
-        let fractional = if fractional.is_empty() {
-            0
-        } else {
-            fractional.parse::<u32>().ok()? * 10_u32.pow(3 - fractional.len() as u32)
-        };
-        let tempo = whole.checked_add(fractional)?;
-        (BPM_SCALE..=1_000 * BPM_SCALE)
-            .contains(&tempo)
-            .then_some(Self(tempo))
-    }
-
-    /// Convert the fixed decimal value to BPM.
-    pub fn bpm(self) -> f64 {
-        f64::from(self.0) / f64::from(BPM_SCALE)
-    }
-}
-
 /// A fixed beat grid anchored to the frame where painting began.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PlaymarkBeatGrid {
@@ -192,26 +156,6 @@ impl SnappedPlaymark {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn grid_tempo_accepts_exact_decimal_input_and_rejects_other_notation() {
-        for (text, bpm) in [
-            (" 120.5 ", 120.5),
-            ("123.145", 123.145),
-            ("1", 1.0),
-            ("1000.000", 1000.0),
-        ] {
-            assert_eq!(
-                PlaymarkGridTempo::parse(text).map(PlaymarkGridTempo::bpm),
-                Some(bpm)
-            );
-        }
-        for text in [
-            "", "0", "0.999", "-2", "+120", "1000.001", "121.0001", "1e2", "NaN", "120.4.5", "١٢٠",
-        ] {
-            assert!(PlaymarkGridTempo::parse(text).is_none(), "{text}");
-        }
-    }
 
     #[test]
     fn midpoint_ties_and_tiny_drags_snap_away_from_the_same_anchor() {

@@ -6,6 +6,7 @@ use super::{
     RootRelativePath, SourceDbError, SourceRevision, SourceWriter, SourceWriterError,
     map_sql_error, normalize_relative_path,
 };
+use crate::sample_sources::SourcePlaymarkGridTempo;
 use crate::sample_sources::readiness::{SourceFeatureInput, SourceFeatureInputError};
 
 /// An authored playmark span and the audio dimensions used to derive its tempo.
@@ -65,9 +66,31 @@ impl SourceWriter {
         expected: &SourceRevision,
         relative: &RootRelativePath,
     ) -> Result<Option<SourcePlaymarkTempo>, SourceWriterError> {
+        self.read_playmark_value(expected, relative, read_tempo)
+    }
+
+    /// Read the explicit grid tempo for the exact audited file.
+    pub fn read_playmark_grid_tempo(
+        &self,
+        expected: &SourceRevision,
+        relative: &RootRelativePath,
+    ) -> Result<Option<SourcePlaymarkGridTempo>, SourceWriterError> {
+        self.read_playmark_value(expected, relative, read_grid_tempo)
+    }
+
+    fn read_playmark_value<T>(
+        &self,
+        expected: &SourceRevision,
+        relative: &RootRelativePath,
+        read: impl FnOnce(
+            &Connection,
+            &str,
+            &SourceFeatureInput,
+        ) -> Result<Option<T>, SourceWriterError>,
+    ) -> Result<Option<T>, SourceWriterError> {
         let input = self.hold_playmark_tempo_input(expected, relative)?;
         let path = normalize_relative_path(relative.as_path())?;
-        let tempo = read_tempo(&self.database.connection, &path, &input)?;
+        let tempo = read(&self.database.connection, &path, &input)?;
         input.validate()?;
         Ok(tempo)
     }
@@ -85,13 +108,63 @@ impl SourceWriter {
         next: Option<SourcePlaymarkTempo>,
         cancel: &AtomicBool,
     ) -> Result<bool, SourceWriterError> {
+        self.compare_and_set_playmark_value(
+            expected,
+            relative,
+            (previous, next),
+            cancel,
+            read_tempo,
+            write_tempo,
+        )
+    }
+
+    /// Replace or clear the exact file's explicit grid tempo without changing its range.
+    ///
+    /// A conflict returns false. The content binding, transaction and cancellation follow the
+    /// same policy as the authored range, and neither operation advances the manifest revision.
+    pub fn compare_and_set_playmark_grid_tempo(
+        &self,
+        expected: &SourceRevision,
+        relative: &RootRelativePath,
+        previous: Option<SourcePlaymarkGridTempo>,
+        next: Option<SourcePlaymarkGridTempo>,
+        cancel: &AtomicBool,
+    ) -> Result<bool, SourceWriterError> {
+        self.compare_and_set_playmark_value(
+            expected,
+            relative,
+            (previous, next),
+            cancel,
+            read_grid_tempo,
+            write_grid_tempo,
+        )
+    }
+
+    fn compare_and_set_playmark_value<T: Eq>(
+        &self,
+        expected: &SourceRevision,
+        relative: &RootRelativePath,
+        change: (Option<T>, Option<T>),
+        cancel: &AtomicBool,
+        read: impl FnOnce(
+            &Connection,
+            &str,
+            &SourceFeatureInput,
+        ) -> Result<Option<T>, SourceWriterError>,
+        write: impl FnOnce(
+            &Connection,
+            &str,
+            &SourceFeatureInput,
+            Option<T>,
+        ) -> Result<(), SourceWriterError>,
+    ) -> Result<bool, SourceWriterError> {
+        let (previous, next) = change;
         if cancel.load(Ordering::Acquire) {
             return Err(SourceFeatureInputError::Cancelled.into());
         }
         self.database.validate_profile_owned_mutation()?;
         let input = self.hold_playmark_tempo_input(expected, relative)?;
         let path = normalize_relative_path(relative.as_path())?;
-        let hash = input.content_hash()?;
         let batch = self.database.write_batch()?;
         let revision = batch.get_revision()?;
         if revision != expected.revision() {
@@ -101,40 +174,14 @@ impl SourceWriter {
             });
         }
         let tx = batch.curation_transaction();
-        if read_tempo(tx, &path, &input)? != previous {
+        if read(tx, &path, &input)? != previous {
             return Ok(false);
         }
         if previous == next {
             return Ok(true);
         }
         crate::sqlite_wal::enforce_wal_admission(tx).map_err(SourceDbError::from)?;
-        if let Some(tempo) = next {
-            tx.execute(
-                "INSERT INTO source_playmark_tempo (
-                    path, file_identity, content_hash, first_frame, end_frame, source_frames,
-                    sample_rate, beat_count
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
-                 ON CONFLICT(path) DO UPDATE SET
-                    file_identity = excluded.file_identity, content_hash = excluded.content_hash,
-                    first_frame = excluded.first_frame, end_frame = excluded.end_frame,
-                    source_frames = excluded.source_frames, sample_rate = excluded.sample_rate,
-                    beat_count = excluded.beat_count",
-                params![
-                    path,
-                    input.identity,
-                    hash,
-                    tempo.first_frame,
-                    tempo.end_frame,
-                    tempo.source_frames,
-                    tempo.sample_rate,
-                    tempo.beat_count
-                ],
-            )
-            .map_err(map_sql_error)?;
-        } else {
-            tx.execute("DELETE FROM source_playmark_tempo WHERE path = ?1", [&path])
-                .map_err(map_sql_error)?;
-        }
+        write(tx, &path, &input, next)?;
         input.validate()?;
         if cancel.load(Ordering::Acquire) {
             return Err(SourceFeatureInputError::Cancelled.into());
@@ -144,11 +191,44 @@ impl SourceWriter {
     }
 }
 
-fn read_tempo(
-    connection: &Connection,
+fn write_tempo(
+    tx: &Connection,
     path: &str,
     input: &SourceFeatureInput,
-) -> Result<Option<SourcePlaymarkTempo>, SourceWriterError> {
+    next: Option<SourcePlaymarkTempo>,
+) -> Result<(), SourceWriterError> {
+    let hash = audited_digest(input)?;
+    if let Some(tempo) = next {
+        tx.execute(
+            "INSERT INTO source_playmark_tempo (
+                    path, file_identity, content_hash, first_frame, end_frame, source_frames,
+                    sample_rate, beat_count
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                 ON CONFLICT(path) DO UPDATE SET
+                    file_identity = excluded.file_identity, content_hash = excluded.content_hash,
+                    first_frame = excluded.first_frame, end_frame = excluded.end_frame,
+                    source_frames = excluded.source_frames, sample_rate = excluded.sample_rate,
+                    beat_count = excluded.beat_count",
+            params![
+                path,
+                input.identity,
+                hash,
+                tempo.first_frame,
+                tempo.end_frame,
+                tempo.source_frames,
+                tempo.sample_rate,
+                tempo.beat_count
+            ],
+        )
+        .map_err(map_sql_error)?;
+    } else {
+        tx.execute("DELETE FROM source_playmark_tempo WHERE path = ?1", [&path])
+            .map_err(map_sql_error)?;
+    }
+    Ok(())
+}
+
+fn audited_digest(input: &SourceFeatureInput) -> Result<&str, SourceWriterError> {
     let hash = input.content_hash()?;
     if !hash
         .bytes()
@@ -158,6 +238,15 @@ fn read_tempo(
             "invalid audited content digest",
         ));
     }
+    Ok(hash)
+}
+
+fn read_tempo(
+    connection: &Connection,
+    path: &str,
+    input: &SourceFeatureInput,
+) -> Result<Option<SourcePlaymarkTempo>, SourceWriterError> {
+    let hash = audited_digest(input)?;
     let fields = connection
         .query_row(
             "SELECT first_frame, end_frame, source_frames, sample_rate, beat_count
@@ -183,4 +272,53 @@ fn read_tempo(
             )
         })
         .transpose()
+}
+
+fn read_grid_tempo(
+    connection: &Connection,
+    path: &str,
+    input: &SourceFeatureInput,
+) -> Result<Option<SourcePlaymarkGridTempo>, SourceWriterError> {
+    let hash = audited_digest(input)?;
+    connection
+        .query_row(
+            "SELECT milli_bpm FROM source_playmark_grid_tempo
+             WHERE path = ?1 AND file_identity = ?2 AND content_hash = ?3",
+            params![path, input.identity, hash],
+            |row| row.get::<_, u32>(0),
+        )
+        .optional()
+        .map_err(map_sql_error)?
+        .map(|value| {
+            SourcePlaymarkGridTempo::from_milli_bpm(value).ok_or(SourceWriterError::InvalidRequest(
+                "invalid stored playmark grid tempo",
+            ))
+        })
+        .transpose()
+}
+
+fn write_grid_tempo(
+    connection: &Connection,
+    path: &str,
+    input: &SourceFeatureInput,
+    next: Option<SourcePlaymarkGridTempo>,
+) -> Result<(), SourceWriterError> {
+    let hash = audited_digest(input)?;
+    if let Some(tempo) = next {
+        connection.execute(
+            "INSERT INTO source_playmark_grid_tempo (path, file_identity, content_hash, milli_bpm)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(path) DO UPDATE SET file_identity = excluded.file_identity,
+             content_hash = excluded.content_hash, milli_bpm = excluded.milli_bpm",
+            params![path, input.identity, hash, tempo.milli_bpm()],
+        ).map_err(map_sql_error)?;
+    } else {
+        connection
+            .execute(
+                "DELETE FROM source_playmark_grid_tempo WHERE path = ?1",
+                [path],
+            )
+            .map_err(map_sql_error)?;
+    }
+    Ok(())
 }

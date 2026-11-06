@@ -1,7 +1,7 @@
 //! Editable tempo for the current waveform's new playmark grid.
 
 use gpui::{AppContext, Context, Entity, KeyDownEvent, Subscription, Window};
-use yield_core::PlaymarkGridTempo;
+use yield_library::sample_sources::SourcePlaymarkGridTempo;
 
 use crate::search_input::{MAX_PLAYMARK_GRID_TEMPO_INPUT_BYTES, SearchInput, SearchInputOptions};
 
@@ -9,7 +9,7 @@ use super::{Browser, playmark_tempo};
 
 pub(super) struct BpmSnapEntry {
     pub(super) input: Entity<SearchInput>,
-    tempo: Option<PlaymarkGridTempo>,
+    tempo: Option<SourcePlaymarkGridTempo>,
     displayed_generation: Option<u64>,
     blur: Option<Subscription>,
 }
@@ -36,7 +36,7 @@ pub(super) fn effective_bpm(browser: &Browser) -> Option<f64> {
     browser
         .bpm_snap_entry
         .tempo
-        .map(PlaymarkGridTempo::bpm)
+        .map(SourcePlaymarkGridTempo::bpm)
         .or_else(|| playmark_tempo::authored_bpm(browser))
 }
 
@@ -91,7 +91,7 @@ pub(super) fn handle_key_down(
                 && browser.waveform.is_some()
                 && browser.bpm_snap_entry.displayed_generation == Some(browser.waveform_generation)
             {
-                if let Some(tempo) = PlaymarkGridTempo::parse(input.content()) {
+                if let Some(tempo) = SourcePlaymarkGridTempo::parse(input.content()) {
                     browser.bpm_snap_entry.tempo = Some(tempo);
                     reset_draft(browser, cx);
                     browser

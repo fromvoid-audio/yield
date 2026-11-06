@@ -2,7 +2,7 @@
 mod fixtures {
     use super::super::*;
     use yield_library::sample_sources::{
-        db::SourcePlaymarkTempo, readiness::SourceFeatureInputError,
+        SourcePlaymarkGridTempo, db::SourcePlaymarkTempo, readiness::SourceFeatureInputError,
     };
 
     const FRAMES: u64 = 16_000;
@@ -54,9 +54,43 @@ mod fixtures {
         let revision = writer.current_revision().unwrap();
         let first = SourcePlaymarkTempo::new(0, frames, frames, sample_rate, 2).unwrap();
         let second = SourcePlaymarkTempo::new(1_000, 13_000, frames, sample_rate, 2).unwrap();
+        let grid = SourcePlaymarkGridTempo::parse("123.145").unwrap();
+        let new_grid = SourcePlaymarkGridTempo::parse("129.5").unwrap();
         let active = AtomicBool::new(false);
         assert!(SourcePlaymarkTempo::new(0, frames + 1, frames, sample_rate, 2).is_none());
         assert_eq!(writer.read_playmark_tempo(&revision, &path).unwrap(), None);
+        assert_eq!(
+            writer.read_playmark_grid_tempo(&revision, &path).unwrap(),
+            None
+        );
+        assert!(
+            writer
+                .compare_and_set_playmark_grid_tempo(&revision, &path, None, Some(grid), &active)
+                .unwrap()
+        );
+        assert!(
+            !writer
+                .compare_and_set_playmark_grid_tempo(
+                    &revision,
+                    &path,
+                    None,
+                    Some(new_grid),
+                    &active
+                )
+                .unwrap()
+        );
+        assert!(matches!(
+            writer.compare_and_set_playmark_grid_tempo(
+                &revision,
+                &path,
+                Some(grid),
+                Some(new_grid),
+                &AtomicBool::new(true)
+            ),
+            Err(SourceWriterError::FeatureInput(
+                SourceFeatureInputError::Cancelled
+            ))
+        ));
         assert!(
             writer
                 .compare_and_set_playmark_tempo(&revision, &path, None, Some(first), &active)
@@ -86,6 +120,21 @@ mod fixtures {
         let writer = open(3);
         let current = writer.current_revision().unwrap();
         assert_eq!(
+            writer.read_playmark_grid_tempo(&current, &path).unwrap(),
+            Some(grid)
+        );
+        assert!(
+            writer
+                .compare_and_set_playmark_grid_tempo(
+                    &current,
+                    &path,
+                    Some(grid),
+                    Some(new_grid),
+                    &active
+                )
+                .unwrap()
+        );
+        assert_eq!(
             writer.read_playmark_tempo(&current, &path).unwrap(),
             Some(first)
         );
@@ -110,6 +159,24 @@ mod fixtures {
                 .unwrap()
         );
         assert_eq!(writer.read_playmark_tempo(&current, &path).unwrap(), None);
+        assert_eq!(
+            writer.read_playmark_grid_tempo(&current, &path).unwrap(),
+            Some(new_grid)
+        );
+        assert!(
+            writer
+                .compare_and_set_playmark_grid_tempo(&current, &path, Some(new_grid), None, &active)
+                .unwrap()
+        );
+        assert_eq!(
+            writer.read_playmark_grid_tempo(&current, &path).unwrap(),
+            None
+        );
+        assert!(
+            writer
+                .compare_and_set_playmark_grid_tempo(&current, &path, None, Some(grid), &active)
+                .unwrap()
+        );
         assert!(
             writer
                 .compare_and_set_playmark_tempo(&current, &path, None, Some(first), &active)
@@ -121,11 +188,16 @@ mod fixtures {
         fs::rename(&media, &displaced).unwrap();
         fs::copy(&displaced, &media).unwrap();
         assert!(writer.read_playmark_tempo(&current, &path).is_err());
+        assert!(writer.read_playmark_grid_tempo(&current, &path).is_err());
         drop(writer);
         audit();
         let writer = open(4);
         let current = writer.current_revision().unwrap();
         assert_eq!(writer.read_playmark_tempo(&current, &path).unwrap(), None);
+        assert_eq!(
+            writer.read_playmark_grid_tempo(&current, &path).unwrap(),
+            None
+        );
         assert_eq!(fs::read(&media).unwrap(), original_bytes);
     }
 
