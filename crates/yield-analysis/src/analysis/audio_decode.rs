@@ -49,6 +49,9 @@ pub fn decode_audio_typed(
     path: &Path,
     max_seconds: Option<f32>,
 ) -> Result<DecodedAudio, AnalysisDecodeError> {
+    if super::aiff::is_aiff_path(path) {
+        return super::aiff::decode(path, max_seconds);
+    }
     match decode_with_symphonia(path, max_seconds) {
         Ok((samples, sample_rate, channels)) => Ok(DecodedAudio {
             samples,

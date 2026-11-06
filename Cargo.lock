@@ -52,6 +52,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "aifc"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "00259ade1408f212e06fbf52b31677526eb81d91ff3f71d1ac8c7fa6f4eaf31f"
+dependencies = [
+ "audio-codec-algorithms",
+]
+
+[[package]]
 name = "alga"
 version = "0.9.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -573,6 +582,12 @@ name = "atomic-waker"
 version = "1.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1505bd5d3d116872e7271a6d4e16d81d0c8570876c8de68093a09ac269d8aac0"
+
+[[package]]
+name = "audio-codec-algorithms"
+version = "0.8.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1254ebf6529f3763c491acfb5ab6e960809e3c75a38584cc664f8c5667fb7107"
 
 [[package]]
 name = "autocfg"
@@ -8865,6 +8880,7 @@ dependencies = [
 name = "yield-analysis"
 version = "0.19.1"
 dependencies = [
+ "aifc",
  "blake3",
  "directories",
  "hdbscan",
