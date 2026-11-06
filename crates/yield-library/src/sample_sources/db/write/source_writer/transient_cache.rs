@@ -17,7 +17,8 @@ impl SourceWriter {
     ) -> Result<Option<CachedTransientMarkers>, SourceWriterError> {
         let config = DetectorConfig::new(detector_version, preset)?;
         self.validate_audio_input(input)?;
-        let result = transient_cache::lookup(&self.database.connection, &input.content, config)?;
+        let result =
+            transient_cache::lookup(&self.database.connection, input.content_hash()?, config)?;
         self.validate_audio_input(input)?;
         Ok(result)
     }
@@ -44,7 +45,7 @@ impl SourceWriter {
             .connection
             .unchecked_transaction()
             .map_err(map_sql_error)?;
-        transient_cache::store(&transaction, &input.content, config, markers)?;
+        transient_cache::store(&transaction, input.content_hash()?, config, markers)?;
         // The original writer serializes revision changes. While this transaction
         // owns its connection, recheck only the independent file and lease fence.
         input.validate()?;
