@@ -6,6 +6,18 @@
   "kv_namespaces": [
     { "binding": "SESSIONS", "id": "REPLACE_WITH_NEW_YIELD_KV_NAMESPACE_ID" }
   ],
+  "ratelimits": [
+    {
+      "name": "EDGE_RATE_LIMIT",
+      "namespace_id": "REPLACE_WITH_NEW_EDGE_RATE_LIMIT_NAMESPACE_ID",
+      "simple": { "limit": 60, "period": 60 }
+    },
+    {
+      "name": "ISSUE_SESSION_RATE_LIMIT",
+      "namespace_id": "REPLACE_WITH_NEW_SESSION_RATE_LIMIT_NAMESPACE_ID",
+      "simple": { "limit": 5, "period": 60 }
+    }
+  ],
   "vars": {
     "GITHUB_OWNER": "PORTALSURFER",
     "GITHUB_REPO": "yield",
