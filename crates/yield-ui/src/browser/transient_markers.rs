@@ -6,15 +6,15 @@ use gpui::{
     AnyView, App, Bounds, Context, Render, Task, Window, canvas, div, fill, point, prelude::*, px,
     size,
 };
-use yield_core::{AudioFile, WaveformViewport};
+use yield_core::WaveformViewport;
 use yield_library::sample_sources::SourcePublicationFence;
-use yield_media::{WaveformDetailContext, WaveformFileRevision};
+use yield_media::WaveformFileRevision;
 use yield_session::{
     CatalogCommand, CatalogEvent, FeatureAnalysisCancellation, SourceTransientRequest,
     TransientCacheUse, TransientMarkers, TransientPreset, TransientRequestFailure,
 };
 
-use super::{Browser, catalog, catalog_metadata::CatalogMetadataContext};
+use super::{Browser, catalog};
 
 const PRESET_DEBOUNCE: Duration = Duration::from_millis(30);
 const MIN_MARKER_SPACING_PX: f32 = 3.0;
@@ -46,7 +46,7 @@ impl ActiveRequest {
         {
             return false;
         }
-        let Some((entry, detail, source)) = current_source(browser) else {
+        let Some((entry, detail, source)) = catalog::audited_waveform_source(browser) else {
             return false;
         };
         self.file_revision == detail.file_revision
@@ -97,26 +97,6 @@ impl TransientMarkersState {
         self.submission = None;
         self.active = None;
     }
-}
-
-fn current_source(
-    browser: &Browser,
-) -> Option<(&AudioFile, &WaveformDetailContext, &CatalogMetadataContext)> {
-    let selected = browser.selected?;
-    let entry = browser.entries.get(selected)?;
-    let detail = browser.waveform.as_ref()?.detail_context.as_ref()?;
-    let source = browser.catalog_metadata.context_ref()?;
-    let activation = browser.catalog_activation.as_ref()?;
-    if entry.path != detail.path
-        || browser.root.as_ref() != Some(&source.root)
-        || source.entry_indices.get(&entry.relative_path) != Some(&selected)
-        || activation.source_id != source.source_id
-        || activation.lifecycle_generation != source.lifecycle_generation
-        || activation.root_identity.as_ref() != Some(&source.root_identity)
-    {
-        return None;
-    }
-    Some((entry, detail, source))
 }
 
 pub(super) fn toggle(browser: &mut Browser, cx: &mut Context<Browser>) {
@@ -184,7 +164,7 @@ pub(super) fn schedule(browser: &mut Browser, cx: &mut Context<Browser>) {
         return;
     }
     browser.transient_markers.invalidate();
-    let Some((entry, detail, source)) = current_source(browser) else {
+    let Some((entry, detail, source)) = catalog::audited_waveform_source(browser) else {
         browser.playback_status =
             String::from("Transient markers unavailable until this waveform has an audited Source");
         return;
@@ -433,6 +413,7 @@ pub(super) fn render_overlay(
 
 #[cfg(test)]
 mod tests {
+    use super::super::catalog_metadata::CatalogMetadataContext;
     use super::*;
     use gpui::{KeyDownEvent, Keystroke, TestAppContext};
     use std::{
@@ -441,6 +422,7 @@ mod tests {
         path::{Path, PathBuf},
         time::Instant,
     };
+    use yield_core::AudioFile;
     use yield_library::app_dirs::{ConfigBaseGuard, PersistenceProfileGuard, WritableProfileGuard};
 
     fn fixture() -> (tempfile::TempDir, PathBuf, yield_media::WaveformPreview) {
@@ -661,6 +643,88 @@ mod tests {
                 (!deliveries.is_empty()).then_some(deliveries)
             })
         })
+    }
+
+    #[gpui::test]
+    fn saved_playmark_tempo_restores_only_the_current_unedited_waveform(cx: &mut TestAppContext) {
+        use super::super::{
+            playmark_tempo, source_registry::SourceRegistryGlobal, waveform::WaveformPlayRegion,
+        };
+        use std::sync::atomic::AtomicBool;
+        use yield_session::{
+            PlaymarkTempoOperation, SourcePlaymarkTempo, SourcePlaymarkTempoRequest,
+        };
+
+        let (_directory, path, preview) = fixture();
+        let root = path.parent().unwrap();
+        let config = tempfile::tempdir().unwrap();
+        let _base = ConfigBaseGuard::set(config.path().canonicalize().unwrap());
+        let _profile = PersistenceProfileGuard::named("gpui-playmark-restore");
+        let guard = WritableProfileGuard::acquire_current().unwrap();
+        let (service, snapshot) = audited_owner(&guard, root);
+        let saved = SourcePlaymarkTempo::new(2_000, 8_000, 16_000, 16_000, 6).unwrap();
+        service
+            .submit(CatalogCommand::PlaymarkTempo {
+                request: SourcePlaymarkTempoRequest::new(
+                    &snapshot.source_id,
+                    snapshot.lifecycle_generation,
+                    snapshot.committed_revision,
+                    1,
+                    Path::new("transients.wav"),
+                    PlaymarkTempoOperation::Replace {
+                        previous: None,
+                        next: Some(saved),
+                    },
+                )
+                .unwrap(),
+                cancellation: Arc::new(AtomicBool::new(false)),
+            })
+            .unwrap();
+        wait_for(|| match service.try_recv_event() {
+            Ok(CatalogEvent::PlaymarkTempoCompleted { result, .. }) => {
+                assert_eq!(result, Ok(Some(saved)));
+                Some(())
+            }
+            _ => None,
+        });
+        cx.set_global(SourceRegistryGlobal::for_catalog_fixture(service));
+        let (browser, cx) = install(cx, &path, preview);
+        browser.update(cx, |view, cx| {
+            install_source(view, root, &snapshot);
+            assert!(playmark_tempo::load_for_waveform(view, cx));
+            assert!(!playmark_tempo::load_for_waveform(view, cx));
+        });
+        let stale = next_delivery(cx);
+        browser.update(cx, |view, cx| {
+            view.invalidate_waveform_generation();
+            assert!(view.apply_catalog_delivery(stale, cx));
+            assert!(view.waveform_play_region.is_none());
+            assert!(playmark_tempo::load_for_waveform(view, cx));
+        });
+        let while_editing = next_delivery(cx);
+        browser.update(cx, |view, cx| {
+            view.set_waveform_play_region(WaveformPlayRegion::new(0.1, 0.2));
+            view.set_waveform_play_region(None);
+            assert!(view.apply_catalog_delivery(while_editing, cx));
+            assert!(view.waveform_play_region.is_none());
+            assert!(!playmark_tempo::load_for_waveform(view, cx));
+            view.invalidate_waveform_generation();
+            assert!(playmark_tempo::load_for_waveform(view, cx));
+        });
+        let current = next_delivery(cx);
+        browser.update(cx, |view, cx| {
+            assert!(view.apply_catalog_delivery(current, cx));
+            assert_eq!(
+                view.waveform_play_region.unwrap().frame_bounds(16_000),
+                Some((2_000, 8_000))
+            );
+            assert_eq!(view.beat_count_input.read(cx).count(), 6);
+            assert!(view.playing_path.is_none());
+            assert!(view.playback_init_intent.is_none());
+        });
+        cx.update(|_, app| {
+            app.update_global::<SourceRegistryGlobal, _>(|global, _| global.shutdown())
+        });
     }
 
     #[gpui::test]

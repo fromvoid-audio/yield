@@ -115,6 +115,7 @@ mod panel_resize;
 mod playback_age;
 mod played_ranges;
 mod playmark_resize;
+mod playmark_tempo;
 mod playmark_timing;
 mod preferences;
 mod random_audition;
@@ -419,6 +420,7 @@ pub(crate) struct Browser {
     pane_resize_environment_subscriptions: Vec<gpui::Subscription>,
     waveform_zoom_anchor_ratio: f64,
     waveform_play_region: Option<waveform::WaveformPlayRegion>,
+    playmark_tempo: playmark_tempo::PlaymarkTempoState,
     playmark_resize_anchor: Option<playmark_resize::ResizeAnchor>,
     held_playmark_slide: Option<waveform::WaveformRegionSlide>,
     playmark_slide_blur_subscription: Option<gpui::Subscription>,
@@ -665,6 +667,9 @@ impl Browser {
         let beat_count_subscription = cx.subscribe(
             &beat_count_input,
             |view, _input, event: &BeatCountChanged, cx| {
+                if view.waveform.is_some() {
+                    view.playmark_tempo.preserve_local_edit();
+                }
                 view.beat_guide_count = event.count;
                 if event.committed {
                     view.apply_metronome_count_change(event.count, cx);
@@ -785,6 +790,7 @@ impl Browser {
             pane_resize_environment_subscriptions: Vec::new(),
             waveform_zoom_anchor_ratio: 0.5,
             waveform_play_region: None,
+            playmark_tempo: playmark_tempo::PlaymarkTempoState::default(),
             playmark_resize_anchor: None,
             held_playmark_slide: None,
             playmark_slide_blur_subscription: None,
@@ -2176,6 +2182,7 @@ impl Browser {
                 match result {
                     Ok(preview) => {
                         view.waveform = Some(preview);
+                        playmark_tempo::load_for_waveform(view, cx);
                         transient_markers::schedule(view, cx);
                     }
                     Err(error) => {

@@ -2324,6 +2324,7 @@ impl Browser {
 
     pub(super) fn set_waveform_play_region(&mut self, region: Option<WaveformPlayRegion>) {
         if self.waveform_play_region != region {
+            self.playmark_tempo.preserve_local_edit();
             self.held_playmark_slide = None;
             self.playmark_resize_anchor = None;
             self.cancel_playmark_timing_edit();
@@ -2389,6 +2390,7 @@ impl Browser {
 
     pub(super) fn invalidate_waveform_generation(&mut self) {
         played_ranges::clear_history(self);
+        self.playmark_tempo.invalidate();
         self.transient_markers.invalidate();
         self.waveform_generation = self.waveform_generation.wrapping_add(1);
         self.waveform_hover_cursor = None;

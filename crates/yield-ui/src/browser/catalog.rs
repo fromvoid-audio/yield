@@ -11,6 +11,7 @@ use yield_library::sample_sources::{
     BrowserFileMetadata, SourceId, SourceManifestEntry, SourcePlaybackType, SourcePublicationFence,
     reconciliation::RootIdentity,
 };
+use yield_media::WaveformDetailContext;
 use yield_session::{
     CatalogCommand, CatalogDelivery, CatalogEvent, CatalogOperation, CatalogPublicationStatus,
     CatalogStatus, CatalogSubmitError, SourceTransientRequest, VerifiedSourceRoot,
@@ -625,6 +626,7 @@ impl Browser {
             }
         }
         let mut changed = self.retry_catalog_metadata(cx);
+        changed |= super::playmark_tempo::load_for_waveform(self, cx);
         changed |= super::rating_decay::retry(self, cx);
         changed |= super::unsupported_entries::retry(self, cx);
         changed
@@ -698,6 +700,10 @@ impl Browser {
         publication_fence: Option<SourcePublicationFence>,
         cx: &mut Context<Self>,
     ) -> bool {
+        if super::playmark_tempo::apply_catalog_event(self, &event, publication_fence.as_ref(), cx)
+        {
+            return true;
+        }
         if super::transient_markers::apply_catalog_event(
             self,
             &mut event,
@@ -1421,6 +1427,30 @@ impl Browser {
         }
         self.set_scan_status(status.to_string());
     }
+}
+
+pub(super) fn audited_waveform_source(
+    browser: &Browser,
+) -> Option<(
+    &AudioFile,
+    &WaveformDetailContext,
+    &catalog_metadata::CatalogMetadataContext,
+)> {
+    let selected = browser.selected?;
+    let entry = browser.entries.get(selected)?;
+    let detail = browser.waveform.as_ref()?.detail_context.as_ref()?;
+    let source = browser.catalog_metadata.context_ref()?;
+    let activation = browser.catalog_activation.as_ref()?;
+    if entry.path != detail.path
+        || browser.root.as_ref() != Some(&source.root)
+        || source.entry_indices.get(&entry.relative_path) != Some(&selected)
+        || activation.source_id != source.source_id
+        || activation.lifecycle_generation != source.lifecycle_generation
+        || activation.root_identity.as_ref() != Some(&source.root_identity)
+    {
+        return None;
+    }
+    Some((entry, detail, source))
 }
 
 pub(super) fn catalog_status(cx: &Context<Browser>) -> Option<CatalogStatus> {
