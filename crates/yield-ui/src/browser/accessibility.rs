@@ -44,6 +44,7 @@ const BPM_SNAP: &str = "transport-bpm-snap";
 const ZERO_CROSSING: &str = "transport-zero-crossing";
 const BEAT_GUIDES: &str = "transport-beat-guides";
 const TRANSIENT_MARKERS: &str = "transport-transient-markers";
+const TRANSIENT_SENSITIVITY: &str = "transport-transient-sensitivity";
 const BEAT_COUNT: &str = "transport-beat-count";
 const METRONOME: &str = "transport-metronome";
 const RANDOM_AUDITION: &str = "transport-random-audition";
@@ -306,6 +307,7 @@ impl BrowserAccessibility {
             ZERO_CROSSING,
             BEAT_GUIDES,
             TRANSIENT_MARKERS,
+            TRANSIENT_SENSITIVITY,
             METRONOME,
             RANDOM_AUDITION,
             NORMALIZED_AUDITION,
@@ -543,6 +545,7 @@ impl BrowserAccessibility {
                                 | ZERO_CROSSING
                                 | BEAT_GUIDES
                                 | TRANSIENT_MARKERS
+                                | TRANSIENT_SENSITIVITY
                                 | BEAT_COUNT
                                 | METRONOME
                                 | RANDOM_AUDITION
@@ -605,7 +608,11 @@ impl BrowserAccessibility {
                         }
                         if matches!(
                             event.id.as_str(),
-                            BPM_SNAP | BEAT_GUIDES | BEAT_COUNT | TRANSIENT_MARKERS
+                            BPM_SNAP
+                                | BEAT_GUIDES
+                                | BEAT_COUNT
+                                | TRANSIENT_MARKERS
+                                | TRANSIENT_SENSITIVITY
                         ) && view.waveform.is_none()
                         {
                             return;
@@ -739,6 +746,9 @@ impl BrowserAccessibility {
                                     cx.notify();
                                 }
                                 TRANSIENT_MARKERS => super::transient_markers::toggle(view, cx),
+                                TRANSIENT_SENSITIVITY => {
+                                    super::transient_markers::cycle_sensitivity(view, cx)
+                                }
                                 METRONOME => view.toggle_metronome(cx),
                                 RANDOM_AUDITION => view.request_random_audition(false, cx),
                                 NORMALIZED_AUDITION => view.toggle_normalized_audition(cx),
@@ -1288,6 +1298,12 @@ impl Browser {
                     TRANSIENT_MARKERS,
                     "Transient markers",
                     self.transient_markers.enabled(),
+                    has_waveform,
+                ),
+                button(
+                    TRANSIENT_SENSITIVITY,
+                    "Transient sensitivity",
+                    Some(self.transient_markers.sensitivity().label().into()),
                     has_waveform,
                 ),
                 toggle(

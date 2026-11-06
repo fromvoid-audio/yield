@@ -8,7 +8,10 @@ use std::{
     },
 };
 
-use gpui::{Bounds, Context, Task, canvas, div, fill, point, prelude::*, px, size};
+use gpui::{
+    AnyView, App, Bounds, Context, Render, Task, Window, canvas, div, fill, point, prelude::*, px,
+    size,
+};
 use yield_core::WaveformViewport;
 use yield_media::{MAX_WAVEFORM_BAND_POINTS, WaveformFileRevision};
 
@@ -17,16 +20,61 @@ use super::Browser;
 const MAX_MARKERS: usize = 512;
 const MIN_GAP_SECONDS: f32 = 0.035;
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(super) enum Sensitivity {
+    Low,
+    #[default]
+    Normal,
+    High,
+}
+
+impl Sensitivity {
+    pub(super) fn label(self) -> &'static str {
+        match self {
+            Self::Low => "Low",
+            Self::Normal => "Normal",
+            Self::High => "High",
+        }
+    }
+
+    pub(super) fn short_label(self) -> &'static str {
+        match self {
+            Self::Low => "Lo",
+            Self::Normal => "Mid",
+            Self::High => "Hi",
+        }
+    }
+
+    fn next(self) -> Self {
+        match self {
+            Self::Low => Self::Normal,
+            Self::Normal => Self::High,
+            Self::High => Self::Low,
+        }
+    }
+
+    fn threshold(self, median: f32) -> f32 {
+        let (multiplier, floor) = match self {
+            Self::Low => (4.0, 0.075),
+            Self::Normal => (2.5, 0.045),
+            Self::High => (1.6, 0.025),
+        };
+        (median * multiplier).max(floor)
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct Intent {
     generation: u64,
     path: PathBuf,
     revision: WaveformFileRevision,
+    sensitivity: Sensitivity,
 }
 
 #[derive(Default)]
 pub(super) struct TransientMarkersState {
     enabled: bool,
+    sensitivity: Sensitivity,
     wanted: Option<Intent>,
     queued: Option<Intent>,
     cancellation: Option<Arc<AtomicBool>>,
@@ -37,6 +85,10 @@ pub(super) struct TransientMarkersState {
 impl TransientMarkersState {
     pub(super) fn enabled(&self) -> bool {
         self.enabled
+    }
+
+    pub(super) fn sensitivity(&self) -> Sensitivity {
+        self.sensitivity
     }
 
     pub(super) fn invalidate(&mut self) {
@@ -66,6 +118,7 @@ fn current_intent(browser: &Browser) -> Option<Intent> {
         generation: browser.waveform_generation,
         path,
         revision: context.file_revision.clone(),
+        sensitivity: browser.transient_markers.sensitivity,
     })
 }
 
@@ -81,6 +134,39 @@ pub(super) fn toggle(browser: &mut Browser, cx: &mut Context<Browser>) {
         browser.playback_status = String::from("Load a waveform to show transient markers");
     }
     cx.notify();
+}
+
+pub(super) fn cycle_sensitivity(browser: &mut Browser, cx: &mut Context<Browser>) {
+    if browser.waveform.is_none() {
+        return;
+    }
+    let next = browser.transient_markers.sensitivity.next();
+    browser.transient_markers.sensitivity = next;
+    if browser.transient_markers.enabled {
+        schedule(browser, cx);
+    } else {
+        browser.playback_status = format!("Transient sensitivity: {}", next.label());
+    }
+    cx.notify();
+}
+
+struct SensitivityTooltip;
+
+impl Render for SensitivityTooltip {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = crate::theme::active(cx);
+        div()
+            .px(px(theme.spacing.control_gap))
+            .py(px(theme.spacing.control_gap))
+            .bg(crate::theme::color(theme.colors.surface_raised))
+            .text_size(px(theme.typography.small_size))
+            .text_color(crate::theme::color(theme.colors.text_primary))
+            .child("Transient sensitivity. Click to cycle Low, Normal, and High.")
+    }
+}
+
+pub(super) fn sensitivity_tooltip(_: &mut Window, cx: &mut App) -> AnyView {
+    cx.new(|_| SensitivityTooltip).into()
 }
 
 pub(super) fn schedule(browser: &mut Browser, cx: &mut Context<Browser>) {
@@ -121,7 +207,7 @@ fn launch(browser: &mut Browser, intent: Intent, cx: &mut Context<Browser>) {
         let (intent, cancellation, result) = cx
             .background_executor()
             .spawn(async move {
-                let result = detect(&bands, duration, &cancellation);
+                let result = detect(&bands, duration, intent.sensitivity, &cancellation);
                 (intent, cancellation, result)
             })
             .await;
@@ -175,6 +261,7 @@ fn accept_result(
 fn detect(
     bands: &[[f32; 4]],
     duration: f32,
+    sensitivity: Sensitivity,
     cancellation: &AtomicBool,
 ) -> Result<Vec<f32>, &'static str> {
     if bands.len() < 3 || bands.len() > MAX_WAVEFORM_BAND_POINTS {
@@ -201,7 +288,7 @@ fn detect(
     let mut sorted = novelty.clone();
     sorted.sort_by(f32::total_cmp);
     let median = sorted[sorted.len() / 2];
-    let threshold = (median * 2.5).max(0.045);
+    let threshold = sensitivity.threshold(median);
     let min_gap = ((MIN_GAP_SECONDS / duration) * bands.len() as f32)
         .ceil()
         .max((bands.len() as f32 / MAX_MARKERS as f32).ceil())
@@ -345,8 +432,26 @@ mod tests {
         let mut bands = vec![[0.0; 4]; 100];
         bands[20] = [1.0, 0.8, 0.7, 1.0];
         bands[70] = [0.8, 1.0, 0.9, 1.0];
-        let positions = detect(&bands, 1.0, &AtomicBool::new(false)).expect("transients");
+        let positions =
+            detect(&bands, 1.0, Sensitivity::Normal, &AtomicBool::new(false)).expect("transients");
         assert_eq!(positions, [0.2, 0.7]);
+    }
+
+    #[test]
+    fn sensitivity_selects_attacks_by_strength() {
+        let mut bands = vec![[0.0; 4]; 100];
+        bands[20][0] = 0.03;
+        bands[40][0] = 0.055;
+        bands[60][0] = 0.10;
+        for (sensitivity, expected) in [
+            (Sensitivity::Low, &[0.6][..]),
+            (Sensitivity::Normal, &[0.4, 0.6]),
+            (Sensitivity::High, &[0.2, 0.4, 0.6]),
+        ] {
+            let positions =
+                detect(&bands, 1.0, sensitivity, &AtomicBool::new(false)).expect("transients");
+            assert_eq!(positions, expected);
+        }
     }
 
     #[test]
@@ -381,6 +486,7 @@ mod tests {
         let positions = detect(
             &preview.bands,
             preview.duration_seconds,
+            Sensitivity::Normal,
             &AtomicBool::new(false),
         )
         .expect("transients");
@@ -398,9 +504,20 @@ mod tests {
 
     #[test]
     fn rejects_invalid_input_and_cancellation() {
-        assert!(detect(&[[0.0; 4]; 2], 1.0, &AtomicBool::new(false)).is_err());
+        assert!(
+            detect(
+                &[[0.0; 4]; 2],
+                1.0,
+                Sensitivity::Normal,
+                &AtomicBool::new(false)
+            )
+            .is_err()
+        );
         let bands = vec![[0.0; 4]; 256];
-        assert_eq!(detect(&bands, 1.0, &AtomicBool::new(true)), Err("canceled"));
+        assert_eq!(
+            detect(&bands, 1.0, Sensitivity::Normal, &AtomicBool::new(true)),
+            Err("canceled")
+        );
     }
 
     #[test]
@@ -409,7 +526,8 @@ mod tests {
         for index in (2..bands.len()).step_by(3) {
             bands[index] = [1.0; 4];
         }
-        let positions = detect(&bands, 20.0, &AtomicBool::new(false)).expect("dense preview");
+        let positions = detect(&bands, 20.0, Sensitivity::Normal, &AtomicBool::new(false))
+            .expect("dense preview");
         assert!(!positions.is_empty());
         assert!(positions.len() <= MAX_MARKERS);
         assert!(positions.windows(2).all(|pair| pair[0] < pair[1]));
@@ -459,6 +577,34 @@ mod tests {
                 .change_marker
                 .push_str("-changed");
             assert!(positions(view).is_empty(), "stale revision must not paint");
+        });
+    }
+
+    #[gpui::test]
+    fn sensitivity_button_updates_markers_and_ignores_old_results(cx: &mut TestAppContext) {
+        let (_directory, path, mut preview) = fixture();
+        preview.bands[40][0] = 0.03;
+        let (browser, cx) = install(cx, &path, preview);
+        browser.update(cx, |view, cx| toggle(view, cx));
+        cx.run_until_parked();
+        let old = browser.update(cx, |view, _| {
+            assert_eq!(positions(view).as_ref(), [0.2, 0.7]);
+            current_intent(view).expect("normal sensitivity intent")
+        });
+        cx.refresh().expect("loaded waveform layout");
+        let toolbar = cx.debug_bounds("main-toolbar").expect("toolbar");
+        let button = cx
+            .debug_bounds("transient-sensitivity-toolbar")
+            .expect("sensitivity button");
+        assert!(button.left() >= toolbar.left() && button.right() <= toolbar.right());
+        assert!(button.top() >= toolbar.top() && button.bottom() <= toolbar.bottom());
+        cx.simulate_click(button.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        browser.update(cx, |view, _| {
+            assert_eq!(view.transient_markers.sensitivity(), Sensitivity::High);
+            accept_result(view, &old, false, Err("old failure"));
+            assert!(view.transient_markers.enabled());
+            assert_eq!(positions(view).as_ref(), [0.2, 0.4, 0.7]);
         });
     }
 
