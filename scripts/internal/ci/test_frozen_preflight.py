@@ -241,6 +241,49 @@ class FrozenPreflightTests(unittest.TestCase):
                 self.assertTrue((pathlib.Path(result["evidence_directory"]) / "native.log").is_file())
             self.assertFalse((pathlib.Path(results[0]["checkout"]["path"]).parent / "active").exists())
 
+    def test_full_check_reuses_after_confirmed_early_failures_but_keeps_nested_lease(self):
+        with self.fixture() as (repo, _):
+            runner_path = repo / MODULE.FULL_FROZEN_RUNNER
+            runner_path.parent.mkdir(parents=True, exist_ok=True)
+            runner_path.write_text(f"# {MODULE.FULL_FROZEN_SUPPORT_MARKER}\n")
+            fixture_path = repo / "scripts/internal/ci/prepare_native_metadata_fixture.py"
+            fixture_path.write_text(
+                "import os\n"
+                "if os.environ.get('YIELD_TEST_FAIL_METADATA_FIXTURE'):\n"
+                "    raise SystemExit('fixture identity changed')\n"
+                "print('{\"source_root\": \"fixture-source\"}')\n"
+            )
+            self.git("add", ".")
+            self.git("commit", "-m", "Fixture with distinguishable full stages")
+            sha = self.git("rev-parse", "HEAD")
+            args = argparse.Namespace(sha=sha, lane="full", case=None)
+            results = []
+            with (
+                mock.patch.object(MODULE, "require_maintenance_protocol"),
+                mock.patch.object(MODULE, "doctor", return_value={}),
+                mock.patch.object(MODULE, "cargo_env", return_value={}),
+                mock.patch.object(MODULE, "run_managed", side_effect=[7, 0, 17]) as runner,
+            ):
+                for fixture_failure in ("1", "", ""):
+                    output = io.StringIO()
+                    with (
+                        mock.patch.dict(os.environ, {"YIELD_TEST_FAIL_METADATA_FIXTURE": fixture_failure}),
+                        redirect_stdout(output),
+                        self.assertRaises(MODULE.CiError),
+                    ):
+                        MODULE._check(args)
+                    result = json.loads(output.getvalue())
+                    results.append(result)
+                    lease = pathlib.Path(result["checkout"]["path"]).parent / "active"
+                    self.assertEqual(lease.exists(), len(results) == 3)
+                self.assertEqual(runner.call_count, 3)
+            self.assertEqual([r["checkout"]["disposition"] for r in results], ["created", "reused", "reused"])
+            self.assertEqual(results[0]["results"], [])
+            self.assertIn("metadata fixture", results[0]["checkout"]["early_full_failure"])
+            self.assertIn("managed preflight", results[1]["checkout"]["early_full_failure"])
+            self.assertEqual([r["exit_code"] for r in results[2]["results"]], [0, 17])
+            self.assertNotIn("early_full_failure", results[2]["checkout"])
+
     def test_unconfirmed_cleanup_preserves_the_lease_and_forces_a_fresh_checkout(self):
         with self.fixture() as (_, sha), MODULE.common_coordinator() as state_dir:
             with self.assertRaisesRegex(MODULE.GroupCleanupUnconfirmed, "fixture"):

@@ -22,7 +22,7 @@ import sys
 import tempfile
 import time
 import uuid
-from typing import Iterator, NamedTuple, Optional, TextIO
+from typing import Callable, Iterator, NamedTuple, Optional, TextIO
 
 if sys.version_info < (3, 11):
     for candidate in ("python3.13", "python3.12", "python3.11"):
@@ -520,7 +520,12 @@ def prepare_frozen_preflight(sha: str, state_dir: pathlib.Path) -> tuple[pathlib
 
 @contextlib.contextmanager
 def validation_worktree(
-    sha: str, state_dir: pathlib.Path, lane: str, native_runner: Optional[str] = None,
+    sha: str,
+    state_dir: pathlib.Path,
+    lane: str,
+    native_runner: Optional[str] = None,
+    *,
+    confirmed_early_full_failure: Callable[[], str | None] | None = None,
 ) -> Iterator[tuple[pathlib.Path, str, Optional[str]]]:
     rejected = None
     reusable = lane == "preflight"
@@ -550,10 +555,14 @@ def validation_worktree(
             try:
                 yield checkout, disposition, None
             except BaseException as error:
-                # Only a successful full lane confirms its nested runners returned
-                # cleanly. A failed full lane may have left an independently owned child.
+                # A completed preparation or preflight failure can be confirmed before
+                # the full runner starts. Any later failure may leave a nested child.
+                early_failure_confirmed = (
+                    confirmed_early_full_failure is not None
+                    and confirmed_early_full_failure() is not None
+                )
                 preserve_lease = (
-                    lane == "full"
+                    (lane == "full" and not early_failure_confirmed)
                     or isinstance(error, GroupCleanupUnconfirmed)
                     or isinstance(error.__cause__, GroupCleanupUnconfirmed)
                 )
@@ -774,10 +783,13 @@ def _check(args: argparse.Namespace) -> None:
                 "opt in explicitly before any clean-state preparation"
             )
     native_route = native_check_route(args.case) if args.lane == "native" else None
+    early_full_failure = None
+    preflight_command = ["bash", "scripts/agent.sh", "preflight"]
     with (
         common_coordinator() as state_dir,
         validation_worktree(
             sha, state_dir, args.lane, native_route.runner if native_route else None,
+            confirmed_early_full_failure=lambda: early_full_failure,
         ) as (checkout, disposition, cache_rejection),
     ):
         cached_identity = (
@@ -805,9 +817,9 @@ def _check(args: argparse.Namespace) -> None:
         retained_evidence = out_dir / "evidence"
         redirected_evidence = False
         if args.lane == "preflight":
-            commands = [["bash", "scripts/agent.sh", "preflight"]]
+            commands = [preflight_command]
         elif args.lane == "full":
-            commands = [["bash", "scripts/agent.sh", "preflight"], ["bash", "scripts/gpui-local-ci.sh", "full"]]
+            commands = [preflight_command, ["bash", "scripts/gpui-local-ci.sh", "full"]]
         else:
             if os.environ.get("YIELD_CONFIG_HOME") or os.environ.get("YIELD_CONFIG_PROFILE"):
                 raise CiError("clear YIELD_CONFIG_HOME and YIELD_CONFIG_PROFILE; native production acceptance requires the canonical namespace")
@@ -857,6 +869,8 @@ def _check(args: argparse.Namespace) -> None:
                         fixture_command, cwd=checkout, check=False, capture_output=True, text=True
                     )
                     if fixture_result.returncode != 0:
+                        if args.lane == "full":
+                            early_full_failure = "metadata fixture preparation returned before validation"
                         raise CiError(
                             "persistent native metadata fixture preparation failed: "
                             + fixture_result.stderr.strip()
@@ -905,6 +919,8 @@ def _check(args: argparse.Namespace) -> None:
                     )
                     details["results"].append({"command": cmd, "exit_code": exit_code})
                     if exit_code:
+                        if args.lane == "full" and cmd == preflight_command:
+                            early_full_failure = "managed preflight returned before nested full validation"
                         details["status"] = "failed"
                         break
                 else:
@@ -991,6 +1007,8 @@ def _check(args: argparse.Namespace) -> None:
             except OSError as error:
                 details["evidence_inspection_error"] = str(error)
         details["completed_unix_ns"] = time.time_ns()
+        if cached_identity is not None and early_full_failure is not None:
+            details["checkout"]["early_full_failure"] = early_full_failure
         log_path.with_suffix(".json").write_text(json.dumps(details, indent=2) + "\n", encoding="utf-8")
         print(json.dumps(details, indent=2))
         if isinstance(failure, KeyboardInterrupt):
