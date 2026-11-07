@@ -314,8 +314,11 @@ impl LegacySourceReadOwner {
         if cancel.load(Ordering::Acquire) {
             return Err(E::Cancelled);
         }
-        if super::schema::SOURCE_DB_SCHEMA_VERSION != 13 {
-            return Err(E::Observation);
+        let current_schema = super::schema::SOURCE_DB_SCHEMA_VERSION;
+        if current_schema != 13 {
+            return Err(E::UnsupportedTargetSchema {
+                current: current_schema,
+            });
         }
         if participant.as_uuid().is_nil() || command.as_uuid().is_nil() {
             return Err(E::Invalid);
