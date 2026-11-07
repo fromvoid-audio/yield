@@ -1,6 +1,10 @@
 # GPUI local CI
 
-The GPUI fork validates committed source on macOS. The old Windows
+The GPUI fork validates committed source locally on Linux and macOS. Linux uses
+`bash scripts/gpui-linux-ci.sh` and the [Linux build baseline](LINUX_SUPPORT.md).
+The user's 6 November 2026 instruction supersedes the former macOS-first sequence:
+shared/Linux work can qualify independently; native macOS/Windows requirements
+remain separate platform-tagged issues. The old Windows
 GitHub Actions workflow is preserved as `gpui-windows.yml.disabled` for its
 command inventory, but it is no longer an automatic gate.
 
@@ -10,8 +14,8 @@ changes. Both modes check formatting and use the pinned lockfile. The full
 mode checks the GPUI app and runs the library, journal, core, platform, and UI
 tests previously listed in the Windows workflow. The storage mode checks the
 storage library and its focused edit tests. The runner exits on non-macOS
-hosts. Windows and Linux implementation and validation are deferred until
-release-ready macOS acceptance in OPT-1863. The old PowerShell commands remain
+hosts. Linux uses its own product lane, without macOS state parking or selectors.
+The old PowerShell commands remain
 in `scripts/gpui-local-ci.ps1.deferred` for later reassessment; they have not
 been validated on a Windows host.
 
@@ -25,7 +29,7 @@ Linux with 0.9.114); see [Scripts](../scripts/README.md) for setup and the archi
 Radiant preflight distinction. This portable development
 command requires the host's GPUI build dependencies and preserves normal lint
 settings. It does not run native AX, Metal, FSEvents, audible or release checks,
-and does not replace the macOS local CI gate or claim Linux desktop support.
+and does not establish native desktop, audio-device or other-platform acceptance.
 Remaining native sessions are indexed in [OPT-1953](https://linear.app/boostnlvp/issue/OPT-1953),
 including new filter controls (OPT-1954) and target-gating regressions (OPT-1955).
 Linux retained-directory SQLite opens use a private adapter to the bundled Unix

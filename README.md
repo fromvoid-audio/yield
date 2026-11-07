@@ -64,6 +64,9 @@ On macOS, build a development application bundle with:
 
 The script prints the `.app` path under the ignored Cargo target directory.
 Rust and the platform's native audio/graphics build tools are required.
+Linux builds enable both X11 and Wayland. See [Linux development and
+validation](docs/LINUX_SUPPORT.md) for dependencies, local checks and the
+remaining native acceptance boundaries.
 Development builds optimize dependencies and the UI/media crates so rendering
 and decoding remain responsive. The first build after this profile change
 recompiles those crates; subsequent edits reuse the optimized dependencies.

@@ -27,10 +27,17 @@ validation and delivery requirements remain in force.
 
 ## Continuous integration and merging
 
+- Linux is an active supported product target alongside macOS. The user's
+  6 November 2026 direction supersedes the former macOS-first platform sequence.
+  Implement and qualify shared/Linux work on Linux; split genuine macOS and
+  Windows requirements into explicitly platform-tagged Pulse issues, reusing
+  existing issues. Keep incomplete work Todo with remaining requirements recorded.
 - Develop features and fixes on a `codex/` branch in a pull request. Preserve
   unrelated working-tree changes and user libraries; use an isolated worktree
   when needed.
-- Run CI locally on this Mac. Do not create, enable or trigger hosted CI.
+- Run CI locally on the implementation's host platform. On Linux use
+  `bash scripts/gpui-linux-ci.sh`; macOS retains its native local-CI lanes.
+  Do not create, enable or trigger hosted CI.
   Use the repository's documented local check commands and pinned dependencies.
 - Choose a small, meaningful validation set from the actual change and its risks.
   Check formatting, compilation and relevant existing tests. Run broader suites
@@ -44,6 +51,9 @@ validation and delivery requirements remain in force.
   not an additional merge gate for an otherwise green PR. Record unperformed or
   failed manual checks honestly in Pulse. Automated success does not establish
   physical acceptance, signing, notarization or public release readiness.
+- Linux checks can qualify shared/Linux changes for merge without waiting for
+  the separate macOS/Windows issues. A headless pass does not establish desktop,
+  audible, device, display or other-platform acceptance.
 - When the user finds a bug that automation missed, fix it in a PR and add or
   adjust focused regression coverage for the underlying behavior. Prefer an
   existing test or shared fixture over a duplicate test family. If a physical
