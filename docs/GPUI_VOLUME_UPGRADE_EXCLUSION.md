@@ -71,3 +71,51 @@ No old app copy, live marker or production profile is removed or changed.
 This closes the bounded source decision/fixture slice; UUID migration and
 native upgrade acceptance remain unavailable until the external boundary is
 qualified and a separately reviewed activation change is accepted.
+
+## Current alpha ownership boundary
+
+The [alpha format policy](../AGENTS.md#active-alpha-compatibility-policy)
+allows an incompatible profile format. It still requires intact ownership,
+recovery and user media. Starting with a fresh profile or changing its schema
+version leaves the per-account volume lock registry, protected reserve and
+registered Source volumes reachable through existing entry points. The profile
+lock excludes writers for its own profile. It cannot exclude an older process
+with a different profile from opening the same volume through the device-keyed
+registry. Installing only a newer copy also leaves retained copies able to run.
+
+Keep the device-keyed registry as the common lock authority for general writable
+volumes. The descriptor UUID continues to validate the mounted volume. Missing,
+changed or ambiguous identity refuses acquisition or revalidation before
+further writable work. Foreign dirty v1 markers retain their exact bytes for
+reconciliation, including when the device number now names a different volume.
+Treat an unsupported alpha format as an explicit refusal. A format rejection
+never authorizes deleting a marker, resetting a reserve or adopting a claim.
+
+Acquiring both locks in the new binary still leaves the unseen-device case:
+an older process can open the new device key while another key retains the
+dirty evidence for the same UUID. Consulting known aliases can also incorrectly
+exclude a different volume now using one of those device numbers. A new UUID
+authority may be considered for a separately enforced writable scope where
+every entry point is denied access to the protected resources unless it uses
+the same owner. Verify the policy against direct launch and alternate profiles.
+The resource inventory must cover the canonical lock registry, the profile
+journal and participant databases, the reserve and its claim/recovery evidence,
+and writable Source roots. A protected directory alone does not establish
+exclusive volume-level capacity accounting.
+
+On macOS 26.6.2 (25G83), two disposable 96 MiB APFS images were attached in
+one order and then the reverse order. Their volume UUIDs stayed stable while
+the mounted files exchanged device numbers `16777243` and `16777247`. All four
+production descriptor probes passed. This is the native identity evidence for
+[Yield #1795](https://pulse.iocore.dev/#/issues/1795).
+
+Before any activation, extend that disposable remount fixture to test writable
+ownership. Retain dirty evidence for A, remount A on a changed device, and
+require its next admission to honor the original owner and generation. Verify
+that a different UUID B reusing A's device cannot inherit A's claims and can
+acquire independent authority once the proposed policy qualifies it. Attempt
+access from a directly launched pre-UUID executable using another profile and
+require denial before it opens the same protected writable resources. Check
+marker bytes, reserve identity and the journal disposition after both refusals
+and a clean handoff. Keep the current shared device key if the exclusion or
+recovery evidence cannot be established.
