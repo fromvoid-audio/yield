@@ -4806,9 +4806,12 @@ mod tests {
     fn random_toolbar_command_precedes_shift_without_starting_playback(cx: &mut TestAppContext) {
         cx.set_global(crate::theme::ActiveTheme::default());
         let (browser, cx) = cx.add_window_view(|_, cx| Browser::new(cx));
-        browser.update(cx, |view, _| view.waveform = Some(inert_preview()));
-        cx.refresh().expect("refresh random toolbar");
+        browser.update(cx, |view, cx| {
+            view.waveform = Some(inert_preview());
+            cx.notify();
+        });
         cx.run_until_parked();
+        cx.refresh().expect("refresh random toolbar");
         let bounds = cx
             .debug_bounds("random-audition-toolbar")
             .expect("random toolbar");
