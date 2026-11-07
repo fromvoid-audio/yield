@@ -184,6 +184,26 @@
       "retirement": "Retain only while the exact automated ownership-substitution fixture exists; remove entries with removed fixture calls. Grants no runtime filesystem, publication or physical reserve authority."
     },
     {
+      "path": "crates/yield-catalog/src/tests/supervised_watcher.rs",
+      "function": "supervised_watcher_does_not_block_catalog_or_overlap_source_generations",
+      "operation": "fs::set_permissions",
+      "count": 1,
+      "classification": "fixture",
+      "issue": "PULSE-6226",
+      "reason": "Sets mode 0700 only on the test-owned stalled helper in its disposable temporary directory so the native supervisor can start it.",
+      "retirement": "Remove this row with the stalled-helper fixture."
+    },
+    {
+      "path": "crates/yield-catalog/src/tests/supervised_watcher.rs",
+      "function": "supervised_watcher_does_not_block_catalog_or_overlap_source_generations",
+      "operation": "fs::write",
+      "count": 1,
+      "classification": "fixture",
+      "issue": "PULSE-6226",
+      "reason": "Writes the stalled helper only inside the test-owned disposable program directory. The helper records process starts and overlap there to verify reaping before the next generation.",
+      "retirement": "Remove this row with the stalled-helper fixture."
+    },
+    {
       "path": "crates/yield-library/src/app_dirs/overrides.rs",
       "function": "set",
       "operation": "fs::create_dir_all",
