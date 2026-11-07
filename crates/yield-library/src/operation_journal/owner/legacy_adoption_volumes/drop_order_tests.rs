@@ -49,6 +49,7 @@ pub(super) fn observe_after_entries(_: &RetainedLegacyVolumes) {
 }
 
 #[test]
+#[ignore = "historical schema-13 adoption, unavailable in the current alpha format"]
 fn legacy_partial_native_owner_drops_before_original_source_reservation_and_charged_credit() {
     let mut f = super::tests::Fixture::new();
     let source_bytes = f.source_bytes();

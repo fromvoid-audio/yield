@@ -62,7 +62,46 @@ impl Fixture {
             .unwrap()
     }
 }
+
 #[test]
+fn legacy_adoption_refuses_current_alpha_target_without_source_or_journal_changes() {
+    let fixture = Fixture::new();
+    let source_path = fixture._profile.path().join("legacy").join(DB_FILE_NAME);
+    let source_bytes = std::fs::read(&source_path).unwrap();
+    assert!(
+        fixture
+            .store
+            .scan_recovery_page(None)
+            .unwrap()
+            .entries()
+            .is_empty()
+    );
+
+    let result = fixture.source.prepare_legacy_adoption_input(
+        &fixture.guard,
+        &fixture.store,
+        ParticipantId::new(),
+        SourceCommandId::new(),
+        &AtomicBool::new(false),
+    );
+
+    assert!(matches!(
+        result,
+        Err(LegacyAdoptionInputError::UnsupportedTargetSchema { .. })
+    ));
+    assert_eq!(std::fs::read(source_path).unwrap(), source_bytes);
+    assert!(
+        fixture
+            .store
+            .scan_recovery_page(None)
+            .unwrap()
+            .entries()
+            .is_empty()
+    );
+}
+
+#[test]
+#[ignore = "historical schema-13 adoption, unavailable in the current alpha format"]
 fn original_preparation_requires_exact_current_journal_schema() {
     let fixture = Fixture::new();
     let original = fixture.prepare();
@@ -81,6 +120,7 @@ fn original_preparation_requires_exact_current_journal_schema() {
 }
 
 #[test]
+#[ignore = "historical schema-13 adoption, unavailable in the current alpha format"]
 fn supported_wire_semantic_corruptions_refuse_even_with_canonical_field_order() {
     let f = Fixture::new();
     let original = f.prepare();
@@ -147,6 +187,7 @@ fn passive_capacity() -> FullCapacityPlan {
     .unwrap()
 }
 #[test]
+#[ignore = "historical schema-13 adoption, unavailable in the current alpha format"]
 fn actual_store_codec_and_owner_refuse_family_before_rows_or_operation_id() {
     let f = Fixture::new();
     let request = f.prepare();

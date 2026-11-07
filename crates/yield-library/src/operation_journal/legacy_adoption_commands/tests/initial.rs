@@ -5,6 +5,7 @@ use crate::operation_journal::full_capacity::{
 };
 
 #[test]
+#[ignore = "historical schema-13 adoption, unavailable in the current alpha format"]
 fn legacy_initial_source_checkpoint_survives_original_journal_change_and_preserves_deadline() {
     let mut fixture = Fixture::new();
     let deadline = Instant::now() + Duration::from_secs(2);
@@ -75,6 +76,7 @@ fn legacy_initial_source_checkpoint_survives_original_journal_change_and_preserv
 }
 
 #[test]
+#[ignore = "historical schema-13 adoption, unavailable in the current alpha format"]
 fn legacy_initial_independently_rounds_all_eight_objects_before_same_volume_class_sums() {
     let fixture = Fixture::new();
     let mut args = fixture.prepare();
@@ -124,6 +126,7 @@ fn legacy_initial_independently_rounds_all_eight_objects_before_same_volume_clas
 }
 
 #[test]
+#[ignore = "historical schema-13 adoption, unavailable in the current alpha format"]
 fn legacy_initial_preserves_separate_role_volumes_and_rejects_inconsistent_units() {
     let fixture = Fixture::new();
     let mut args = fixture.prepare();
@@ -152,6 +155,7 @@ fn legacy_initial_preserves_separate_role_volumes_and_rejects_inconsistent_units
 }
 
 #[test]
+#[ignore = "historical schema-13 adoption, unavailable in the current alpha format"]
 fn legacy_initial_v19_roundtrips_exact_original_plan_and_refuses_family_or_plan_coercion() {
     let fixture = Fixture::new();
     let args = fixture.prepare();
@@ -260,6 +264,7 @@ fn settlement_fixture(
 }
 
 #[test]
+#[ignore = "historical schema-13 adoption, unavailable in the current alpha format"]
 fn legacy_initial_borrowed_store_commit_keeps_original_lease_and_exact_readback() {
     use crate::operation_journal::owner::JournalNamespaceFundingProbe;
     let f = Fixture::new();
@@ -313,6 +318,7 @@ fn legacy_initial_borrowed_store_commit_keeps_original_lease_and_exact_readback(
 }
 
 #[test]
+#[ignore = "historical schema-13 adoption, unavailable in the current alpha format"]
 fn legacy_initial_borrowed_store_refuses_changed_frozen_bytes_before_pin() {
     use crate::operation_journal::{
         owner::JournalNamespaceFundingProbe, store::BorrowedInitialClaimSettlementError,
@@ -342,6 +348,7 @@ fn legacy_initial_borrowed_store_refuses_changed_frozen_bytes_before_pin() {
 }
 
 #[test]
+#[ignore = "historical schema-13 adoption, unavailable in the current alpha format"]
 fn legacy_initial_borrowed_store_rollback_unknown_commit_and_ledger_failure_retain_exact_rules() {
     use crate::operation_journal::{
         owner::JournalNamespaceFundingProbe,
@@ -419,6 +426,7 @@ fn legacy_initial_borrowed_store_rollback_unknown_commit_and_ledger_failure_reta
 }
 
 #[test]
+#[ignore = "historical schema-13 adoption, unavailable in the current alpha format"]
 fn legacy_initial_streaming_transport_matches_original_canonical_bytes_and_cap() {
     use base64::Engine;
     let f = Fixture::new();
@@ -447,6 +455,7 @@ fn legacy_initial_streaming_transport_matches_original_canonical_bytes_and_cap()
 }
 
 #[test]
+#[ignore = "historical schema-13 adoption, unavailable in the current alpha format"]
 fn legacy_initial_typed_estimator_covers_exact_three_role_classes_without_relabeling() {
     use crate::operation_journal::capacity_estimator::{
         CapacityEstimateDisposition as D, estimate_capacity,

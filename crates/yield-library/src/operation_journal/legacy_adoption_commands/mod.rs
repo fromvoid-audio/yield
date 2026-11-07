@@ -19,6 +19,12 @@ const MAGIC: &[u8; 8] = b"YLADOPT\0";
 /// Invalid, stale, cancelled or unsupported original-owner input.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum LegacyAdoptionInputError {
+    /// The current Source format has no supported legacy-adoption route.
+    #[error("legacy adoption is unsupported for current Source schema {current}")]
+    UnsupportedTargetSchema {
+        /// The active Source schema version.
+        current: i64,
+    },
     /// Actual original retained owner observation could not be obtained.
     #[error("legacy adoption original observation unavailable")]
     Observation,

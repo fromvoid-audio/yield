@@ -81,6 +81,7 @@ impl Fixture {
 }
 
 #[test]
+#[ignore = "historical schema-13 adoption, unavailable in the current alpha format"]
 fn original_worker_prelease_missing_physical_floor_refuses_before_bootstrap_and_refunds_only_unused_input()
  {
     let mut f = Fixture::new();
@@ -117,6 +118,7 @@ fn original_worker_prelease_missing_physical_floor_refuses_before_bootstrap_and_
 }
 
 #[test]
+#[ignore = "historical schema-13 adoption, unavailable in the current alpha format"]
 fn complete_private_checkpoint_advances_after_each_of_two_real_journal_prefixes_without_refreshing_old_public_handle()
  {
     let mut f = Fixture::new();
@@ -163,6 +165,7 @@ fn complete_private_checkpoint_advances_after_each_of_two_real_journal_prefixes_
 }
 
 #[test]
+#[ignore = "historical schema-13 adoption, unavailable in the current alpha format"]
 fn partial_slot_refuses_exact_reentry_without_new_bootstrap_or_credit_release() {
     let mut f = Fixture::new();
     let retained = f.runtime.legacy_adoption.as_mut().unwrap();
@@ -202,6 +205,7 @@ fn partial_slot_refuses_exact_reentry_without_new_bootstrap_or_credit_release() 
 }
 
 #[test]
+#[ignore = "historical schema-13 adoption, unavailable in the current alpha format"]
 fn completed_private_checkpoint_duplicate_retains_each_reply_copy_credit_and_does_no_bootstrap() {
     let mut f = Fixture::new();
     let retained = f.runtime.legacy_adoption.as_mut().unwrap();

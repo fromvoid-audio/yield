@@ -152,6 +152,7 @@ fn journal_bytes(f: &Fixture) -> Vec<u8> {
 }
 
 #[test]
+#[ignore = "historical schema-13 adoption, unavailable in the current alpha format"]
 fn legacy_custody_actual_worker_captures_and_revalidates_without_writes_or_lease() {
     let mut f = Fixture::new();
     let source_bytes = fs::read(f.path()).unwrap();
@@ -213,6 +214,7 @@ fn legacy_custody_actual_worker_captures_and_revalidates_without_writes_or_lease
 }
 
 #[test]
+#[ignore = "historical schema-13 adoption, unavailable in the current alpha format"]
 fn legacy_custody_reply_loss_retains_original_lock_and_metadata_credit_until_shutdown() {
     let mut f = Fixture::new();
     let client = f.client();
@@ -262,6 +264,7 @@ fn legacy_custody_reply_loss_retains_original_lock_and_metadata_credit_until_shu
 }
 
 #[test]
+#[ignore = "historical schema-13 adoption, unavailable in the current alpha format"]
 fn legacy_custody_changed_source_rows_refuse_and_retain_slot_without_repair() {
     let mut f = Fixture::new();
     let custody = f.prepare().unwrap();
@@ -296,6 +299,7 @@ fn legacy_custody_changed_source_rows_refuse_and_retain_slot_without_repair() {
 
 #[cfg(unix)]
 #[test]
+#[ignore = "historical schema-13 adoption, unavailable in the current alpha format"]
 fn legacy_custody_original_directory_replacement_refuses_without_touching_substitute() {
     let mut f = Fixture::new();
     let custody = f.prepare().unwrap();
@@ -374,16 +378,19 @@ fn changed_evidence(journal_rollback: bool) {
 }
 
 #[test]
+#[ignore = "historical schema-13 adoption, unavailable in the current alpha format"]
 fn legacy_custody_changed_control_evidence_refuses() {
     changed_evidence(false);
 }
 
 #[test]
+#[ignore = "historical schema-13 adoption, unavailable in the current alpha format"]
 fn legacy_custody_changed_journal_evidence_refuses() {
     changed_evidence(true);
 }
 
 #[test]
+#[ignore = "historical schema-13 adoption, unavailable in the current alpha format"]
 fn legacy_custody_foreign_profile_rejection_refunds_and_preserves_both_originals() {
     let mut f = Fixture::new();
     let first_bytes = fs::read(f.path()).unwrap();
@@ -414,6 +421,7 @@ fn legacy_custody_foreign_profile_rejection_refunds_and_preserves_both_originals
 }
 
 #[test]
+#[ignore = "historical schema-13 adoption, unavailable in the current alpha format"]
 fn legacy_custody_queue_credit_refusal_preserves_source_and_does_not_install_slot() {
     let mut f = Fixture::new();
     let client = f.client();
@@ -449,6 +457,7 @@ fn legacy_custody_queue_credit_refusal_preserves_source_and_does_not_install_slo
 }
 
 #[test]
+#[ignore = "historical schema-13 adoption, unavailable in the current alpha format"]
 fn legacy_initial_actual_worker_refuses_missing_original_volume_custody_without_intent() {
     let mut f = Fixture::new();
     let source = fs::read(f.path()).unwrap();
@@ -475,6 +484,7 @@ fn legacy_initial_actual_worker_refuses_missing_original_volume_custody_without_
 }
 
 #[test]
+#[ignore = "historical schema-13 adoption, unavailable in the current alpha format"]
 fn legacy_initial_actual_queued_deadline_and_foreign_digest_refuse_before_intent() {
     let mut f = Fixture::new();
     let custody = f.prepare().unwrap();
@@ -515,6 +525,7 @@ fn legacy_initial_actual_queued_deadline_and_foreign_digest_refuse_before_intent
 // qualification harness or substitute a logical provider for the live consumer.
 #[cfg(target_os = "macos")]
 #[test]
+#[ignore = "historical schema-13 adoption, unavailable in the current alpha format"]
 fn legacy_initial_native_actual_worker_commit_duplicate_lost_reply_and_source_fence() {
     let mut f = Fixture::new_with_start(true, None);
     let original_source = fs::read(f.path()).unwrap();
@@ -570,6 +581,7 @@ fn legacy_initial_native_actual_worker_commit_duplicate_lost_reply_and_source_fe
 
 #[cfg(target_os = "macos")]
 #[test]
+#[ignore = "historical schema-13 adoption, unavailable in the current alpha format"]
 fn legacy_initial_native_actual_worker_commit_faults_keep_same_source_slot_and_refuse_readmission()
 {
     for case in 0..3 {
