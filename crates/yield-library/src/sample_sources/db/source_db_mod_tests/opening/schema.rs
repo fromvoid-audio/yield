@@ -1,6 +1,36 @@
 use super::*;
 
 #[test]
+fn source_write_open_rejects_newer_schema_without_losing_data() {
+    let dir = tempdir().unwrap();
+    let db_file = dir.path().join(DB_FILE_NAME);
+    let connection = Connection::open(&db_file).unwrap();
+    connection
+        .execute_batch("CREATE TABLE future_data (value TEXT); INSERT INTO future_data VALUES ('preserve me');")
+        .unwrap();
+    let future_version = current_schema_version() + 1;
+    connection
+        .pragma_update(None, "user_version", future_version)
+        .unwrap();
+    drop(connection);
+
+    assert!(matches!(
+        SourceDatabase::open_for_source_write(dir.path()),
+        Err(SourceDbError::NewerSchemaVersion { found, supported })
+            if found == future_version && supported == current_schema_version()
+    ));
+    let reopened = Connection::open(&db_file).unwrap();
+    assert_eq!(schema_version(&reopened), future_version);
+    assert_eq!(
+        reopened
+            .query_row("SELECT value FROM future_data", [], |row| row
+                .get::<_, String>(0))
+            .unwrap(),
+        "preserve me"
+    );
+}
+
+#[test]
 fn missing_columns_are_added_on_open() {
     let dir = tempdir().unwrap();
     let db_file = dir.path().join(DB_FILE_NAME);

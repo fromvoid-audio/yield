@@ -25,6 +25,7 @@ pub(crate) use migrations::table_columns;
 /// A matching stamp means the file has already passed the full schema-assurance
 /// path once. Current-stamped opens still run low-cost additive table/column
 /// repairs, but they skip index rebuilds and deferred cleanup work.
+/// Newer stamps are rejected before schema assurance or cleanup.
 pub(super) const SOURCE_DB_SCHEMA_VERSION: i64 = 14;
 
 /// Apply the full source-database schema, including deferred cleanup work.
@@ -125,7 +126,14 @@ fn assure_schema(connection: &Connection) -> Result<(), SourceDbError> {
 }
 
 fn schema_is_current(connection: &Connection) -> Result<bool, SourceDbError> {
-    Ok(read_schema_version(connection)? == SOURCE_DB_SCHEMA_VERSION)
+    let found = read_schema_version(connection)?;
+    if found > SOURCE_DB_SCHEMA_VERSION {
+        return Err(SourceDbError::NewerSchemaVersion {
+            found,
+            supported: SOURCE_DB_SCHEMA_VERSION,
+        });
+    }
+    Ok(found == SOURCE_DB_SCHEMA_VERSION)
 }
 
 fn read_schema_version(connection: &Connection) -> Result<i64, SourceDbError> {
@@ -156,6 +164,52 @@ mod tests {
             .optional()
             .unwrap()
             .is_some()
+    }
+
+    #[test]
+    fn maintenance_rejects_newer_schema_without_mutating_it() {
+        fn schema_objects(connection: &Connection) -> Vec<(String, String, Option<String>)> {
+            connection
+                .prepare("SELECT type, name, sql FROM sqlite_master ORDER BY type, name")
+                .unwrap()
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap()
+        }
+        for apply in [apply_schema_fast, apply_schema] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("source.sqlite");
+            let connection = Connection::open(&path).unwrap();
+            connection.execute_batch("CREATE TABLE future_data (value TEXT NOT NULL); CREATE INDEX future_index ON future_data(value); INSERT INTO future_data VALUES ('preserve me');").unwrap();
+            let future_version = SOURCE_DB_SCHEMA_VERSION + 1;
+            connection
+                .pragma_update(None, "user_version", future_version)
+                .unwrap();
+            let schema_before = schema_objects(&connection);
+            assert!(matches!(
+                require_current_schema(&connection),
+                Err(SourceDbError::NewerSchemaVersion { found, supported })
+                    if found == future_version && supported == SOURCE_DB_SCHEMA_VERSION
+            ));
+            let result = apply(&connection);
+            assert!(matches!(
+                result,
+                Err(SourceDbError::NewerSchemaVersion { found, supported })
+                    if found == future_version && supported == SOURCE_DB_SCHEMA_VERSION
+            ));
+            drop(connection);
+            let connection = Connection::open(&path).unwrap();
+            assert_eq!(read_schema_version(&connection).unwrap(), future_version);
+            assert_eq!(
+                connection
+                    .query_row("SELECT value FROM future_data", [], |row| row
+                        .get::<_, String>(0))
+                    .unwrap(),
+                "preserve me"
+            );
+            assert_eq!(schema_objects(&connection), schema_before);
+        }
     }
 
     #[test]
