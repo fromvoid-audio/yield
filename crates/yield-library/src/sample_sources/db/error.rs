@@ -173,6 +173,16 @@ pub enum SourceDbError {
     /// must prepare it before this role can open the database.
     #[error("source database requires owner-held maintenance before operational access")]
     MaintenanceRequired,
+    /// The database was written by a version with a newer source schema.
+    #[error(
+        "source database schema version {found} is newer than supported version {supported}; open it with a newer version of yield"
+    )]
+    NewerSchemaVersion {
+        /// Schema version recorded in the source database.
+        found: i64,
+        /// Latest schema version understood by this build.
+        supported: i64,
+    },
     /// A bounded source read exceeded its input or row budget before materializing more rows.
     #[error("source snapshot read exceeded its bounded budget")]
     SnapshotBudgetExceeded,
