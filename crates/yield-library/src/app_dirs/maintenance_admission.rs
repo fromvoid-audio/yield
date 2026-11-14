@@ -125,12 +125,8 @@ mod unix {
                 let admission = adopt_exclusive_handoff(
                     &base,
                     namespace,
-                    namespace_fd,
-                    &path,
-                    canonical_file,
-                    transition_fd,
-                    &transition_path,
-                    transition_file,
+                    (namespace_fd, &path, canonical_file),
+                    (transition_fd, &transition_path, transition_file),
                 )?;
                 // Successful validation establishes that these are the exact handoff FDs.
                 // Close the raw inherited descriptors now; the retained duplicate is the
@@ -215,8 +211,7 @@ mod unix {
             let record_metadata = match fs::symlink_metadata(&record_path) {
                 Ok(metadata) => metadata,
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::Other,
+                    return Err(io::Error::other(
                         "uncommitted maintenance preparation requires explicit recovery before startup",
                     ));
                 }
@@ -285,8 +280,7 @@ mod unix {
                 }
             }
             if !matches!(phase, "original_parked" | "restored" | "aborted") {
-                return Err(io::Error::new(
-                    io::ErrorKind::Other,
+                return Err(io::Error::other(
                     "pending Yield state recovery must complete before startup",
                 ));
             }
@@ -297,13 +291,11 @@ mod unix {
     fn adopt_exclusive_handoff(
         base: &Path,
         namespace: &str,
-        namespace_fd: i32,
-        namespace_path: &Path,
-        canonical_file: File,
-        transition_fd: i32,
-        transition_path: &Path,
-        transition_file: File,
+        namespace_lock: (i32, &Path, File),
+        transition_lock: (i32, &Path, File),
     ) -> Result<ProcessMaintenanceAdmission, io::Error> {
+        let (namespace_fd, namespace_path, canonical_file) = namespace_lock;
+        let (transition_fd, transition_path, transition_file) = transition_lock;
         // SAFETY: fstat initializes this value on success; checked below before use.
         let mut inherited_stat = unsafe { std::mem::zeroed::<libc::stat>() };
         if unsafe { libc::fstat(namespace_fd, &mut inherited_stat) } != 0 {
@@ -538,12 +530,16 @@ mod unix {
             let admission = adopt_exclusive_handoff(
                 base.path(),
                 ".yield",
-                namespace_owner.as_raw_fd(),
-                &namespace_path,
-                namespace_canonical,
-                transition_owner.as_raw_fd(),
-                &transition_path,
-                transition_canonical,
+                (
+                    namespace_owner.as_raw_fd(),
+                    &namespace_path,
+                    namespace_canonical,
+                ),
+                (
+                    transition_owner.as_raw_fd(),
+                    &transition_path,
+                    transition_canonical,
+                ),
             )
             .expect("verified reset handoff");
 
@@ -630,12 +626,16 @@ mod unix {
             let error = adopt_exclusive_handoff(
                 base.path(),
                 ".yield",
-                namespace_owner.as_raw_fd(),
-                &namespace_path,
-                namespace_canonical,
-                transition_owner.as_raw_fd(),
-                &transition_path,
-                transition_canonical,
+                (
+                    namespace_owner.as_raw_fd(),
+                    &namespace_path,
+                    namespace_canonical,
+                ),
+                (
+                    transition_owner.as_raw_fd(),
+                    &transition_path,
+                    transition_canonical,
+                ),
             )
             .expect_err("transition lock must also be held exclusively");
             assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
@@ -672,12 +672,16 @@ mod unix {
             let error = adopt_exclusive_handoff(
                 base.path(),
                 ".yield",
-                namespace_owner.as_raw_fd(),
-                &namespace_path,
-                namespace_canonical,
-                unlocked_transition.as_raw_fd(),
-                &transition_path,
-                transition_canonical,
+                (
+                    namespace_owner.as_raw_fd(),
+                    &namespace_path,
+                    namespace_canonical,
+                ),
+                (
+                    unlocked_transition.as_raw_fd(),
+                    &transition_path,
+                    transition_canonical,
+                ),
             )
             .expect_err("unlocked transition descriptor cannot borrow a foreign fence");
             assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
@@ -867,12 +871,8 @@ mod unix {
             let admission = adopt_exclusive_handoff(
                 &base,
                 ".yield-development",
-                namespace_fd,
-                &namespace_path,
-                canonical,
-                transition_fd,
-                &transition_path,
-                transition,
+                (namespace_fd, &namespace_path, canonical),
+                (transition_fd, &transition_path, transition),
             )
             .expect("child adopts both exclusive locks");
             unsafe {

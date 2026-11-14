@@ -519,7 +519,7 @@ pub(crate) fn open_canonical_global_app_root() -> Result<(PathBuf, Dir), Profile
         let (app_dir, _) =
             open_or_create_final_child(&support_dir, super::APP_DIR_NAME, &support_path)?;
         ensure_current_user_owned(&app_path, &app_dir)?;
-        return Ok((app_path, app_dir));
+        Ok((app_path, app_dir))
     }
 
     #[cfg(not(target_os = "macos"))]

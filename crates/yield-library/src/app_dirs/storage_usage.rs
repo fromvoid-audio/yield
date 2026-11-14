@@ -666,12 +666,12 @@ fn cap_metadata_identity(_path: &Path, metadata: &cap_std::fs::Metadata) -> Opti
             .into_std()
             .duration_since(std::time::UNIX_EPOCH)
             .ok()?;
-        return Some(format!(
+        Some(format!(
             "unix:{}:{}:{}",
             metadata.dev(),
             metadata.ino(),
             created.as_nanos()
-        ));
+        ))
     }
     #[cfg(not(unix))]
     {
@@ -799,10 +799,10 @@ fn map_count_error(error: CountError, outcome: &CacheClearOutcome) -> CacheMaint
 
 fn overlap_candidates(path: &Path) -> Vec<PathBuf> {
     let mut candidates = vec![lexically_normalized(path)];
-    if let Some(canonical) = canonicalized_existing_prefix(path) {
-        if !candidates.iter().any(|candidate| candidate == &canonical) {
-            candidates.push(canonical);
-        }
+    if let Some(canonical) = canonicalized_existing_prefix(path)
+        && !candidates.iter().any(|candidate| candidate == &canonical)
+    {
+        candidates.push(canonical);
     }
     candidates
 }
