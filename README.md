@@ -25,6 +25,20 @@ I’m [PORTALSURFER](https://soundcloud.com/portalsurfer). I make music and buil
 
 I build this software for myself first and foremost and offer no guarantees of support. That said, I welcome code, documentation, and interesting ideas, and I’m happy to add them when we align on the direction.
 
+## Philosophy
+
+Copyright wasn't just inconvenienced by AI; perhaps it was always the wrong bet.
+
+We treated ideas like property, then acted surprised when progress slowed and wealth pooled upward. But evolution has always followed a simple pattern: **copying, mutation, and selection.** Ideas, like living things, develop through variation and iteration.
+
+Perhaps the mistake was never copying, but our insistence on preventing it.
+
+Soon, software will be something we simply wish into existence, endlessly adapting to our needs. When creation becomes abundant, artificial scarcity loses its purpose.
+
+**fromvoid** is built in the open, not as charity, but as a refusal to restrict the evolution of ideas.
+
+**Copy. Mutate. Select. Repeat.**
+
 ## Support
 
 If you’d like to help cover development costs, you can chip in on Ko-fi:
